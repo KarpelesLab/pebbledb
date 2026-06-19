@@ -571,6 +571,157 @@ fn concurrent_writers_and_readers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A filesystem wrapper that injects write failures for files under a given directory
+/// prefix once "tripped", used to exercise WAL failover. Reads always succeed.
+mod fault {
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+
+    #[derive(Clone)]
+    pub struct FaultFs {
+        inner: MemFs,
+        prefix: PathBuf,
+        pub tripped: Arc<AtomicBool>,
+    }
+
+    impl FaultFs {
+        pub fn new(prefix: impl Into<PathBuf>) -> FaultFs {
+            FaultFs {
+                inner: MemFs::new(),
+                prefix: prefix.into(),
+                tripped: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn faulting(&self, path: &Path) -> bool {
+            path.starts_with(&self.prefix)
+        }
+    }
+
+    struct FaultWritable {
+        inner: Box<dyn WritableFile>,
+        tripped: Arc<AtomicBool>,
+        faulting: bool,
+    }
+
+    impl FaultWritable {
+        fn check(&self) -> io::Result<()> {
+            if self.faulting && self.tripped.load(Ordering::SeqCst) {
+                Err(io::Error::other("injected WAL write failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Write for FaultWritable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.check()?;
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.check()?;
+            self.inner.flush()
+        }
+    }
+
+    impl WritableFile for FaultWritable {
+        fn sync_all(&mut self) -> io::Result<()> {
+            self.check()?;
+            self.inner.sync_all()
+        }
+    }
+
+    impl Fs for FaultFs {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            Ok(Box::new(FaultWritable {
+                inner: self.inner.create(path)?,
+                tripped: Arc::clone(&self.tripped),
+                faulting: self.faulting(path),
+            }))
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.inner.read(path)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn size(&self, path: &Path) -> io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(path)
+        }
+    }
+}
+
+#[test]
+fn wal_failover_to_secondary_directory() {
+    use std::sync::atomic::Ordering;
+
+    let fs = fault::FaultFs::new("/db/wal-primary");
+    let opts = || Options {
+        fs: Arc::new(fs.clone()),
+        wal_dir: Some("/db/wal-primary".into()),
+        wal_failover_dir: Some("/db/wal-secondary".into()),
+        ..Default::default()
+    };
+
+    {
+        let db = Db::open("/db/store", opts()).unwrap();
+        // These writes go to the primary WAL.
+        db.set(b"a", b"1").unwrap();
+        db.set(b"b", b"2").unwrap();
+        // Trip the primary WAL directory: subsequent WAL writes fail and the engine fails
+        // over to the secondary directory, re-logging the batch there.
+        fs.tripped.store(true, Ordering::SeqCst);
+        db.set(b"c", b"3").unwrap();
+        db.set(b"d", b"4").unwrap();
+        // All four are readable in the live database.
+        for (k, v) in [
+            (&b"a"[..], &b"1"[..]),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+        ] {
+            assert_eq!(db.get(k).unwrap().as_deref(), Some(v));
+        }
+    }
+
+    // Reopen (primary readable again): recovery scans both WAL directories and recovers
+    // the pre-failover and post-failover batches alike.
+    {
+        fs.tripped.store(false, Ordering::SeqCst);
+        let db = Db::open("/db/store", opts()).unwrap();
+        for (k, v) in [
+            (&b"a"[..], &b"1"[..]),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+        ] {
+            assert_eq!(db.get(k).unwrap().as_deref(), Some(v), "key after reopen");
+        }
+    }
+}
+
 #[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");

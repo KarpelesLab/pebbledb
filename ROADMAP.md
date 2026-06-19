@@ -128,8 +128,15 @@ refined as they are reached.
   ingestion), placed in L0 and recorded in the MANIFEST, carrying point keys, range
   tombstones, and range keys. Verified by checkpoint-reopen and ingest-shadow-and-reopen
   tests. (Excise, flushable ingests, and disk-usage estimation remain a follow-up.)
-- [ ] **Phase 27 — WAL manager & failover.** The `pebble/wal` package: multiple WAL
-  directories, failover, recycling, and the sync queue.
+- [x] **Phase 27 — WAL manager & failover.** Multiple WAL directories
+  (`Options::wal_dir` primary override + `Options::wal_failover_dir` secondary): on a
+  failed WAL write or sync the engine rotates to a fresh WAL in the next directory and
+  re-logs the batch so it stays durable, and recovery scans every WAL directory (merging
+  by the globally-monotonic log number, skipping flushed logs). Verified by a
+  fault-injecting filesystem test that trips the primary mid-run and confirms both
+  pre- and post-failover writes survive a reopen. (Inode/space recycling of WAL files and
+  Pebble's batched sync queue remain throughput follow-ups; the recyclable record format
+  is already implemented and used.)
 - [x] **Phase 28 — Metrics & observability.** Complete `Metrics`, an `EventListener`, and
   logging/tracing hooks matching Pebble's surface.
 - [x] **Phase 29 — Tooling.** A `pebbledb` CLI binary (`src/bin/pebbledb.rs`) with

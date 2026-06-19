@@ -81,6 +81,13 @@ pub struct Options {
     /// The on-disk format major version a newly created store is initialized to (default
     /// [`FormatMajorVersion::DEFAULT`]). Existing stores keep their recorded version.
     pub format_major_version: FormatMajorVersion,
+    /// Directory the write-ahead log is written to. `None` (default) keeps WALs in the
+    /// database directory.
+    pub wal_dir: Option<PathBuf>,
+    /// A secondary WAL directory to fail over to when a write to the primary WAL fails
+    /// (e.g. a stalled or failing disk). On failure the current batch is re-logged here and
+    /// subsequent WALs are created here; recovery scans every configured WAL directory.
+    pub wal_failover_dir: Option<PathBuf>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -106,6 +113,8 @@ impl Default for Options {
             max_open_files: 1000,
             fs: Arc::new(DiskFs),
             format_major_version: FormatMajorVersion::DEFAULT,
+            wal_dir: None,
+            wal_failover_dir: None,
         }
     }
 }
@@ -121,6 +130,9 @@ struct State {
     imm_wals: Vec<u64>,
     wal: Option<record::Writer<Box<dyn WritableFile>>>,
     wal_number: u64,
+    /// Index into [`DbInner::wal_dirs`] of the directory the active WAL lives in. Advances
+    /// on failover.
+    wal_dir_idx: usize,
     manifest: Option<record::Writer<Box<dyn WritableFile>>>,
     read_only: bool,
     /// Set on close to tell the background worker to exit.
@@ -160,6 +172,9 @@ pub struct DbInner {
     max_open_files: usize,
     /// The filesystem all I/O goes through.
     fs: Arc<dyn Fs>,
+    /// WAL directories, primary first then failover targets. The active WAL is created in
+    /// the first that accepts it; recovery scans them all.
+    wal_dirs: Vec<PathBuf>,
     /// The held exclusive directory lock (released on drop). `None` when read-only.
     _lock: Option<Box<dyn DirLock>>,
     /// The store's on-disk format major version.
@@ -225,6 +240,20 @@ impl DbInner {
     fn open_inner(dir: impl AsRef<Path>, opts: Options) -> Result<DbInner> {
         let dir = dir.as_ref().to_path_buf();
         let fs = opts.fs.clone();
+
+        // WAL directories: the primary (override or the db dir) first, then any failover
+        // directory. Recovery scans them all; the active WAL is created in the first that
+        // accepts it.
+        let mut wal_dirs = vec![opts.wal_dir.clone().unwrap_or_else(|| dir.clone())];
+        if let Some(f) = opts.wal_failover_dir.clone() {
+            wal_dirs.push(f);
+        }
+        if !opts.read_only {
+            for d in &wal_dirs {
+                fs.create_dir_all(d)?;
+            }
+        }
+
         let exists = fs.exists(&dir);
         if !exists {
             if opts.read_only || !opts.create_if_missing {
@@ -258,8 +287,8 @@ impl DbInner {
             Some(manifest_name) => {
                 let bytes = fs.read(&dir.join(&manifest_name))?;
                 let vs = VersionSet::load(&bytes, cmp.clone())?;
-                // Recover every WAL present (each record is a batch).
-                recover_wals(fs.as_ref(), &dir, &names, &mem, vs)?
+                // Recover the un-flushed WALs across every WAL directory.
+                recover_wals(fs.as_ref(), &wal_dirs, &mem, vs)?
             }
             None => {
                 if !opts.create_if_missing {
@@ -279,6 +308,7 @@ impl DbInner {
                 imm_wals: Vec::new(),
                 wal: None,
                 wal_number: 0,
+                wal_dir_idx: 0,
                 manifest: None,
                 read_only: true,
                 shutdown: false,
@@ -288,6 +318,7 @@ impl DbInner {
             return Ok(DbInner {
                 dir,
                 cmp,
+                wal_dirs,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
                 state: Mutex::new(state),
@@ -350,10 +381,8 @@ impl DbInner {
             mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
         }
 
-        let wal = record::Writer::with_log_num(
-            fs.create(&dir.join(wal_filename(wal_number)))?,
-            wal_number as u32,
-        );
+        let (wal_writer, wal_dir_idx) = create_wal(fs.as_ref(), &wal_dirs, 0, wal_number)?;
+        let wal = wal_writer;
 
         // Record the options for this session in a fresh OPTIONS file.
         let options_num = vs.allocate_file_number();
@@ -376,6 +405,7 @@ impl DbInner {
             imm_wals: Vec::new(),
             wal: Some(wal),
             wal_number,
+            wal_dir_idx,
             manifest: Some(manifest),
             read_only: false,
             shutdown: false,
@@ -385,6 +415,7 @@ impl DbInner {
         Ok(DbInner {
             dir,
             cmp,
+            wal_dirs,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
             state: Mutex::new(state),
@@ -577,16 +608,52 @@ impl DbInner {
 
         let base = state.vs.last_sequence + 1;
         batch.set_seqnum(base);
-        if let Some(wal) = state.wal.as_mut() {
-            wal.write_record(batch.as_bytes())?;
-            if self.wal_sync {
-                wal.sync_all()?;
-            } else {
-                wal.flush()?;
-            }
+        if state.wal.is_some() {
+            self.append_to_wal(&mut state, &batch)?;
         }
         state.mem.apply(&batch)?;
         state.vs.last_sequence = base + u64::from(batch.count()) - 1;
+        Ok(())
+    }
+
+    /// Appends `batch` to the active WAL, failing over to the next WAL directory if the
+    /// write (or its sync) fails — e.g. a stalled or failing disk. The batch is re-logged
+    /// to the new WAL so it is durable before the write returns.
+    fn append_to_wal(&self, state: &mut State, batch: &Batch) -> Result<()> {
+        {
+            let wal = state.wal.as_mut().expect("wal present");
+            let res = wal.write_record(batch.as_bytes()).and_then(|_| {
+                if self.wal_sync {
+                    wal.sync_all()
+                } else {
+                    wal.flush()
+                }
+            });
+            if res.is_ok() {
+                return Ok(());
+            }
+            // Primary write failed: fall through to failover (if a directory is available).
+            if state.wal_dir_idx + 1 >= self.wal_dirs.len() {
+                return res; // no failover directory left
+            }
+        }
+        // Rotate to a fresh WAL in the next directory and re-log the batch there so it is
+        // durable. The failed WAL keeps its number in `imm_wals`-style cleanup via the
+        // normal flush path is not applicable here, so it is left for the next open's
+        // recovery scan / obsolete-file handling.
+        let next_dir = state.wal_dir_idx + 1;
+        let new_wal = state.vs.allocate_file_number();
+        let (mut writer, dir_idx) =
+            create_wal(self.fs.as_ref(), &self.wal_dirs, next_dir, new_wal)?;
+        writer.write_record(batch.as_bytes())?;
+        if self.wal_sync {
+            writer.sync_all()?;
+        } else {
+            writer.flush()?;
+        }
+        state.wal = Some(writer);
+        state.wal_number = new_wal;
+        state.wal_dir_idx = dir_idx;
         Ok(())
     }
 
@@ -613,10 +680,11 @@ impl DbInner {
             return Ok(());
         }
         let new_wal = state.vs.allocate_file_number();
-        let wal = record::Writer::with_log_num(
-            self.fs.create(&self.dir.join(wal_filename(new_wal)))?,
-            new_wal as u32,
-        );
+        // Keep the active WAL directory across rotation (don't fall back to the primary if
+        // we've already failed over to a secondary).
+        let (wal, dir_idx) =
+            create_wal(self.fs.as_ref(), &self.wal_dirs, state.wal_dir_idx, new_wal)?;
+        state.wal_dir_idx = dir_idx;
         let old_mem = std::mem::replace(
             &mut state.mem,
             Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size)),
@@ -674,7 +742,10 @@ impl DbInner {
         let popped_wal = state.imm_wals.remove(0);
         state.flush_count += 1;
         if popped_wal != 0 {
-            let _ = self.fs.remove(&self.dir.join(wal_filename(popped_wal)));
+            // The WAL may live in any configured directory (failover); remove from each.
+            for dir in &self.wal_dirs {
+                let _ = self.fs.remove(&dir.join(wal_filename(popped_wal)));
+            }
         }
         // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
         self.maybe_compact(&mut state)?;
@@ -1022,26 +1093,32 @@ fn wal_filename(num: u64) -> String {
 /// first, would wrongly shadow the newer on-disk data.
 fn recover_wals(
     fs: &dyn Fs,
-    dir: &Path,
-    names: &[String],
+    wal_dirs: &[PathBuf],
     mem: &Arc<MemTable>,
     mut vs: VersionSet,
 ) -> Result<VersionSet> {
     let min_unflushed = vs.log_number;
-    let mut logs: Vec<(u64, &String)> = names
-        .iter()
-        .filter_map(|n| {
-            n.strip_suffix(".log")
-                .and_then(|s| s.parse().ok())
-                .map(|num| (num, n))
-        })
-        .filter(|(num, _)| *num >= min_unflushed)
-        .collect();
+    // Collect un-flushed WALs from every WAL directory, keyed by number. WAL numbers are
+    // globally monotonic, so the same number never appears in two directories.
+    let mut logs: Vec<(u64, PathBuf)> = Vec::new();
+    for dir in wal_dirs {
+        let names = match fs.list(dir) {
+            Ok(n) => n,
+            Err(_) => continue, // a configured failover dir may not exist yet
+        };
+        for n in names {
+            if let Some(num) = n.strip_suffix(".log").and_then(|s| s.parse::<u64>().ok())
+                && num >= min_unflushed
+            {
+                logs.push((num, dir.join(&n)));
+            }
+        }
+    }
     logs.sort_by_key(|(num, _)| *num);
 
     let mut last_seq = vs.last_sequence;
-    for (num, name) in logs {
-        let bytes = fs.read(&dir.join(name))?;
+    for (num, path) in logs {
+        let bytes = fs.read(&path)?;
         let mut reader = record::Reader::new(std::io::Cursor::new(bytes), num as u32);
         while let Some(rec) = reader.read_record()? {
             let batch = Batch::from_bytes(rec)?;
@@ -1054,6 +1131,28 @@ fn recover_wals(
     }
     vs.last_sequence = last_seq;
     Ok(vs)
+}
+
+/// Creates a WAL file numbered `wal_number`, trying `wal_dirs[start_idx..]` in order until
+/// one accepts it (failover). Returns the writer and the index of the directory used.
+fn create_wal(
+    fs: &dyn Fs,
+    wal_dirs: &[PathBuf],
+    start_idx: usize,
+    wal_number: u64,
+) -> Result<(record::Writer<Box<dyn WritableFile>>, usize)> {
+    let mut last_err = None;
+    for (i, dir) in wal_dirs.iter().enumerate().skip(start_idx) {
+        match fs.create(&dir.join(wal_filename(wal_number))) {
+            Ok(file) => {
+                return Ok((record::Writer::with_log_num(file, wal_number as u32), i));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .map(Error::from)
+        .unwrap_or_else(|| Error::InvalidState("db: no WAL directory available".into())))
 }
 
 /// Writes every entry of `mem` (in internal-key order) to `<dir>/<file_num>.sst`, and
