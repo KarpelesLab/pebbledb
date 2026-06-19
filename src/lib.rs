@@ -27,6 +27,7 @@ pub mod base;
 pub mod batch;
 pub mod crc;
 mod error;
+pub mod memtable;
 pub mod record;
 
 pub use error::{Error, Result};

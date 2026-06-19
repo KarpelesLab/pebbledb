@@ -20,7 +20,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   record format (carrying a log number). Read real Pebble WAL files.
 - [x] **Phase 3 — Batch.** 12-byte header (`seqnum: u64`, `count: u32`) followed by the
   op stream; encode/decode and apply to a memtable.
-- [ ] **Phase 4 — MemTable.** Arena-backed concurrent skiplist (port of `arenaskl`)
+- [x] **Phase 4 — MemTable.** Arena-backed concurrent skiplist (port of `arenaskl`)
   ordered by internal key, with an iterator.
 - [ ] **Phase 5 — sstable read.** Footer + magic + format versions (RocksDBv2,
   Pebblev1..v5), metaindex, index (incl. two-level), prefix-compressed data blocks with
