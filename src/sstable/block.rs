@@ -331,6 +331,63 @@ impl BlockIter {
             self.next();
         }
     }
+
+    /// Positions at the last entry of the block.
+    pub fn last(&mut self) {
+        if self.num_restarts == 0 {
+            self.valid = false;
+            return;
+        }
+        self.key.clear();
+        self.decode_at(self.restart_offset(self.num_restarts - 1));
+        while self.valid && self.next_offset < self.restarts {
+            self.decode_at(self.next_offset);
+        }
+    }
+
+    /// Steps back to the previous entry, becoming invalid before the first.
+    ///
+    /// Blocks are forward-delta encoded, so this re-decodes from the restart point
+    /// preceding the current entry and scans forward to the entry just before it.
+    pub fn prev(&mut self) {
+        if !self.valid {
+            return;
+        }
+        let original = self.offset;
+        if original == 0 {
+            self.valid = false;
+            self.key.clear();
+            return;
+        }
+        // Find the first restart whose offset is >= the current entry's offset; the one
+        // before it is the restart that begins (or precedes) the current entry.
+        let mut lo = 0usize;
+        let mut hi = self.num_restarts;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.restart_offset(mid) < original {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let start = lo - 1; // lo >= 1 because restart 0 is at offset 0 < original
+        self.key.clear();
+        self.decode_at(self.restart_offset(start));
+        while self.valid && self.next_offset < original {
+            self.decode_at(self.next_offset);
+        }
+    }
+
+    /// Positions at the last entry whose key is `< target`, becoming invalid if none.
+    pub fn seek_lt(&mut self, target: &[u8], cmp: &dyn Comparer) {
+        self.seek_ge(target, cmp);
+        if self.valid {
+            self.prev();
+        } else {
+            self.last();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +503,43 @@ mod tests {
         // Seek past the end -> invalid.
         it.seek_ge(&ikey(b"z", 5, InternalKeyKind::Set), &cmp);
         assert!(!it.valid());
+    }
+
+    #[test]
+    fn last_prev_and_seek_lt() {
+        let cmp = DefaultComparer;
+        let users = ["a", "c", "e", "g", "i"];
+        let keys: Vec<Vec<u8>> = users
+            .iter()
+            .map(|k| ikey(k.as_bytes(), 5, InternalKeyKind::Set))
+            .collect();
+        let entries: Vec<(&[u8], &[u8])> = keys
+            .iter()
+            .map(|k| (k.as_slice(), b"x".as_slice()))
+            .collect();
+        let block = build_block(&entries, 2);
+        let mut it = BlockIter::new(Arc::from(block)).unwrap();
+
+        // Reverse iteration via last()/prev() mirrors the forward order.
+        it.last();
+        let mut got = Vec::new();
+        while it.valid() {
+            got.push(String::from_utf8(it.key()[..1].to_vec()).unwrap());
+            it.prev();
+        }
+        assert_eq!(got, ["i", "g", "e", "c", "a"]);
+
+        // seek_lt("e") -> last key < e == "c".
+        it.seek_lt(&ikey(b"e", 5, InternalKeyKind::Set), &cmp);
+        assert_eq!(&it.key()[..1], b"c");
+
+        // seek_lt below everything -> invalid.
+        it.seek_lt(&ikey(b"a", 100, InternalKeyKind::Set), &cmp);
+        assert!(!it.valid());
+
+        // seek_lt past the end -> last entry.
+        it.seek_lt(&ikey(b"z", 5, InternalKeyKind::Set), &cmp);
+        assert_eq!(&it.key()[..1], b"i");
     }
 
     #[test]

@@ -77,9 +77,13 @@ refined as they are reached.
 - [x] **Phase 19 — Snapshots & sequence semantics.** Registered snapshots that hold back
   compaction (retain versions an open snapshot needs), correct SINGLEDEL semantics, and
   eventually-file-only snapshots.
-- [ ] **Phase 20 — Iterator surface.** Reverse iteration (`Prev`/`Last`/`SeekLT`) through
-  the whole DB, lower/upper bounds, prefix iteration with bloom (`SeekPrefixGE`),
-  `IterOptions`, and point/range/both key-type selection.
+- [x] **Phase 20 — Iterator surface.** Full bidirectional iteration through the whole DB
+  (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`), with seek and reverse threaded down
+  through `BlockIter`, `TableIter`, the memtable iterator, and a direction-switching
+  `MergingIter`. `IterOptions` lower/upper bounds (inclusive/exclusive) and
+  `seek_prefix_ge` prefix iteration on `DbIterator`, with reverse merge/range-tombstone
+  resolution shared with the forward path. (Bloom-skip during `seek_prefix_ge` and
+  point/range/both key-type selection remain a perf/range-key follow-up.)
 - [ ] **Phase 21 — Concurrency & commit pipeline.** Group commit, a background flush
   worker, concurrent background compactions, non-blocking memtable rotation, and
   read/write concurrency under load.

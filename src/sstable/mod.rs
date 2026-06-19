@@ -583,39 +583,38 @@ impl Reader {
         Ok(TableIter {
             reader: Arc::clone(self),
             handles,
-            next_block: 0,
+            block_idx: None,
             data: None,
             cur_value: Vec::new(),
         })
     }
 }
 
-/// A forward iterator over all entries of an sstable. Data-block handles are resolved up
-/// front (flattening any two-level index); each block is read and iterated in turn.
+/// A bidirectional, seekable iterator over all entries of an sstable. Data-block handles
+/// are resolved up front (flattening any two-level index); blocks are loaded on demand as
+/// the cursor crosses block boundaries in either direction.
 pub struct TableIter {
     reader: Arc<Reader>,
     handles: Vec<BlockHandle>,
-    /// Index into `handles` of the next block to load.
-    next_block: usize,
+    /// Index into `handles` of the currently loaded block, if any.
+    block_idx: Option<usize>,
     data: Option<BlockIter>,
     /// The current entry's resolved value (value prefixes/handles already applied).
     cur_value: Vec<u8>,
 }
 
 impl TableIter {
-    /// Loads the next data block in `handles`, if any, returning whether one was loaded.
-    fn load_next_block(&mut self) -> Result<bool> {
-        if self.next_block >= self.handles.len() {
-            self.data = None;
-            return Ok(false);
-        }
-        let handle = self.handles[self.next_block];
-        self.next_block += 1;
-        let block = self.reader.read_data_block(handle)?;
-        let mut it = BlockIter::new(block)?;
-        it.first();
-        self.data = Some(it);
-        Ok(true)
+    /// Loads the data block at `idx` (without positioning within it).
+    fn load_block(&mut self, idx: usize) -> Result<()> {
+        let block = self.reader.read_data_block(self.handles[idx])?;
+        self.data = Some(BlockIter::new(block)?);
+        self.block_idx = Some(idx);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.data = None;
+        self.block_idx = None;
     }
 
     /// Resolves and caches the current entry's value.
@@ -630,17 +629,32 @@ impl TableIter {
 
     /// Advances to the first entry and returns whether one exists.
     pub fn first(&mut self) -> Result<bool> {
-        self.next_block = 0;
-        // Skip any empty data blocks.
-        loop {
-            if !self.load_next_block()? {
-                return Ok(false);
-            }
-            if self.data.as_ref().is_some_and(|d| d.valid()) {
+        for i in 0..self.handles.len() {
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().first();
+            if self.data.as_ref().unwrap().valid() {
                 self.refresh_value()?;
                 return Ok(true);
             }
         }
+        self.clear();
+        Ok(false)
+    }
+
+    /// Positions at the last entry and returns whether one exists.
+    pub fn last(&mut self) -> Result<bool> {
+        let mut i = self.handles.len();
+        while i > 0 {
+            i -= 1;
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().last();
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
+            }
+        }
+        self.clear();
+        Ok(false)
     }
 
     /// Whether the iterator is at a valid entry.
@@ -672,15 +686,106 @@ impl TableIter {
             None => return Ok(false),
         }
         // Current data block exhausted; advance to the next non-empty block.
-        loop {
-            if !self.load_next_block()? {
-                return Ok(false);
+        let mut i = self.block_idx.expect("loaded") + 1;
+        while i < self.handles.len() {
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().first();
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
             }
-            if self.data.as_ref().is_some_and(|d| d.valid()) {
+            i += 1;
+        }
+        self.clear();
+        Ok(false)
+    }
+
+    /// Steps back to the previous entry. Returns whether the iterator remains valid.
+    pub fn prev(&mut self) -> Result<bool> {
+        match self.data.as_mut() {
+            Some(d) => {
+                d.prev();
+                if d.valid() {
+                    self.refresh_value()?;
+                    return Ok(true);
+                }
+            }
+            None => return Ok(false),
+        }
+        // Current data block exhausted at its front; retreat to the previous block.
+        let mut i = self.block_idx.expect("loaded");
+        while i > 0 {
+            i -= 1;
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().last();
+            if self.data.as_ref().unwrap().valid() {
                 self.refresh_value()?;
                 return Ok(true);
             }
         }
+        self.clear();
+        Ok(false)
+    }
+
+    /// Positions at the first entry whose internal key is `>= target`.
+    pub fn seek_ge(&mut self, target: &[u8]) -> Result<bool> {
+        let handle = match self.reader.seek_data_handle(target)? {
+            Some(h) => h,
+            None => {
+                self.clear();
+                return Ok(false);
+            }
+        };
+        let idx = self.handles.iter().position(|x| *x == handle).unwrap_or(0);
+        let cmp = self.reader.cmp.clone();
+        self.load_block(idx)?;
+        self.data.as_mut().unwrap().seek_ge(target, cmp.as_ref());
+        if self.data.as_ref().unwrap().valid() {
+            self.refresh_value()?;
+            return Ok(true);
+        }
+        // Target falls past this block; scan into later blocks.
+        let mut i = idx + 1;
+        while i < self.handles.len() {
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().first();
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
+            }
+            i += 1;
+        }
+        self.clear();
+        Ok(false)
+    }
+
+    /// Positions at the last entry whose internal key is `< target`.
+    pub fn seek_lt(&mut self, target: &[u8]) -> Result<bool> {
+        let idx = match self.reader.seek_data_handle(target)? {
+            Some(h) => self.handles.iter().position(|x| *x == h).unwrap_or(0),
+            // Target is past the whole table: the last entry is the answer.
+            None => return self.last(),
+        };
+        let cmp = self.reader.cmp.clone();
+        self.load_block(idx)?;
+        self.data.as_mut().unwrap().seek_lt(target, cmp.as_ref());
+        if self.data.as_ref().unwrap().valid() {
+            self.refresh_value()?;
+            return Ok(true);
+        }
+        // Nothing < target in this block; retreat to earlier blocks.
+        let mut i = idx;
+        while i > 0 {
+            i -= 1;
+            self.load_block(i)?;
+            self.data.as_mut().unwrap().last();
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
+            }
+        }
+        self.clear();
+        Ok(false)
     }
 }
 

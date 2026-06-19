@@ -616,6 +616,43 @@ impl OwnedMemIter {
         }
         self.rebuild_key();
     }
+
+    /// Positions at the last entry.
+    pub fn last(&mut self) {
+        self.nd = prev_off(&self.mem.skl.arena, self.mem.skl.tail, 0);
+        self.rebuild_key();
+    }
+
+    /// Steps back to the previous entry.
+    pub fn prev(&mut self) {
+        if self.nd != self.mem.skl.head {
+            self.nd = prev_off(&self.mem.skl.arena, self.nd, 0);
+        }
+        self.rebuild_key();
+    }
+
+    /// Splits an encoded internal key into its user key and trailer.
+    fn split(target: &[u8]) -> (&[u8], u64) {
+        let n = target.len() - 8;
+        let trailer = u64::from_le_bytes(target[n..].try_into().unwrap());
+        (&target[..n], trailer)
+    }
+
+    /// Positions at the first entry whose internal key is `>= target`.
+    pub fn seek_ge(&mut self, target: &[u8]) {
+        let (uk, tr) = Self::split(target);
+        let (_, next) = self.mem.skl.seek_for_splice(uk, tr);
+        self.nd = next;
+        self.rebuild_key();
+    }
+
+    /// Positions at the last entry whose internal key is `< target`.
+    pub fn seek_lt(&mut self, target: &[u8]) {
+        let (uk, tr) = Self::split(target);
+        let (prev, _) = self.mem.skl.seek_for_splice(uk, tr);
+        self.nd = prev;
+        self.rebuild_key();
+    }
 }
 
 #[cfg(test)]

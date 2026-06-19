@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pebbledb::{Batch, Db, Options};
+use pebbledb::{Batch, Db, IterOptions, Options};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -131,6 +131,126 @@ fn block_cache_serves_repeated_reads() {
         "expected block-cache hits, got {}",
         m.block_cache_hits
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn collect_reverse(it: &mut pebbledb::DbIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    it.last().unwrap();
+    while it.valid() {
+        out.push((it.key().to_vec(), it.value().to_vec()));
+        it.prev().unwrap();
+    }
+    out
+}
+
+#[test]
+fn reverse_iteration_matches_forward() {
+    let dir = temp_dir("reverse");
+    let opts = Options {
+        mem_table_size: 16 * 1024, // force several flushes + levels
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..1500u32 {
+        db.set(format!("k{i:05}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    // Overwrite some so multiple versions exist across levels.
+    for i in 0..200u32 {
+        db.set(format!("k{i:05}").as_bytes(), b"new").unwrap();
+    }
+    db.delete(b"k00500").unwrap();
+
+    let forward = collect(&db);
+    let mut it = db.iter().unwrap();
+    let mut reverse = collect_reverse(&mut it);
+    reverse.reverse();
+    assert_eq!(forward, reverse, "reverse iteration must mirror forward");
+    assert_eq!(forward.len(), 1499); // 1500 written, 1 deleted
+    assert_eq!(db.get(b"k00000").unwrap(), Some(b"new".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seek_and_bounds() {
+    let dir = temp_dir("seek-bounds");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..100u32 {
+        db.set(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    // seek_ge lands on the first key >= target.
+    let mut it = db.iter().unwrap();
+    it.seek_ge(b"k042").unwrap();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"k042");
+    it.next().unwrap();
+    assert_eq!(it.key(), b"k043");
+
+    // seek_ge to a gap rounds up.
+    it.seek_ge(b"k0419").unwrap();
+    assert_eq!(it.key(), b"k042");
+
+    // seek_lt lands on the last key < target.
+    it.seek_lt(b"k042").unwrap();
+    assert_eq!(it.key(), b"k041");
+    it.prev().unwrap();
+    assert_eq!(it.key(), b"k040");
+
+    // Direction change: seek_ge then prev.
+    it.seek_ge(b"k050").unwrap();
+    it.prev().unwrap();
+    assert_eq!(it.key(), b"k049");
+    it.next().unwrap();
+    assert_eq!(it.key(), b"k050");
+
+    // Bounds restrict the visible range.
+    let mut bit = db
+        .iter_with_options(IterOptions {
+            lower_bound: Some(b"k010".to_vec()),
+            upper_bound: Some(b"k020".to_vec()),
+        })
+        .unwrap();
+    bit.first().unwrap();
+    assert_eq!(bit.key(), b"k010");
+    let mut keys = Vec::new();
+    while bit.valid() {
+        keys.push(String::from_utf8(bit.key().to_vec()).unwrap());
+        bit.next().unwrap();
+    }
+    assert_eq!(keys.first().unwrap(), "k010");
+    assert_eq!(keys.last().unwrap(), "k019"); // upper bound exclusive
+    assert_eq!(keys.len(), 10);
+
+    // last() honors the upper bound.
+    bit.last().unwrap();
+    assert_eq!(bit.key(), b"k019");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prefix_iteration() {
+    let dir = temp_dir("prefix");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for k in ["aa1", "aa2", "ab1", "ba1", "bb1"] {
+        db.set(k.as_bytes(), b"x").unwrap();
+    }
+    db.flush().unwrap();
+
+    let mut it = db.iter().unwrap();
+    it.seek_prefix_ge(b"aa", b"aa").unwrap();
+    let mut keys = Vec::new();
+    while it.valid() {
+        keys.push(String::from_utf8(it.key().to_vec()).unwrap());
+        it.next().unwrap();
+    }
+    assert_eq!(keys, ["aa1", "aa2"]); // stops at the prefix boundary
 
     let _ = std::fs::remove_dir_all(&dir);
 }

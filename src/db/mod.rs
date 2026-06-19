@@ -25,8 +25,8 @@ mod compaction;
 mod filenames;
 mod merging_iter;
 
-pub use merging_iter::DbIterator;
 use merging_iter::InternalIter;
+pub use merging_iter::{DbIterator, IterOptions};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -582,6 +582,17 @@ impl Db {
 
     /// Returns a forward iterator over all keys as visible at `snapshot`.
     pub fn iter_at(&self, snapshot: SeqNum) -> Result<DbIterator> {
+        self.iter_at_with_options(snapshot, IterOptions::default())
+    }
+
+    /// Returns an iterator with bounds (and other [`IterOptions`]) over the latest view.
+    pub fn iter_with_options(&self, opts: IterOptions) -> Result<DbIterator> {
+        let snapshot = self.state.lock().unwrap().vs.last_sequence;
+        self.iter_at_with_options(snapshot, opts)
+    }
+
+    /// Returns an iterator with bounds over the view as visible at `snapshot`.
+    pub fn iter_at_with_options(&self, snapshot: SeqNum, opts: IterOptions) -> Result<DbIterator> {
         let (mem, imm, version) = {
             let state = self.state.lock().unwrap();
             (
@@ -605,12 +616,13 @@ impl Db {
                 sources.push(Box::new(reader.iter()?));
             }
         }
-        DbIterator::new(
+        DbIterator::with_options(
             sources,
             snapshot,
             self.cmp.clone(),
             tombstones,
             self.merger.clone(),
+            opts,
         )
     }
 
