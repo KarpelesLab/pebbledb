@@ -65,9 +65,15 @@ refined as they are reached.
 - [x] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
   indirection), Pebblev4 DELSIZED tombstones, and blob files for separated values with
   their MANIFEST blob-file edits and references.
-- [ ] **Phase 16 — Columnar blocks.** The Pebblev5+ columnar data / index / keyspan block
-  formats (read + write), table-format versions v5–v8, and the v6/v7 footer checksum +
-  attributes.
+- [~] **Phase 16 — Columnar blocks (in progress).** Table-format versions v5–v8 and the
+  v6/v7 footer (checksum + attributes) are recognized by the footer parser, and the
+  columnar block header (`sstable::colblk`: version, column count, row count, per-column
+  type + page offset, trailing padding) plus the `DataType` enum are parsed and tested
+  against the documented layout. **Remaining (the bulk of this phase):** the per-column
+  codecs (uint width/delta, prefix-bytes prefix compression, raw bytes, bool bitmaps) and
+  the columnar data / index / keyspan block iterators on top of them — a large subsystem
+  that the interop CI is the right vehicle to validate. Until it lands, the reader returns
+  a clear "columnar format not yet supported" error rather than misreading a v5+ table.
 - [x] **Phase 17 — MANIFEST completeness.** `NewFile5` (range-key bounds, with the
   point/range bounds marker) is decoded, and the full `NewFile4`/`NewFile5` custom-tag set
   — creation time, no-range-key-sets, virtual backing tables, synthetic prefix/suffix, and

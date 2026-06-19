@@ -26,6 +26,7 @@
 //! format (Pebblev5+) and blob files are not yet supported.
 
 pub mod block;
+pub mod colblk;
 pub mod filter;
 pub mod properties;
 pub mod valblk;
