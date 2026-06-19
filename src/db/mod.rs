@@ -593,6 +593,30 @@ impl DbInner {
         self.apply(b)
     }
 
+    /// Deletes `key` using single-delete semantics: valid only when `key` has at most one
+    /// prior `set` not yet compacted away. Behaves as a deletion on read.
+    pub fn single_delete(&self, key: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.single_delete(key);
+        self.apply(b)
+    }
+
+    /// Deletes `key`, recording the approximate deleted value size as a compaction hint
+    /// (Pebblev4 `DELSIZED`). Behaves as a deletion on read.
+    pub fn delete_sized(&self, key: &[u8], value_size: u64) -> Result<()> {
+        let mut b = Batch::new();
+        b.delete_sized(key, value_size);
+        self.apply(b)
+    }
+
+    /// Appends opaque data to the write-ahead log without modifying the keyspace
+    /// (Pebble's `LogData`). Useful for embedding application markers in the WAL.
+    pub fn log_data(&self, data: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.log_data(data);
+        self.apply(b)
+    }
+
     /// Records a merge operand for `key`, combined with prior values by the configured
     /// merge operator at read time.
     pub fn merge(&self, key: &[u8], value: &[u8]) -> Result<()> {

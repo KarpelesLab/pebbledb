@@ -184,6 +184,14 @@ impl Batch {
         self.add(InternalKeyKind::SingleDelete, key, None);
     }
 
+    /// Deletes `key`, recording the approximate size of the value being deleted as a hint
+    /// for compaction heuristics (Pebblev4 `DELSIZED`). Behaves as a deletion on read.
+    pub fn delete_sized(&mut self, key: &[u8], value_size: u64) {
+        let mut v = Vec::new();
+        crate::base::varint::put_uvarint(&mut v, value_size);
+        self.add(InternalKeyKind::DeleteSized, key, Some(&v));
+    }
+
     /// Deletes every key in the half-open user-key range `[start, end)`.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
         self.add(InternalKeyKind::RangeDelete, start, Some(end));

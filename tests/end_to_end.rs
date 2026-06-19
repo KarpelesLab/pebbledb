@@ -923,6 +923,35 @@ fn external_iter_merges_sstables_without_ingesting() {
 }
 
 #[test]
+fn single_delete_delete_sized_and_log_data() {
+    let dir = temp_dir("del-variants");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"s", b"v").unwrap();
+    db.set(b"z", b"zz").unwrap();
+
+    // single_delete and delete_sized both read back as absent.
+    db.single_delete(b"s").unwrap();
+    assert_eq!(db.get(b"s").unwrap(), None);
+    db.delete_sized(b"z", 2).unwrap();
+    assert_eq!(db.get(b"z").unwrap(), None);
+
+    // log_data is a WAL-only marker; it does not change the keyspace.
+    db.set(b"keep", b"1").unwrap();
+    db.log_data(b"app-marker").unwrap();
+    assert_eq!(db.get(b"keep").unwrap(), Some(b"1".to_vec()));
+
+    // All of it survives flush + reopen.
+    db.flush().unwrap();
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"s").unwrap(), None);
+    assert_eq!(db.get(b"z").unwrap(), None);
+    assert_eq!(db.get(b"keep").unwrap(), Some(b"1".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
