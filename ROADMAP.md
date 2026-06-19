@@ -114,8 +114,11 @@ refined as they are reached.
   directories, failover, recycling, and the sync queue.
 - [x] **Phase 28 — Metrics & observability.** Complete `Metrics`, an `EventListener`, and
   logging/tracing hooks matching Pebble's surface.
-- [ ] **Phase 29 — Tooling.** Rust equivalents of the `pebble` CLI tools (sstable /
-  manifest / WAL dump, DB inspection) and debug utilities.
+- [x] **Phase 29 — Tooling.** A `pebbledb` CLI binary (`src/bin/pebbledb.rs`) with
+  `sstable dump`, `wal dump`, `manifest dump`, and `db get` / `db scan` (read-only)
+  subcommands, with human-readable internal-key and byte-escaping formatting. Integration
+  tests drive each subcommand against freshly-built on-disk files. (Further `pebble`
+  subcommands — `bench`, `find`, space-amplification analysis — remain a follow-up.)
 - [ ] **Phase 30 — Interop & correctness hardening.** Bidirectional interop verified in
   **GitHub Actions**: a CI job installs Go and `cockroachdb/pebble`, generates fixtures
   (sstables, WAL, MANIFEST, full DBs) that pebbledb must read, and verifies Go Pebble can
