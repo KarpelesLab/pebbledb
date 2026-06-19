@@ -18,7 +18,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
 - [x] **Phase 2 — record log (WAL).** Reader/writer over 32 KiB blocks; 7-byte header
   (`crc32c | length | type`); full/first/middle/last records plus the recyclable
   record format (carrying a log number). Read real Pebble WAL files.
-- [ ] **Phase 3 — Batch.** 12-byte header (`seqnum: u64`, `count: u32`) followed by the
+- [x] **Phase 3 — Batch.** 12-byte header (`seqnum: u64`, `count: u32`) followed by the
   op stream; encode/decode and apply to a memtable.
 - [ ] **Phase 4 — MemTable.** Arena-backed concurrent skiplist (port of `arenaskl`)
   ordered by internal key, with an iterator.

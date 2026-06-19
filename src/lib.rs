@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 pub mod base;
+pub mod batch;
 pub mod crc;
 mod error;
 pub mod record;
