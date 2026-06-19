@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::base::comparer::{Comparer, DefaultComparer};
-use crate::base::internal_key::{InternalKeyKind, SeqNum};
+use crate::base::internal_key::{InternalKey, InternalKeyKind, SeqNum, encoded_user_key};
+use crate::base::range_del::max_covering_seqnum;
 use crate::batch::Batch;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, VersionEdit, VersionSet};
 use crate::memtable::MemTable;
@@ -207,6 +208,13 @@ impl Db {
         self.apply(b)
     }
 
+    /// Deletes every key in the half-open user-key range `[start, end)`.
+    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.delete_range(start, end);
+        self.apply(b)
+    }
+
     /// Atomically applies all operations in `batch`. Alias for [`Db::apply`].
     pub fn write(&self, batch: Batch) -> Result<()> {
         self.apply(batch)
@@ -302,6 +310,12 @@ impl Db {
     }
 
     /// Looks up `key` as visible at sequence number `snapshot`.
+    ///
+    /// Sources are consulted newest-first. As each is examined its covering range
+    /// tombstones (with `seqnum <= snapshot`) raise a running maximum; the first source
+    /// that holds a point entry for `key` decides the result: the entry is visible only
+    /// if its sequence number exceeds every covering tombstone seen so far (and is a
+    /// non-tombstone kind).
     pub fn get_at(&self, key: &[u8], snapshot: SeqNum) -> Result<Option<Vec<u8>>> {
         // Snapshot the volatile state under the lock, then read without holding it.
         let (mem, imm, version) = {
@@ -313,19 +327,43 @@ impl Db {
             )
         };
 
-        if let Some(hit) = mem.get(key, snapshot) {
-            return Ok(visible_value(hit));
+        let mut max_rts = 0u64;
+        let cmp = self.cmp.as_ref();
+
+        // Mutable memtable.
+        max_rts = max_rts.max(max_covering_seqnum(
+            &mem.range_tombstones(),
+            cmp,
+            key,
+            snapshot,
+        ));
+        if let Some((seq, kind, value)) = mem.lookup(key, snapshot) {
+            return Ok(resolve(seq, kind, value, max_rts));
         }
+        // Immutable memtables, newest first.
         for m in imm.iter().rev() {
-            if let Some(hit) = m.get(key, snapshot) {
-                return Ok(visible_value(hit));
+            max_rts = max_rts.max(max_covering_seqnum(
+                &m.range_tombstones(),
+                cmp,
+                key,
+                snapshot,
+            ));
+            if let Some((seq, kind, value)) = m.lookup(key, snapshot) {
+                return Ok(resolve(seq, kind, value, max_rts));
             }
         }
+        // Sstables: L0 newest-first, then L1..L6.
         for level in 0..NUM_LEVELS {
-            for f in version.overlapping(self.cmp.as_ref(), level, key) {
+            for f in version.overlapping(cmp, level, key) {
                 let reader = self.open_reader(f.file_num)?;
-                if let Some((kind, value)) = reader.get(key, snapshot)? {
-                    return Ok(visible_value((kind, value)));
+                max_rts = max_rts.max(max_covering_seqnum(
+                    reader.range_tombstones(),
+                    cmp,
+                    key,
+                    snapshot,
+                ));
+                if let Some((seq, kind, value)) = reader.lookup(key, snapshot)? {
+                    return Ok(resolve(seq, kind, value, max_rts));
                 }
             }
         }
@@ -350,17 +388,20 @@ impl Db {
         };
 
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
+        let mut tombstones = mem.range_tombstones();
         sources.push(Box::new(mem.scan()));
         for m in imm.iter().rev() {
+            tombstones.extend(m.range_tombstones());
             sources.push(Box::new(m.scan()));
         }
         for level in version.levels.iter() {
             for f in level {
                 let reader = self.open_reader(f.file_num)?;
+                tombstones.extend_from_slice(reader.range_tombstones());
                 sources.push(Box::new(reader.iter()?));
             }
         }
-        DbIterator::new(sources, snapshot, self.cmp.clone())
+        DbIterator::new(sources, snapshot, self.cmp.clone(), tombstones)
     }
 
     /// Opens (or returns a cached) reader for the sstable with the given file number.
@@ -446,9 +487,13 @@ pub struct Metrics {
     pub last_sequence: SeqNum,
 }
 
-/// Maps a `(kind, value)` lookup result to a user-visible value, treating tombstones as
-/// absent.
-fn visible_value((kind, value): (InternalKeyKind, Vec<u8>)) -> Option<Vec<u8>> {
+/// Resolves a point entry against the maximum covering range-tombstone sequence number:
+/// the entry is visible only if it is newer than every covering tombstone and is not
+/// itself a point tombstone.
+fn resolve(seq: SeqNum, kind: InternalKeyKind, value: Vec<u8>, max_rts: u64) -> Option<Vec<u8>> {
+    if seq <= max_rts {
+        return None; // shadowed by a range tombstone
+    }
     match kind {
         InternalKeyKind::Delete | InternalKeyKind::SingleDelete | InternalKeyKind::DeleteSized => {
             None
@@ -531,6 +576,35 @@ fn write_memtable_to_sstable(
         largest_seq = largest_seq.max(seq);
         it.next();
     }
+
+    // Write the memtable's range tombstones, in start-key order, into the range-del
+    // block. Each contributes its bounds to the file's key range.
+    let mut tombstones = mem.range_tombstones();
+    tombstones.sort_by(|a, b| {
+        cmp.compare(&a.start, &b.start)
+            .then(b.seqnum.cmp(&a.seqnum))
+    });
+    for t in &tombstones {
+        let start_ikey =
+            InternalKey::new(t.start.clone(), t.seqnum, InternalKeyKind::RangeDelete).encode();
+        w.add(&start_ikey, &t.end)?;
+        if smallest.is_none()
+            || cmp.compare(&t.start, encoded_user_key(smallest.as_ref().unwrap()))
+                == std::cmp::Ordering::Less
+        {
+            smallest = Some(start_ikey.clone());
+        }
+        // The tombstone's exclusive end extends the largest user-key bound.
+        if largest.is_empty()
+            || cmp.compare(&t.end, encoded_user_key(&largest)) == std::cmp::Ordering::Greater
+        {
+            largest =
+                InternalKey::new(t.end.clone(), t.seqnum, InternalKeyKind::RangeDelete).encode();
+        }
+        smallest_seq = smallest_seq.min(t.seqnum);
+        largest_seq = largest_seq.max(t.seqnum);
+    }
+
     w.finish()?;
 
     Ok(FileMetadata {
@@ -760,6 +834,66 @@ mod tests {
             );
         }
         assert_eq!(collect(&db).len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn range_deletions_in_memtable() {
+        let dir = temp_dir();
+        let db = Db::open(&dir, Options::default()).unwrap();
+        for i in 0..20u32 {
+            db.set(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        // Delete the range [k05, k15).
+        db.delete_range(b"k05", b"k15").unwrap();
+        for i in 0..20u32 {
+            let key = format!("k{i:02}");
+            let got = db.get(key.as_bytes()).unwrap();
+            if (5..15).contains(&i) {
+                assert_eq!(got, None, "{key} should be range-deleted");
+            } else {
+                assert_eq!(got, Some(format!("v{i}").into_bytes()), "{key}");
+            }
+        }
+        // A point write after the range delete resurrects that key.
+        db.set(b"k07", b"new7").unwrap();
+        assert_eq!(db.get(b"k07").unwrap(), Some(b"new7".to_vec()));
+        // Iteration also hides range-deleted keys.
+        let live: Vec<_> = collect(&db).into_iter().map(|(k, _)| k).collect();
+        assert!(!live.contains(&"k06".to_string()));
+        assert!(live.contains(&"k07".to_string()));
+        assert!(live.contains(&"k15".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn range_deletions_survive_flush_and_compaction() {
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        // Write keys, delete a wide range, then write enough to force flushes and a
+        // compaction so the range tombstone must persist through both.
+        for i in 0..400u32 {
+            db.set(format!("key{i:05}").as_bytes(), b"v").unwrap();
+        }
+        db.delete_range(b"key00100", b"key00300").unwrap();
+        for i in 400..2000u32 {
+            db.set(format!("key{i:05}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+
+        // Reopen to ensure the tombstone persisted to disk and is reapplied.
+        drop(db);
+        let db = Db::open(&dir, Options::default()).unwrap();
+        assert_eq!(db.get(b"key00050").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(db.get(b"key00100").unwrap(), None);
+        assert_eq!(db.get(b"key00200").unwrap(), None);
+        assert_eq!(db.get(b"key00299").unwrap(), None);
+        assert_eq!(db.get(b"key00300").unwrap(), Some(b"v".to_vec()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

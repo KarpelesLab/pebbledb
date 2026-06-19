@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::base::comparer::Comparer;
 use crate::base::internal_key::{InternalKeyKind, SeqNum, make_trailer, trailer_kind};
+use crate::base::range_del::RangeTombstone;
 use crate::batch::Batch;
 use crate::{Error, Result};
 
@@ -406,9 +407,12 @@ impl<'a> SklIterator<'a> {
     }
 }
 
-/// An in-memory write buffer: a [`Skiplist`] of internal keys plus batch application.
+/// An in-memory write buffer: a [`Skiplist`] of point keys plus a list of range
+/// tombstones, with batch application.
 pub struct MemTable {
     skl: Skiplist,
+    /// Range tombstones applied to this memtable, kept separate from point keys.
+    range_dels: std::sync::Mutex<Vec<RangeTombstone>>,
 }
 
 impl MemTable {
@@ -416,6 +420,7 @@ impl MemTable {
     pub fn new(cmp: Arc<dyn Comparer>, arena_size: usize) -> Self {
         MemTable {
             skl: Skiplist::new(cmp, arena_size),
+            range_dels: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -426,13 +431,30 @@ impl MemTable {
         let base = batch.seqnum();
         for (i, op) in batch.iter().enumerate() {
             let op = op?;
-            if op.kind == InternalKeyKind::LogData {
-                continue;
+            let seqnum = base + i as u64;
+            match op.kind {
+                InternalKeyKind::LogData => continue,
+                InternalKeyKind::RangeDelete => {
+                    // start = key, end = value; kept in the range-del list, not the
+                    // point-key skiplist.
+                    self.range_dels.lock().unwrap().push(RangeTombstone::new(
+                        op.key.to_vec(),
+                        op.value.unwrap_or(&[]).to_vec(),
+                        seqnum,
+                    ));
+                }
+                _ => {
+                    let trailer = make_trailer(seqnum, op.kind);
+                    self.skl.add(op.key, trailer, op.value.unwrap_or(&[]))?;
+                }
             }
-            let trailer = make_trailer(base + i as u64, op.kind);
-            self.skl.add(op.key, trailer, op.value.unwrap_or(&[]))?;
         }
         Ok(())
+    }
+
+    /// Returns a copy of the memtable's range tombstones.
+    pub fn range_tombstones(&self) -> Vec<RangeTombstone> {
+        self.range_dels.lock().unwrap().clone()
     }
 
     /// Inserts a single internal key/value pair directly.
@@ -452,6 +474,16 @@ impl MemTable {
     /// A returned [`InternalKeyKind::Delete`] / [`InternalKeyKind::SingleDelete`] is a
     /// tombstone; the caller treats it as "not found" but must not look in older levels.
     pub fn get(&self, user_key: &[u8], snapshot: SeqNum) -> Option<(InternalKeyKind, Vec<u8>)> {
+        self.lookup(user_key, snapshot).map(|(_, k, v)| (k, v))
+    }
+
+    /// Like [`MemTable::get`] but also returns the entry's sequence number, used by the
+    /// database to compare point keys against range tombstones.
+    pub fn lookup(
+        &self,
+        user_key: &[u8],
+        snapshot: SeqNum,
+    ) -> Option<(SeqNum, InternalKeyKind, Vec<u8>)> {
         // A trailer of (snapshot << 8 | 0xff) sorts immediately before any real entry at
         // `snapshot`, so SeekGE lands on the newest entry with seqnum <= snapshot.
         let trailer = (snapshot << 8) | 0xff;
@@ -463,12 +495,12 @@ impl MemTable {
         if self.skl.cmp.compare(it.user_key(), user_key) != std::cmp::Ordering::Equal {
             return None;
         }
-        Some((it.kind(), it.value().to_vec()))
+        Some((it.trailer() >> 8, it.kind(), it.value().to_vec()))
     }
 
-    /// Whether the memtable is empty.
+    /// Whether the memtable has neither point keys nor range tombstones.
     pub fn is_empty(&self) -> bool {
-        self.skl.is_empty()
+        self.skl.is_empty() && self.range_dels.lock().unwrap().is_empty()
     }
 
     /// The number of bytes allocated from the arena.

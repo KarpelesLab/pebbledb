@@ -20,6 +20,7 @@ use crate::base::internal_key::{
     InternalKeyKind, SeqNum, compare_encoded, encoded_trailer, encoded_user_key, trailer_kind,
     trailer_seqnum,
 };
+use crate::base::range_del::{RangeTombstone, max_covering_seqnum};
 use crate::memtable::OwnedMemIter;
 use crate::sstable::TableIter;
 
@@ -150,6 +151,8 @@ pub struct DbIterator {
     cur_value: Vec<u8>,
     valid: bool,
     started: bool,
+    /// All range tombstones visible at the snapshot, across every source.
+    range_tombstones: Vec<RangeTombstone>,
 }
 
 impl DbIterator {
@@ -157,12 +160,14 @@ impl DbIterator {
         sources: Vec<Box<dyn InternalIter>>,
         snapshot: SeqNum,
         cmp: Arc<dyn Comparer>,
+        range_tombstones: Vec<RangeTombstone>,
     ) -> Result<DbIterator> {
         let merge = MergingIter::new(sources, cmp.clone())?;
         Ok(DbIterator {
             merge,
             snapshot,
             cmp,
+            range_tombstones,
             cur_key: Vec::new(),
             cur_value: Vec::new(),
             valid: false,
@@ -211,7 +216,7 @@ impl DbIterator {
     fn advance_to_next_user_key(&mut self) -> Result<()> {
         while self.merge.valid() {
             let ukey = encoded_user_key(self.merge.key()).to_vec();
-            let mut chosen: Option<(InternalKeyKind, Vec<u8>)> = None;
+            let mut chosen: Option<(SeqNum, InternalKeyKind, Vec<u8>)> = None;
 
             // Versions of the same user key arrive newest-first (trailer descending).
             while self.merge.valid()
@@ -221,14 +226,27 @@ impl DbIterator {
                 if chosen.is_none() {
                     let trailer = encoded_trailer(self.merge.key());
                     if trailer_seqnum(trailer) <= self.snapshot {
-                        chosen = Some((trailer_kind(trailer), self.merge.value().to_vec()));
+                        chosen = Some((
+                            trailer_seqnum(trailer),
+                            trailer_kind(trailer),
+                            self.merge.value().to_vec(),
+                        ));
                     }
                 }
                 self.merge.advance()?;
             }
 
+            // A covering range tombstone newer than the chosen point version deletes it.
+            let max_rts = max_covering_seqnum(
+                &self.range_tombstones,
+                self.cmp.as_ref(),
+                &ukey,
+                self.snapshot,
+            );
+
             match chosen {
-                Some((kind, value)) => match kind {
+                Some((seq, _, _)) if seq <= max_rts => continue, // deleted by a range tombstone
+                Some((_, kind, value)) => match kind {
                     InternalKeyKind::Delete
                     | InternalKeyKind::SingleDelete
                     | InternalKeyKind::DeleteSized => continue, // tombstone: skip this key

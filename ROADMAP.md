@@ -57,7 +57,7 @@ refined as they are reached.
 - [x] **Phase 12 — sstable format completeness.** Two-level indexes (read + write), bloom
   filters (full filter: build, store, and use in `Get`/`SeekPrefixGE`), the complete
   properties block, full metaindex, xxHash64 block checksums, and per-block-kind options.
-- [ ] **Phase 13 — Range deletions.** RANGEDEL v1/v2 blocks (read + write),
+- [x] **Phase 13 — Range deletions.** RANGEDEL v1/v2 blocks (read + write),
   range-tombstone-aware iterators, `Get`, and compaction (truncation, fragmentation,
   eliding).
 - [ ] **Phase 14 — Range keys.** RANGEKEYSET / RANGEKEYUNSET / RANGEKEYDEL blocks,

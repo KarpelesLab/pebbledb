@@ -27,7 +27,9 @@ use crate::crc::{Crc32c, mask};
 use crate::{Error, Result};
 
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
-use super::properties::{BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, Properties, TWO_LEVEL_INDEX};
+use super::properties::{
+    BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, META_RANGE_DEL_NAME, Properties, TWO_LEVEL_INDEX,
+};
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
     VERSION_LEN,
@@ -168,6 +170,9 @@ pub struct Writer<W: Write> {
     cmp: Arc<dyn Comparer>,
     offset: u64,
     data_block: BlockBuilder,
+    /// Range-deletion entries (start internal key -> end user key), written as a
+    /// separate block referenced from the metaindex.
+    range_del_block: BlockBuilder,
     /// The current lower-level index block (index partition).
     index_partition: BlockBuilder,
     /// The top-level index: separator -> index-partition handle.
@@ -180,8 +185,11 @@ pub struct Writer<W: Write> {
     first_partition_handle: Option<BlockHandle>,
     /// Total size of all index partitions.
     index_size: u64,
-    /// The last internal key added, used to enforce ordering and as a block separator.
+    /// The last point internal key added, used to enforce ordering and as a block
+    /// separator.
     last_key: Vec<u8>,
+    /// The last range-deletion internal key added, used to enforce ordering.
+    last_range_del_key: Vec<u8>,
     num_entries: u64,
     num_deletions: u64,
     num_range_deletions: u64,
@@ -204,6 +212,7 @@ impl<W: Write> Writer<W> {
             cmp,
             offset: 0,
             data_block: BlockBuilder::new(ri),
+            range_del_block: BlockBuilder::new(ri),
             index_partition: BlockBuilder::new(ri),
             top_level_index: BlockBuilder::new(ri),
             last_index_sep: Vec::new(),
@@ -211,6 +220,7 @@ impl<W: Write> Writer<W> {
             first_partition_handle: None,
             index_size: 0,
             last_key: Vec::new(),
+            last_range_del_key: Vec::new(),
             num_entries: 0,
             num_deletions: 0,
             num_range_deletions: 0,
@@ -225,7 +235,35 @@ impl<W: Write> Writer<W> {
 
     /// Adds an entry. `internal_key` is an encoded internal key and must be strictly
     /// greater (in internal-key order) than every previously added key.
+    ///
+    /// A [`RangeDelete`](crate::base::internal_key::InternalKeyKind::RangeDelete) entry
+    /// (`internal_key` = `(start, seq, RangeDelete)`, `value` = end user key) is routed
+    /// to the range-deletion block rather than a data block.
     pub fn add(&mut self, internal_key: &[u8], value: &[u8]) -> Result<()> {
+        use crate::base::internal_key::InternalKeyKind;
+        let kind = crate::base::internal_key::trailer_kind(
+            crate::base::internal_key::encoded_trailer(internal_key),
+        );
+
+        // Point keys and range deletions are independent sorted streams (range dels go
+        // in their own block), so each enforces its own increasing-key order.
+        if kind == InternalKeyKind::RangeDelete {
+            if !self.last_range_del_key.is_empty()
+                && compare_encoded(self.cmp.as_ref(), &self.last_range_del_key, internal_key)
+                    != std::cmp::Ordering::Less
+            {
+                return Err(Error::InvalidState(
+                    "sstable: range-del keys must be added in increasing order".into(),
+                ));
+            }
+            self.last_range_del_key.clear();
+            self.last_range_del_key.extend_from_slice(internal_key);
+            self.range_del_block.add(internal_key, value);
+            self.num_range_deletions += 1;
+            self.num_deletions += 1;
+            return Ok(());
+        }
+
         if !self.last_key.is_empty()
             && compare_encoded(self.cmp.as_ref(), &self.last_key, internal_key)
                 != std::cmp::Ordering::Less
@@ -234,24 +272,17 @@ impl<W: Write> Writer<W> {
                 "sstable: keys must be added in strictly increasing order".into(),
             ));
         }
-        self.data_block.add(internal_key, value);
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
+
+        self.data_block.add(internal_key, value);
         self.num_entries += 1;
         self.raw_key_size += internal_key.len() as u64;
         self.raw_value_size += value.len() as u64;
-        let kind = crate::base::internal_key::trailer_kind(
-            crate::base::internal_key::encoded_trailer(internal_key),
-        );
-        use crate::base::internal_key::InternalKeyKind;
         if matches!(
             kind,
             InternalKeyKind::Delete | InternalKeyKind::SingleDelete | InternalKeyKind::DeleteSized
         ) {
-            self.num_deletions += 1;
-        }
-        if kind == InternalKeyKind::RangeDelete {
-            self.num_range_deletions += 1;
             self.num_deletions += 1;
         }
         if let Some(fw) = self.filter.as_mut() {
@@ -340,6 +371,20 @@ impl<W: Write> Writer<W> {
         let mut meta_entries: Vec<(String, BlockHandle)> = Vec::new();
         let mut filter_size = 0u64;
         let mut filter_policy_name = String::new();
+
+        // Range-deletion block (compressed like data), referenced under
+        // "rocksdb.range_del2".
+        if !self.range_del_block.is_empty() {
+            let raw = self.range_del_block.finish();
+            let handle = write_block(
+                &mut self.w,
+                &mut self.offset,
+                raw,
+                self.opts.compression,
+                self.opts.checksum,
+            )?;
+            meta_entries.push((META_RANGE_DEL_NAME.to_string(), handle));
+        }
         if let Some(fw) = self.filter.as_ref()
             && let Some(filter_bytes) = fw.finish()
         {

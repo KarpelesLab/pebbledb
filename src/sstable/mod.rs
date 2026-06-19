@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use crate::base::comparer::Comparer;
 use crate::base::internal_key::{InternalKeyKind, SeqNum, encoded_user_key, trailer_kind};
+use crate::base::range_del::RangeTombstone;
 use crate::{Error, Result};
 
 use block::{BlockHandle, BlockIter, ChecksumType, read_block};
@@ -157,18 +158,28 @@ fn parse_footer(file: &[u8]) -> Result<Footer> {
     Err(Error::corruption("sstable: bad magic number"))
 }
 
-/// Reads the metaindex and returns the decoded properties and the table's bloom filter
-/// block (if any), looking up the `rocksdb.properties` and `fullfilter.*` entries.
-fn read_metaindex(file: &[u8], footer: &Footer) -> Result<(Properties, Option<Arc<[u8]>>)> {
+/// The decoded contents of an sstable's metaindex-referenced meta blocks.
+struct MetaBlocks {
+    props: Properties,
+    filter: Option<Arc<[u8]>>,
+    range_dels: Vec<RangeTombstone>,
+}
+
+/// Reads the metaindex and the meta blocks it references (`rocksdb.properties`,
+/// `fullfilter.*`, `rocksdb.range_del2`).
+fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
     let metaindex = read_block(file, footer.metaindex, footer.checksum)?;
     let mut it = BlockIter::new(metaindex)?;
     it.first();
     let mut props_handle = None;
     let mut filter_handle = None;
+    let mut range_del_handle = None;
     while it.valid() {
         let key = it.key();
         if key == properties::META_PROPERTIES_NAME.as_bytes() {
             props_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+        } else if key == properties::META_RANGE_DEL_NAME.as_bytes() {
+            range_del_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         } else if key.starts_with(b"fullfilter.") {
             filter_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         }
@@ -190,7 +201,28 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<(Properties, Option<Ar
         Some(handle) => Some(read_block(file, handle, footer.checksum)?),
         None => None,
     };
-    Ok((props, filter))
+
+    let mut range_dels = Vec::new();
+    if let Some(handle) = range_del_handle {
+        let block = read_block(file, handle, footer.checksum)?;
+        let mut rit = BlockIter::new(block)?;
+        rit.first();
+        while rit.valid() {
+            // key = (start, seq, RangeDelete); value = end user key.
+            let start = encoded_user_key(rit.key()).to_vec();
+            let seqnum = crate::base::internal_key::trailer_seqnum(
+                crate::base::internal_key::encoded_trailer(rit.key()),
+            );
+            range_dels.push(RangeTombstone::new(start, rit.value().to_vec(), seqnum));
+            rit.next();
+        }
+    }
+
+    Ok(MetaBlocks {
+        props,
+        filter,
+        range_dels,
+    })
 }
 
 /// A reader over an in-memory sstable.
@@ -204,6 +236,8 @@ pub struct Reader {
     props: Properties,
     /// The table's bloom filter block, if present.
     filter: Option<Arc<[u8]>>,
+    /// The table's range tombstones, parsed from the range-del block.
+    range_dels: Vec<RangeTombstone>,
     /// Whether the index is two-level (the footer index handle is the top-level index).
     two_level: bool,
 }
@@ -218,18 +252,24 @@ impl Reader {
                 "sstable: value blocks (Pebblev3+) not yet supported",
             ));
         }
-        let (props, filter) = read_metaindex(&file, &footer)?;
-        let two_level = props.is_two_level_index();
+        let meta = read_metaindex(&file, &footer)?;
+        let two_level = meta.props.is_two_level_index();
         let index = read_block(&file, footer.index, footer.checksum)?;
         Ok(Reader {
             file,
             cmp,
             footer,
             index,
-            props,
-            filter,
+            props: meta.props,
+            filter: meta.filter,
+            range_dels: meta.range_dels,
             two_level,
         })
+    }
+
+    /// The table's range tombstones.
+    pub fn range_tombstones(&self) -> &[RangeTombstone] {
+        &self.range_dels
     }
 
     /// The table's properties.
@@ -319,6 +359,16 @@ impl Reader {
         user_key: &[u8],
         snapshot: SeqNum,
     ) -> Result<Option<(InternalKeyKind, Vec<u8>)>> {
+        Ok(self.lookup(user_key, snapshot)?.map(|(_, k, v)| (k, v)))
+    }
+
+    /// Like [`Reader::get`] but also returns the entry's sequence number, used by the
+    /// database to compare point keys against range tombstones.
+    pub fn lookup(
+        &self,
+        user_key: &[u8],
+        snapshot: SeqNum,
+    ) -> Result<Option<(SeqNum, InternalKeyKind, Vec<u8>)>> {
         // The bloom filter can rule the key out without touching any data block.
         if let Some(filter) = &self.filter
             && !filter::may_contain(filter, user_key)
@@ -343,8 +393,9 @@ impl Reader {
         if self.cmp.compare(encoded_user_key(it.key()), user_key) != std::cmp::Ordering::Equal {
             return Ok(None);
         }
-        let kind = trailer_kind(crate::base::internal_key::encoded_trailer(it.key()));
-        Ok(Some((kind, it.value().to_vec())))
+        let trailer = crate::base::internal_key::encoded_trailer(it.key());
+        let kind = trailer_kind(trailer);
+        Ok(Some((trailer >> 8, kind, it.value().to_vec())))
     }
 
     /// Returns an iterator over every entry in the table, in internal-key order.

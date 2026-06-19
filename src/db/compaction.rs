@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::base::internal_key::{InternalKeyKind, encoded_trailer, encoded_user_key, trailer_kind};
+use crate::base::range_del::RangeTombstone;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEdit};
 use crate::sstable::{Writer, WriterOptions};
 
@@ -102,16 +103,27 @@ impl Db {
 
     /// Executes a compaction: merges the inputs, writes outputs, and records the edit.
     fn run_compaction(&self, state: &mut State, c: Compaction) -> Result<()> {
-        // Build a merging iterator over every input file.
+        // Build a merging iterator over every input file and collect their range
+        // tombstones, which must be carried to the output (otherwise the deletions
+        // would be lost).
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
+        let mut tombstones: Vec<RangeTombstone> = Vec::new();
         for f in c.inputs.iter().chain(c.overlap.iter()) {
             let reader = self.open_reader(f.file_num)?;
+            tombstones.extend_from_slice(reader.range_tombstones());
             sources.push(Box::new(reader.iter()?));
         }
         let mut merge = MergingIter::new(sources, self.cmp.clone())?;
 
-        // Tombstones can be dropped only when compacting into the lowest level.
+        // Tombstones (point and range) can be dropped only when compacting into the
+        // lowest level, where there is no older data left to shadow.
         let drop_tombstones = c.output_level == NUM_LEVELS - 1;
+        let write_tombstones = !drop_tombstones && !tombstones.is_empty();
+        tombstones.sort_by(|a, b| {
+            self.cmp
+                .compare(&a.start, &b.start)
+                .then(b.seqnum.cmp(&a.seqnum))
+        });
 
         let mut outputs: Vec<FileMetadata> = Vec::new();
         let mut builder: Option<OutputBuilder> = None;
@@ -137,8 +149,7 @@ impl Db {
             }
 
             if builder.is_none() {
-                let file_num = state.vs.allocate_file_number();
-                builder = Some(OutputBuilder::new(self, file_num)?);
+                builder = Some(self.new_output(state, &tombstones, write_tombstones)?);
             }
             let b = builder.as_mut().unwrap();
             b.add(&ikey, &value)?;
@@ -147,6 +158,13 @@ impl Db {
             }
         }
         if let Some(b) = builder.take() {
+            outputs.push(b.finish()?);
+        }
+
+        // If the compaction produced only range tombstones (no surviving point keys),
+        // still emit a file to carry them.
+        if outputs.is_empty() && write_tombstones {
+            let b = self.new_output(state, &tombstones, true)?;
             outputs.push(b.finish()?);
         }
 
@@ -182,15 +200,34 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Creates a fresh output builder, seeding it with the carried range tombstones.
+    fn new_output(
+        &self,
+        state: &mut State,
+        tombstones: &[RangeTombstone],
+        write_tombstones: bool,
+    ) -> Result<OutputBuilder> {
+        let file_num = state.vs.allocate_file_number();
+        let mut b = OutputBuilder::new(self, file_num)?;
+        if write_tombstones {
+            for t in tombstones {
+                b.add_range_del(&t.start, &t.end, t.seqnum)?;
+            }
+        }
+        Ok(b)
+    }
 }
 
-/// Accumulates entries into one output sstable during compaction.
+/// Accumulates entries into one output sstable during compaction, tracking the file's
+/// key-range and sequence-number bounds across both point keys and range tombstones.
 struct OutputBuilder {
     file_num: u64,
     path: std::path::PathBuf,
     writer: Writer<File>,
+    cmp_dyn: Arc<dyn crate::base::comparer::Comparer>,
     smallest: Option<Vec<u8>>,
-    largest: Vec<u8>,
+    largest: Option<Vec<u8>>,
     smallest_seq: u64,
     largest_seq: u64,
 }
@@ -207,23 +244,52 @@ impl OutputBuilder {
             file_num,
             path,
             writer,
+            cmp_dyn: db.cmp.clone(),
             smallest: None,
-            largest: Vec::new(),
+            largest: None,
             smallest_seq: u64::MAX,
             largest_seq: 0,
         })
     }
 
-    fn add(&mut self, ikey: &[u8], value: &[u8]) -> Result<()> {
-        self.writer.add(ikey, value)?;
-        if self.smallest.is_none() {
+    /// Updates the key-range bounds with an encoded internal key.
+    fn extend_bounds(&mut self, ikey: &[u8], seq: u64) {
+        let cmp = self.cmp_dyn.as_ref();
+        let ukey = encoded_user_key(ikey);
+        if self
+            .smallest
+            .as_deref()
+            .is_none_or(|s| cmp.compare(ukey, encoded_user_key(s)) == std::cmp::Ordering::Less)
+        {
             self.smallest = Some(ikey.to_vec());
         }
-        self.largest.clear();
-        self.largest.extend_from_slice(ikey);
-        let seq = encoded_trailer(ikey) >> 8;
+        if self
+            .largest
+            .as_deref()
+            .is_none_or(|l| cmp.compare(ukey, encoded_user_key(l)) == std::cmp::Ordering::Greater)
+        {
+            self.largest = Some(ikey.to_vec());
+        }
         self.smallest_seq = self.smallest_seq.min(seq);
         self.largest_seq = self.largest_seq.max(seq);
+    }
+
+    fn add(&mut self, ikey: &[u8], value: &[u8]) -> Result<()> {
+        self.writer.add(ikey, value)?;
+        self.extend_bounds(ikey, encoded_trailer(ikey) >> 8);
+        Ok(())
+    }
+
+    fn add_range_del(&mut self, start: &[u8], end: &[u8], seqnum: u64) -> Result<()> {
+        use crate::base::internal_key::{InternalKey, InternalKeyKind};
+        let start_ikey =
+            InternalKey::new(start.to_vec(), seqnum, InternalKeyKind::RangeDelete).encode();
+        self.writer.add(&start_ikey, end)?;
+        self.extend_bounds(&start_ikey, seqnum);
+        // The exclusive end extends the largest user-key bound.
+        let end_ikey =
+            InternalKey::new(end.to_vec(), seqnum, InternalKeyKind::RangeDelete).encode();
+        self.extend_bounds(&end_ikey, seqnum);
         Ok(())
     }
 
@@ -234,7 +300,7 @@ impl OutputBuilder {
             file_num: self.file_num,
             size,
             smallest: self.smallest.unwrap_or_default(),
-            largest: self.largest,
+            largest: self.largest.unwrap_or_default(),
             smallest_seqnum: self.smallest_seq.min(self.largest_seq),
             largest_seqnum: self.largest_seq,
         })

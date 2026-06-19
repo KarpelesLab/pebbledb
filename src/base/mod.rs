@@ -8,6 +8,7 @@
 
 pub mod comparer;
 pub mod internal_key;
+pub mod range_del;
 pub mod varint;
 
 pub use comparer::{Comparer, DefaultComparer};
@@ -15,3 +16,4 @@ pub use internal_key::{
     InternalKey, InternalKeyKind, SEQNUM_BATCH_BIT, SEQNUM_MAX, SEQNUM_START, SEQNUM_ZERO, SeqNum,
     make_trailer, trailer_kind, trailer_seqnum,
 };
+pub use range_del::RangeTombstone;
