@@ -15,7 +15,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
 - [x] **Phase 1 — base layer.** `Comparer` / `DefaultComparer` (bytewise), `InternalKey`
   / `InternalKeyKind` / `SeqNum` and the 8-byte trailer, varint + fixed-LE encoders,
   CRC32C (Castagnoli) with the RocksDB mask.
-- [ ] **Phase 2 — record log (WAL).** Reader/writer over 32 KiB blocks; 7-byte header
+- [x] **Phase 2 — record log (WAL).** Reader/writer over 32 KiB blocks; 7-byte header
   (`crc32c | length | type`); full/first/middle/last records plus the recyclable
   record format (carrying a log number). Read real Pebble WAL files.
 - [ ] **Phase 3 — Batch.** 12-byte header (`seqnum: u64`, `count: u32`) followed by the

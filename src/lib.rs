@@ -26,5 +26,6 @@
 pub mod base;
 pub mod crc;
 mod error;
+pub mod record;
 
 pub use error::{Error, Result};
