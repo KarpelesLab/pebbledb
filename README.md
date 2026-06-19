@@ -4,18 +4,37 @@ A Rust port of [CockroachDB's Pebble](https://github.com/cockroachdb/pebble) —
 LSM (log-structured merge-tree) key-value storage engine in the LevelDB / RocksDB
 lineage.
 
-> **Status: functional core, pre-1.0; full parity in progress.** The goal is a
-> **complete** port of Pebble — 100% of its functionality and on-disk format, with
-> nothing permanently out of scope. The core engine (Milestone 1) is done: open/create a
-> store, `set`/`delete`/batch writes through a write-ahead log, flush memtables to
-> sstables, leveled compaction, point lookups and snapshot-consistent iterators, and
-> recovery on reopen, with the sstable / record-log / MANIFEST formats reproduced for
-> binary compatibility. Milestone 2 extends this to everything else Pebble does —
-> two-level indexes, bloom filters, range keys and range deletions, value blocks and blob
-> files, the columnar table formats, the merge operator, background/concurrent
-> compaction, the full options and metrics surfaces, ingestion, and more. See
-> [`ROADMAP.md`](ROADMAP.md) for the phase-by-phase plan. The public API is **not** yet
-> stable.
+> **Status: broad parity implemented, pre-1.0.** The goal is a **complete** port of Pebble
+> — 100% of its functionality and on-disk format, with nothing permanently out of scope.
+> The full original build-out is implemented and tested: open/create, `set` / `delete` /
+> `merge` / `delete_range` and (indexed) batches through a write-ahead log, background
+> flush and leveled compaction, bidirectional snapshot-consistent iteration with bounds
+> and prefix seek, range keys and range deletions, value blocks and blob-file reads, the
+> merge operator, a block + table cache, the columnar table-format codecs, checkpoints and
+> external-sstable ingestion, an `OPTIONS` file with format-major-version ratcheting, a
+> `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
+> with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
+> The remaining work toward full upstream parity (block-property filters, the disaggregated
+> `objstorage` provider, compaction-heuristic breadth, columnar key-schema interop, etc.)
+> is catalogued in [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
+
+## Capabilities
+
+- **Writes**: `set` / `delete` / `single_delete` / `merge` / `delete_range`, range keys,
+  atomic `Batch`es, and **indexed batches** (read-your-own-writes via `Db::indexed_batch`).
+- **Reads**: point `get`, snapshots, and a **bidirectional** iterator
+  (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with `IterOptions` bounds and
+  `seek_prefix_ge`; `new_external_iter` reads sstables without ingesting them.
+- **Engine**: WAL with multi-directory failover, a background flush/compaction worker,
+  score-based + manual `compact_range`, a sharded block cache, and an `EstimateDiskUsage`.
+- **Storage formats**: row-format sstables (every supported table-format version, two-level
+  indexes, bloom filters, value blocks, range-del/range-key blocks) and the columnar
+  (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
+- **Operations**: `checkpoint`, external sstable `ingest`, `Options` + `OPTIONS` file,
+  `FormatMajorVersion` ratcheting, `Metrics`, an `EventListener`, a `Logger`, and a
+  `Cleaner` (delete or archive obsolete files).
+- **Filesystem**: `Fs` trait with `DiskFs` and a fully in-memory `MemFs`.
+- **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `db scan`).
 
 ## Usage
 
