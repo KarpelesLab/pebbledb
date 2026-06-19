@@ -63,6 +63,12 @@ pub struct Options {
     /// Optional merge operator. Required to read keys written with `merge`; without it,
     /// a merge resolves to its newest operand.
     pub merger: Option<Arc<dyn crate::base::merge::Merger>>,
+    /// Size in bytes of the shared block cache for decompressed blocks (default 8 MiB).
+    /// Zero disables block caching.
+    pub block_cache_size: usize,
+    /// Maximum number of sstable readers kept open (default 1000). The least-recently
+    /// used reader is evicted when the limit is exceeded.
+    pub max_open_files: usize,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -84,6 +90,8 @@ impl Default for Options {
             wal_sync: true,
             event_listener: None,
             merger: None,
+            block_cache_size: 8 << 20,
+            max_open_files: 1000,
         }
     }
 }
@@ -118,6 +126,10 @@ pub struct Db {
     listener: Option<Arc<dyn EventListener>>,
     /// Optional merge operator.
     merger: Option<Arc<dyn crate::base::merge::Merger>>,
+    /// Shared block cache (None when disabled).
+    block_cache: Option<Arc<crate::cache::BlockCache>>,
+    /// Maximum number of cached open readers.
+    max_open_files: usize,
 }
 
 impl Db {
@@ -182,6 +194,14 @@ impl Db {
                 snapshots: Mutex::new(Vec::new()),
                 listener: opts.event_listener.clone(),
                 merger: opts.merger.clone(),
+                block_cache: if opts.block_cache_size > 0 {
+                    Some(Arc::new(crate::cache::BlockCache::new(
+                        opts.block_cache_size,
+                    )))
+                } else {
+                    None
+                },
+                max_open_files: opts.max_open_files.max(1),
             });
         }
 
@@ -225,6 +245,14 @@ impl Db {
             snapshots: Mutex::new(Vec::new()),
             listener: opts.event_listener.clone(),
             merger: opts.merger.clone(),
+            block_cache: if opts.block_cache_size > 0 {
+                Some(Arc::new(crate::cache::BlockCache::new(
+                    opts.block_cache_size,
+                )))
+            } else {
+                None
+            },
+            max_open_files: opts.max_open_files.max(1),
         })
     }
 
@@ -592,11 +620,28 @@ impl Db {
             return Ok(Arc::clone(r));
         }
         let bytes = std::fs::read(self.dir.join(filenames::table(file_num)))?;
-        let reader = Arc::new(Reader::open(bytes, self.cmp.clone())?);
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(file_num, Arc::clone(&reader));
+        let reader = Arc::new(Reader::open_with_cache(
+            bytes,
+            self.cmp.clone(),
+            file_num,
+            self.block_cache.clone(),
+        )?);
+        let mut cache = self.cache.lock().unwrap();
+        // Bound the number of open readers. Once at capacity, drop entries that are not
+        // referenced elsewhere before inserting the new reader.
+        while cache.len() >= self.max_open_files {
+            let victim = cache
+                .iter()
+                .find(|(_, r)| Arc::strong_count(r) == 1)
+                .map(|(&k, _)| k);
+            match victim {
+                Some(k) => {
+                    cache.remove(&k);
+                }
+                None => break, // every cached reader is in use; allow temporary overflow
+            }
+        }
+        cache.insert(file_num, Arc::clone(&reader));
         Ok(reader)
     }
 
@@ -618,12 +663,18 @@ impl Db {
         let level_files = std::array::from_fn(|i| state.vs.current.levels[i].len());
         let level_bytes =
             std::array::from_fn(|i| state.vs.current.levels[i].iter().map(|f| f.size).sum());
+        let (block_cache_hits, block_cache_misses) = match &self.block_cache {
+            Some(c) => (c.hits(), c.misses()),
+            None => (0, 0),
+        };
         Metrics {
             level_files,
             level_bytes,
             last_sequence: state.vs.last_sequence,
             flush_count: state.flush_count,
             compaction_count: state.compaction_count,
+            block_cache_hits,
+            block_cache_misses,
         }
     }
 
@@ -690,6 +741,10 @@ pub struct Metrics {
     pub flush_count: u64,
     /// Number of compactions performed this session.
     pub compaction_count: u64,
+    /// Number of block-cache hits so far (0 if caching is disabled).
+    pub block_cache_hits: u64,
+    /// Number of block-cache misses so far (0 if caching is disabled).
+    pub block_cache_misses: u64,
 }
 
 /// The filename of the WAL with the given number.

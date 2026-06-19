@@ -107,6 +107,35 @@ fn snapshot_isolation() {
 }
 
 #[test]
+fn block_cache_serves_repeated_reads() {
+    let dir = temp_dir("blockcache");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..500u32 {
+        db.set(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap(); // push everything to an L0 sstable
+
+    // First pass populates the block cache; the second pass should hit it.
+    for _ in 0..2 {
+        for i in 0..500u32 {
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
+    }
+    let m = db.metrics();
+    assert!(
+        m.block_cache_hits > 0,
+        "expected block-cache hits, got {}",
+        m.block_cache_hits
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

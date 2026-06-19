@@ -85,8 +85,11 @@ refined as they are reached.
   read/write concurrency under load.
 - [ ] **Phase 22 — vfs abstraction.** An `FS` trait with `DiskFS` and `MemFS`, atomic
   markers and directory syncing through the vfs, and true OS-level directory locking.
-- [ ] **Phase 23 — Caches.** A sharded block cache and a table cache with eviction, cache
-  options, and cache metrics.
+- [x] **Phase 23 — Caches.** A sharded, byte-bounded LRU block cache (`cache::BlockCache`,
+  keyed by `(file_num, block_offset)`) wired through the sstable reader's data- and
+  value-block reads; a bounded table cache of open readers (`Options::max_open_files`,
+  reference-count-aware eviction); cache sizing via `Options::block_cache_size`; and
+  hit/miss counters surfaced in `Metrics::block_cache_{hits,misses}`.
 - [ ] **Phase 24 — Compaction completeness.** The full compaction picker (level scores,
   read/write-amplification heuristics, elision-only, tombstone-density, L0 sublevels,
   intra-L0), manual compaction, range-key/range-del compaction, deletion pacing, and

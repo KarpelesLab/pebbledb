@@ -48,6 +48,7 @@
 
 pub mod base;
 pub mod batch;
+pub mod cache;
 pub mod crc;
 pub mod db;
 mod error;

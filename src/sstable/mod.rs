@@ -287,11 +287,26 @@ pub struct Reader {
     prefixed_values: bool,
     /// Handles of the table's value blocks, indexed by block number.
     value_block_handles: Vec<BlockHandle>,
+    /// This table's file number, used as the block-cache key prefix.
+    file_num: u64,
+    /// Optional shared block cache for decompressed blocks.
+    block_cache: Option<Arc<crate::cache::BlockCache>>,
 }
 
 impl Reader {
     /// Opens an sstable held entirely in `file`, comparing user keys with `cmp`.
     pub fn open(file: impl Into<Arc<[u8]>>, cmp: Arc<dyn Comparer>) -> Result<Reader> {
+        Reader::open_with_cache(file, cmp, 0, None)
+    }
+
+    /// Opens an sstable, tagging cached blocks with `file_num` and consulting the optional
+    /// shared block cache.
+    pub fn open_with_cache(
+        file: impl Into<Arc<[u8]>>,
+        cmp: Arc<dyn Comparer>,
+        file_num: u64,
+        block_cache: Option<Arc<crate::cache::BlockCache>>,
+    ) -> Result<Reader> {
         let file: Arc<[u8]> = file.into();
         let footer = parse_footer(&file)?;
         if footer.format.is_columnar() {
@@ -315,6 +330,8 @@ impl Reader {
             range_dels: meta.range_dels,
             range_keys: meta.range_keys,
             two_level,
+            file_num,
+            block_cache,
         })
     }
 
@@ -343,9 +360,24 @@ impl Reader {
         self.footer.checksum
     }
 
+    /// Reads and decodes the block referenced by `handle`, consulting the block cache
+    /// (keyed by file number + offset) when one is configured.
+    fn read_cached(&self, handle: BlockHandle) -> Result<Arc<[u8]>> {
+        if let Some(cache) = &self.block_cache {
+            let key = (self.file_num, handle.offset);
+            if let Some(block) = cache.get(key) {
+                return Ok(block);
+            }
+            let block = read_block(&self.file, handle, self.footer.checksum)?;
+            cache.insert(key, Arc::clone(&block));
+            return Ok(block);
+        }
+        read_block(&self.file, handle, self.footer.checksum)
+    }
+
     /// Reads and decodes the data block referenced by `handle`.
     fn read_data_block(&self, handle: BlockHandle) -> Result<Arc<[u8]>> {
-        read_block(&self.file, handle, self.footer.checksum)
+        self.read_cached(handle)
     }
 
     /// Resolves a value stored in a data block to the actual value bytes.
@@ -369,7 +401,7 @@ impl Reader {
                     .value_block_handles
                     .get(h.block_num as usize)
                     .ok_or_else(|| Error::corruption("sstable: value block number out of range"))?;
-                let block = read_block(&self.file, block_handle, self.footer.checksum)?;
+                let block = self.read_cached(block_handle)?;
                 let start = h.offset_in_block as usize;
                 let end = start + h.value_len as usize;
                 if end > block.len() {
