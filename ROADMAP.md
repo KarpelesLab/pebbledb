@@ -107,9 +107,13 @@ refined as they are reached.
   `FilterPolicy`, `Merger`, comparer registry, cache, event listeners), WAL fsync / sync
   modes, OPTIONS file read/write/validation, and format-major-version ratcheting +
   migrations.
-- [ ] **Phase 26 — Ingestion & maintenance.** External sstable ingestion (IngestSST),
-  excise, flushable ingests, checkpoints/backups, disk-usage estimation, and the
-  `Compact`/`Flush`/`Close` maintenance APIs.
+- [x] **Phase 26 — Ingestion & maintenance.** `Db::checkpoint` writes a self-contained,
+  openable copy (flush, copy live sstables, fresh MANIFEST + marker). `Db::ingest` adds
+  external sstables — rewritten through the engine's writer at one freshly-assigned
+  sequence number per file (the functional equivalent of Pebble's global-seqnum
+  ingestion), placed in L0 and recorded in the MANIFEST, carrying point keys, range
+  tombstones, and range keys. Verified by checkpoint-reopen and ingest-shadow-and-reopen
+  tests. (Excise, flushable ingests, and disk-usage estimation remain a follow-up.)
 - [ ] **Phase 27 — WAL manager & failover.** The `pebble/wal` package: multiple WAL
   directories, failover, recycling, and the sync queue.
 - [x] **Phase 28 — Metrics & observability.** Complete `Metrics`, an `EventListener`, and

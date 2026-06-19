@@ -312,6 +312,74 @@ fn directory_lock_blocks_second_open() {
 }
 
 #[test]
+fn checkpoint_produces_openable_copy() {
+    let dir = temp_dir("ckpt-src");
+    let dest = temp_dir("ckpt-dst");
+    {
+        let db = Db::open(&dir, Options::default()).unwrap();
+        for i in 0..300u32 {
+            db.set(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        db.delete(b"k0100").unwrap();
+        db.checkpoint(&dest).unwrap();
+        // The source remains usable after checkpointing.
+        assert_eq!(db.get(b"k0000").unwrap(), Some(b"v0".to_vec()));
+    }
+    // The checkpoint opens as a standalone database with the same contents.
+    {
+        let db = Db::open(&dest, Options::default()).unwrap();
+        assert_eq!(db.get(b"k0000").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(db.get(b"k0299").unwrap(), Some(b"v299".to_vec()));
+        assert_eq!(db.get(b"k0100").unwrap(), None);
+        assert_eq!(collect(&db).len(), 299);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn ingest_external_sstable() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("ingest");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // Pre-existing data, including a key the ingest will shadow.
+    db.set(b"apple", b"old").unwrap();
+    db.set(b"cherry", b"keep").unwrap();
+    db.flush().unwrap();
+
+    // Build an external sstable (keys at seqnum 0, as an offline builder would produce).
+    let ext = dir.join("external.sst");
+    {
+        let f = std::fs::File::create(&ext).unwrap();
+        let cmp = std::sync::Arc::new(pebbledb::DefaultComparer);
+        let mut w = Writer::new(f, cmp, WriterOptions::default());
+        for (k, v) in [("apple", "new"), ("banana", "fresh")] {
+            let ikey = InternalKey::new(k.as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
+            w.add(&ikey, v.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    db.ingest(&[&ext]).unwrap();
+
+    // The ingested values win over older data and add new keys; untouched keys remain.
+    assert_eq!(db.get(b"apple").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(db.get(b"banana").unwrap(), Some(b"fresh".to_vec()));
+    assert_eq!(db.get(b"cherry").unwrap(), Some(b"keep".to_vec()));
+
+    // And it survives a reopen.
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"apple").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(db.get(b"banana").unwrap(), Some(b"fresh".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

@@ -23,6 +23,7 @@
 
 mod compaction;
 mod filenames;
+mod maintenance;
 mod merging_iter;
 
 use merging_iter::InternalIter;
