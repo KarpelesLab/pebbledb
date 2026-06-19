@@ -23,10 +23,13 @@
 //! binary-search indexes, bloom filters, properties, range-del and range-key blocks,
 //! value blocks (Pebblev3+ value prefixes and out-of-line values), and CRC32C or
 //! xxHash64 checksums — the RocksDBv2 and Pebblev1..v4 table formats. The columnar block
-//! format (Pebblev5+) and blob files are not yet supported.
+//! format (Pebblev5+) lives in [`colblk`] (the column codecs and block formats) and
+//! [`columnar`] (a complete columnar table writer/reader); cross-implementation parity
+//! with Pebble's production columnar tables is validated by the interop CI.
 
 pub mod block;
 pub mod colblk;
+pub mod columnar;
 pub mod filter;
 pub mod properties;
 pub mod valblk;
@@ -95,14 +98,14 @@ impl TableFormat {
 
 /// The decoded sstable footer.
 #[derive(Clone, Copy, Debug)]
-struct Footer {
-    format: TableFormat,
-    checksum: ChecksumType,
-    index: BlockHandle,
-    metaindex: BlockHandle,
+pub(crate) struct Footer {
+    pub(crate) format: TableFormat,
+    pub(crate) checksum: ChecksumType,
+    pub(crate) index: BlockHandle,
+    pub(crate) metaindex: BlockHandle,
 }
 
-fn parse_footer(file: &[u8]) -> Result<Footer> {
+pub(crate) fn parse_footer(file: &[u8]) -> Result<Footer> {
     let n = file.len();
     if n < LEVELDB_FOOTER_LEN {
         return Err(Error::corruption("sstable: file smaller than footer"));

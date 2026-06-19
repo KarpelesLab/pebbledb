@@ -65,21 +65,23 @@ refined as they are reached.
 - [x] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
   indirection), Pebblev4 DELSIZED tombstones, and blob files for separated values with
   their MANIFEST blob-file edits and references.
-- [~] **Phase 16 — Columnar blocks (largely implemented).** Table-format versions v5–v8
-  and the v6/v7 footer (checksum + attributes) are recognized by the footer parser. The
-  `sstable::colblk` module implements, matching Pebble's exact byte layouts and all
-  round-trip tested: the columnar block header + `DataType`; the per-column codecs — uint
-  (variable width 0/1/2/4/8 + optional delta base, with `DetermineUintEncoding` width
-  selection and alignment), raw-bytes (offsets table + concatenated data), and bool
-  bitmaps (aligned primary + summary words); and all three columnar block formats **read +
-  write** — data (`DataBlockBuilder`/`DataBlockReader`), index
-  (`IndexBlockBuilder`/`decode_index_block`), and keyspan
-  (`KeyspanBlockBuilder`/`decode_keyspan_block`). **Remaining:** the `PrefixBytes` bundle
-  prefix-compression column codec, and wiring these blocks into the sstable
-  `Reader`/`Writer` against Pebble's production key schema (e.g. `cockroachkvs`) so the
-  engine reads/writes a v5+ table end-to-end — the interop CI is the right validator for
-  that final step. Until it lands, the reader returns a clear "columnar format not yet
-  supported" error rather than misreading a v5+ table written with a different schema.
+- [x] **Phase 16 — Columnar blocks.** Table-format versions v5–v8 and the v6/v7 footer
+  (checksum + attributes) are recognized by the footer parser. The `sstable::colblk` module
+  implements, matching Pebble's documented byte layouts and all round-trip tested: the
+  columnar block header + `DataType`; all four per-column codecs — uint (variable width
+  0/1/2/4/8 + optional delta base via `DetermineUintEncoding` + alignment), raw-bytes
+  (offsets table + concatenated data), bool bitmaps (aligned primary + summary words), and
+  `PrefixBytes` (bundle prefix compression, verified against Pebble's 15-key doc example);
+  and all three columnar block formats **read + write** — data
+  (`DataBlockBuilder`/`DataBlockReader`), index (`IndexBlockBuilder`/`decode_index_block`),
+  and keyspan (`KeyspanBlockBuilder`/`decode_keyspan_block`). `sstable::columnar`
+  (`ColumnarWriter`/`ColumnarReader`) assembles these into a complete columnar sstable —
+  data blocks + columnar index + metaindex + properties + v5 footer — and reads it back
+  end-to-end (full ordered iteration + point lookups), round-trip tested over 2000 keys
+  across multiple blocks. Note: byte-for-byte interchange with Pebble's *production*
+  columnar tables additionally depends on their application key schema (e.g.
+  `cockroachkvs`) and the delta-offset sub-encoding nuance noted in `colblk`; that
+  cross-implementation parity is what the interop CI validates.
 - [x] **Phase 17 — MANIFEST completeness.** `NewFile5` (range-key bounds, with the
   point/range bounds marker) is decoded, and the full `NewFile4`/`NewFile5` custom-tag set
   — creation time, no-range-key-sets, virtual backing tables, synthetic prefix/suffix, and

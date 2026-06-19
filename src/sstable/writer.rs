@@ -98,7 +98,7 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Accumulates prefix-compressed entries into a single block.
-struct BlockBuilder {
+pub(crate) struct BlockBuilder {
     buf: Vec<u8>,
     restarts: Vec<u32>,
     restart_interval: usize,
@@ -107,7 +107,7 @@ struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    fn new(restart_interval: usize) -> BlockBuilder {
+    pub(crate) fn new(restart_interval: usize) -> BlockBuilder {
         BlockBuilder {
             buf: Vec::new(),
             restarts: Vec::new(),
@@ -126,7 +126,7 @@ impl BlockBuilder {
         self.buf.len() + (self.restarts.len() + 1) * 4
     }
 
-    fn add(&mut self, key: &[u8], value: &[u8]) {
+    pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) {
         let shared = if self.counter == 0 {
             self.restarts.push(self.buf.len() as u32);
             0
@@ -148,7 +148,7 @@ impl BlockBuilder {
     }
 
     /// Appends the restart array and returns the finished block bytes.
-    fn finish(&mut self) -> &[u8] {
+    pub(crate) fn finish(&mut self) -> &[u8] {
         if self.restarts.is_empty() {
             self.restarts.push(0);
         }
@@ -698,7 +698,7 @@ impl<W: Write> Writer<W> {
 /// Compresses `raw` with `compression`, appends the trailer (compression byte +
 /// `checksum`), writes the whole block to `w`, advances `*offset`, and returns the
 /// block's handle.
-fn write_block(
+pub(crate) fn write_block(
     w: &mut impl Write,
     offset: &mut u64,
     raw: &[u8],
@@ -763,7 +763,7 @@ fn compress(raw: &[u8], compression: CompressionType) -> Result<(u8, Vec<u8>)> {
 }
 
 /// Encodes the footer for the given format (LevelDB 48-byte or RocksDB/Pebble 53-byte).
-fn encode_footer(
+pub(crate) fn encode_footer(
     format: TableFormat,
     checksum: ChecksumType,
     metaindex: BlockHandle,

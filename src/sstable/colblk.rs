@@ -37,11 +37,14 @@
 //! the index block ([`IndexBlockBuilder`] / [`decode_index_block`]), and the keyspan block
 //! ([`KeyspanBlockBuilder`] / [`decode_keyspan_block`]).
 //!
-//! Still being ported (see `ROADMAP.md`): the [`DataType::PrefixBytes`] bundle
-//! prefix-compression codec, and integration of these blocks into
-//! [`crate::sstable::Reader`]/`Writer` against Pebble's production key schema — until that
-//! lands the sstable reader reports a clear error for v5+ tables rather than misreading
-//! one written with a different schema.
+//! The [`DataType::PrefixBytes`] bundle prefix-compression codec
+//! ([`encode_prefix_bytes`]/[`decode_prefix_bytes`]) is also implemented. These blocks are
+//! assembled into a complete columnar sstable by [`crate::sstable::columnar`] (read +
+//! write). Note: `PrefixBytes`'s offset sub-table uses the standard uint-column encoding
+//! here; Pebble omits the always-zero delta base in the rare wide-offset case, so
+//! byte-for-byte interchange of a delta-encoded offset table — and reading Pebble's
+//! production tables, which use their application key schema — is validated by the interop
+//! CI (see `ROADMAP.md`).
 
 use crate::{Error, Result};
 
@@ -391,6 +394,113 @@ pub fn decode_bitmap(b: &[u8], mut off: usize, bit_count: usize) -> Result<(Vec<
         let word_off = off + (i / 64) * 8;
         let word = u64::from_le_bytes(b[word_off..word_off + 8].try_into().unwrap());
         out.push(word & (1u64 << (i % 64)) != 0);
+    }
+    Ok((out, end))
+}
+
+// ---------------------------------------------------------------------------
+// PrefixBytes column
+//
+// Lexicographically-sorted byte slices with bundle-based prefix compression. The column
+// stores 1 block-wide prefix, one prefix per bundle of `bundleSize` keys, and one suffix
+// per key. A key is reconstructed as block_prefix ++ bundle_prefix ++ suffix. Layout:
+// 1 byte log2(bundleSize), then an offsets table (end offset of each slice; the first
+// slice — the block prefix — implicitly starts at 0), then the concatenated slice data.
+// ---------------------------------------------------------------------------
+
+/// Longest common prefix length of `a` and `b`.
+fn lcp(a: &[u8], b: &[u8]) -> usize {
+    let mut i = 0;
+    let max = a.len().min(b.len());
+    while i < max && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Encodes a `PrefixBytes` column of lexicographically-sorted `keys` (bundle size a power
+/// of two) at `offset` within `buf`. Returns the offset just past the column.
+pub fn encode_prefix_bytes(
+    keys: &[&[u8]],
+    bundle_size: usize,
+    offset: usize,
+    buf: &mut Vec<u8>,
+) -> usize {
+    assert!(bundle_size.is_power_of_two() && bundle_size >= 1);
+    buf.truncate(offset);
+    buf.push(bundle_size.trailing_zeros() as u8);
+    let n = keys.len();
+    if n == 0 {
+        // A single empty block-prefix slice.
+        encode_uint_column(&[0], buf.len(), buf);
+        return buf.len();
+    }
+    let block_prefix_len = lcp(keys[0], keys[n - 1]);
+    let num_bundles = n.div_ceil(bundle_size);
+
+    // Build the slices in storage order: block prefix, then per bundle [prefix, suffixes].
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(1 + num_bundles + n);
+    slices.push(&keys[0][..block_prefix_len]);
+    for b in 0..num_bundles {
+        let start = b * bundle_size;
+        let end = ((b + 1) * bundle_size).min(n);
+        let bundle_lcp = lcp(keys[start], keys[end - 1]).max(block_prefix_len);
+        slices.push(&keys[start][block_prefix_len..bundle_lcp]);
+        for key in &keys[start..end] {
+            slices.push(&key[bundle_lcp..]);
+        }
+    }
+
+    // End offsets of each slice within the concatenated data section.
+    let mut offsets = Vec::with_capacity(slices.len());
+    let mut acc = 0u64;
+    for s in &slices {
+        acc += s.len() as u64;
+        offsets.push(acc);
+    }
+    encode_uint_column(&offsets, buf.len(), buf);
+    for s in &slices {
+        buf.extend_from_slice(s);
+    }
+    buf.len()
+}
+
+/// Decodes a `PrefixBytes` column of `n` keys starting at `off`. Returns the reconstructed
+/// keys and the offset just past the column.
+pub fn decode_prefix_bytes(b: &[u8], mut off: usize, n: usize) -> Result<(Vec<Vec<u8>>, usize)> {
+    let log2 = *b
+        .get(off)
+        .ok_or_else(|| Error::corruption("colblk: truncated prefix-bytes"))?;
+    off += 1;
+    let bundle_size = 1usize << log2;
+    if n == 0 {
+        let (_, end) = decode_uint_column(b, off, 1)?;
+        return Ok((Vec::new(), end));
+    }
+    let num_bundles = n.div_ceil(bundle_size);
+    let num_slices = 1 + num_bundles + n;
+    let (offsets, data_start) = decode_uint_column(b, off, num_slices)?;
+    let slice = |k: usize| -> Result<&[u8]> {
+        let s = if k == 0 { 0 } else { offsets[k - 1] as usize };
+        let e = offsets[k] as usize;
+        b.get(data_start + s..data_start + e)
+            .ok_or_else(|| Error::corruption("colblk: prefix-bytes slice out of range"))
+    };
+    let block_prefix = slice(0)?;
+    let mut end = data_start;
+    if let Some(last) = offsets.last() {
+        end = data_start + *last as usize;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let bundle = i / bundle_size;
+        let prefix_slice = 1 + bundle * (1 + bundle_size);
+        let suffix_slice = prefix_slice + 1 + (i - bundle * bundle_size);
+        let mut key = Vec::with_capacity(block_prefix.len());
+        key.extend_from_slice(block_prefix);
+        key.extend_from_slice(slice(prefix_slice)?);
+        key.extend_from_slice(slice(suffix_slice)?);
+        out.push(key);
     }
     Ok((out, end))
 }
@@ -836,6 +946,43 @@ mod codec_tests {
         let (got, off) = decode_raw_bytes(&buf, 0, slices.len()).unwrap();
         assert_eq!(got, slices);
         assert_eq!(off, end);
+    }
+
+    #[test]
+    fn prefix_bytes_roundtrips() {
+        // The 15-key example from Pebble's prefix_bytes.go doc, plus simpler cases.
+        let example: Vec<&[u8]> = vec![
+            b"aaabbbc",
+            b"aaabbbcc",
+            b"aaabbbcde",
+            b"aaabbbce",
+            b"aaabbbdee",
+            b"aaabbbdee",
+            b"aaabbbdee",
+            b"aaabbbeff",
+            b"aaabbe",
+            b"aaabbeef",
+            b"aaabbeef",
+            b"aaabc",
+            b"aabcceef",
+            b"aabcceef",
+            b"aabcceef",
+        ];
+        for (keys, bundle) in [
+            (vec![], 4usize),
+            (vec![&b"only"[..]], 4),
+            (vec![&b"a"[..], b"b", b"c"], 2),
+            (example.clone(), 4),
+            (example.clone(), 1),
+            (example, 16),
+        ] {
+            let mut buf = Vec::new();
+            let end = encode_prefix_bytes(&keys, bundle, 0, &mut buf);
+            let (got, off) = decode_prefix_bytes(&buf, 0, keys.len()).unwrap();
+            let want: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+            assert_eq!(got, want, "bundle={bundle}");
+            assert_eq!(off, end);
+        }
     }
 
     #[test]
