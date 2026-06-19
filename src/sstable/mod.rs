@@ -19,10 +19,11 @@
 //! [`Reader`] opens a table held entirely in memory, parses the footer, and supports
 //! point lookups ([`Reader::get`]) and full ordered iteration ([`Reader::iter`]).
 //!
-//! Scope: this reader handles the row-based block format with single-level binary-search
-//! indexes and CRC32C checksums — the RocksDBv2 and Pebblev1/v2 table formats, plus the
-//! footer layouts of later Pebble versions. Two-level indexes, value blocks (Pebblev3+),
-//! the columnar format (Pebblev5+), and xxHash checksums are not yet supported.
+//! Scope: this reader handles the row-based block format with single- and two-level
+//! binary-search indexes, bloom filters, properties, and CRC32C or xxHash64 checksums —
+//! the RocksDBv2 and Pebblev1/v2 table formats, plus the footer layouts of later Pebble
+//! versions. Value blocks (Pebblev3+) and the columnar format (Pebblev5+) are not yet
+//! supported.
 
 pub mod block;
 pub mod filter;
@@ -203,6 +204,8 @@ pub struct Reader {
     props: Properties,
     /// The table's bloom filter block, if present.
     filter: Option<Arc<[u8]>>,
+    /// Whether the index is two-level (the footer index handle is the top-level index).
+    two_level: bool,
 }
 
 impl Reader {
@@ -216,6 +219,7 @@ impl Reader {
             ));
         }
         let (props, filter) = read_metaindex(&file, &footer)?;
+        let two_level = props.is_two_level_index();
         let index = read_block(&file, footer.index, footer.checksum)?;
         Ok(Reader {
             file,
@@ -224,6 +228,7 @@ impl Reader {
             index,
             props,
             filter,
+            two_level,
         })
     }
 
@@ -247,9 +252,61 @@ impl Reader {
         read_block(&self.file, handle, self.footer.checksum)
     }
 
-    /// Returns an iterator over the index block.
+    /// Returns an iterator over the top-level index block.
     fn index_iter(&self) -> Result<BlockIter> {
         BlockIter::new(Arc::clone(&self.index))
+    }
+
+    /// Resolves the handle of the data block that may contain `lookup`, walking one or
+    /// two index levels as appropriate. Returns `None` if `lookup` is past the table.
+    fn seek_data_handle(&self, lookup: &[u8]) -> Result<Option<BlockHandle>> {
+        let mut index = self.index_iter()?;
+        index.seek_ge(lookup, self.cmp.as_ref());
+        if !index.valid() {
+            return Ok(None);
+        }
+        let (handle, _) = BlockHandle::decode(index.value())
+            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        if !self.two_level {
+            return Ok(Some(handle));
+        }
+        // Two-level: `handle` points to a lower-level index partition.
+        let partition = read_block(&self.file, handle, self.footer.checksum)?;
+        let mut pit = BlockIter::new(partition)?;
+        pit.seek_ge(lookup, self.cmp.as_ref());
+        if !pit.valid() {
+            return Ok(None);
+        }
+        let (data_handle, _) = BlockHandle::decode(pit.value())
+            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        Ok(Some(data_handle))
+    }
+
+    /// Collects every data-block handle in the table, in order, flattening a two-level
+    /// index. Used to drive full-table iteration.
+    fn data_block_handles(&self) -> Result<Vec<BlockHandle>> {
+        let mut handles = Vec::new();
+        let mut index = self.index_iter()?;
+        index.first();
+        while index.valid() {
+            let (handle, _) = BlockHandle::decode(index.value())
+                .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+            if self.two_level {
+                let partition = read_block(&self.file, handle, self.footer.checksum)?;
+                let mut pit = BlockIter::new(partition)?;
+                pit.first();
+                while pit.valid() {
+                    let (dh, _) = BlockHandle::decode(pit.value())
+                        .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+                    handles.push(dh);
+                    pit.next();
+                }
+            } else {
+                handles.push(handle);
+            }
+            index.next();
+        }
+        Ok(handles)
     }
 
     /// Looks up `user_key` as visible at `snapshot`, returning the kind and value of the
@@ -273,13 +330,10 @@ impl Reader {
         let mut lookup = user_key.to_vec();
         lookup.extend_from_slice(&(((snapshot << 8) | 0xff).to_le_bytes()));
 
-        let mut index = self.index_iter()?;
-        index.seek_ge(&lookup, self.cmp.as_ref());
-        if !index.valid() {
-            return Ok(None);
-        }
-        let (handle, _) = BlockHandle::decode(index.value())
-            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        let handle = match self.seek_data_handle(&lookup)? {
+            Some(h) => h,
+            None => return Ok(None),
+        };
         let data = self.read_data_block(handle)?;
         let mut it = BlockIter::new(data)?;
         it.seek_ge(&lookup, self.cmp.as_ref());
@@ -298,33 +352,35 @@ impl Reader {
     /// The iterator holds a shared reference to the reader, so it can outlive the
     /// borrow and be stored (e.g. in a merging iterator).
     pub fn iter(self: &Arc<Reader>) -> Result<TableIter> {
-        let mut index = self.index_iter()?;
-        index.first();
+        let handles = self.data_block_handles()?;
         Ok(TableIter {
             reader: Arc::clone(self),
-            index,
+            handles,
+            next_block: 0,
             data: None,
         })
     }
 }
 
-/// A forward iterator over all entries of an sstable, walking the index block and each
-/// data block it points to in turn.
+/// A forward iterator over all entries of an sstable. Data-block handles are resolved up
+/// front (flattening any two-level index); each block is read and iterated in turn.
 pub struct TableIter {
     reader: Arc<Reader>,
-    index: BlockIter,
+    handles: Vec<BlockHandle>,
+    /// Index into `handles` of the next block to load.
+    next_block: usize,
     data: Option<BlockIter>,
 }
 
 impl TableIter {
-    /// Loads the data block for the current index entry, if any.
-    fn load_current_data_block(&mut self) -> Result<bool> {
-        if !self.index.valid() {
+    /// Loads the next data block in `handles`, if any, returning whether one was loaded.
+    fn load_next_block(&mut self) -> Result<bool> {
+        if self.next_block >= self.handles.len() {
             self.data = None;
             return Ok(false);
         }
-        let (handle, _) = BlockHandle::decode(self.index.value())
-            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        let handle = self.handles[self.next_block];
+        self.next_block += 1;
         let block = self.reader.read_data_block(handle)?;
         let mut it = BlockIter::new(block)?;
         it.first();
@@ -334,16 +390,15 @@ impl TableIter {
 
     /// Advances to the first entry and returns whether one exists.
     pub fn first(&mut self) -> Result<bool> {
-        self.index.first();
+        self.next_block = 0;
         // Skip any empty data blocks.
         loop {
-            if !self.load_current_data_block()? {
+            if !self.load_next_block()? {
                 return Ok(false);
             }
             if self.data.as_ref().is_some_and(|d| d.valid()) {
                 return Ok(true);
             }
-            self.index.next();
         }
     }
 
@@ -374,10 +429,9 @@ impl TableIter {
             }
             None => return Ok(false),
         }
-        // Current data block exhausted; advance the index to the next block.
+        // Current data block exhausted; advance to the next non-empty block.
         loop {
-            self.index.next();
-            if !self.load_current_data_block()? {
+            if !self.load_next_block()? {
                 return Ok(false);
             }
             if self.data.as_ref().is_some_and(|d| d.valid()) {

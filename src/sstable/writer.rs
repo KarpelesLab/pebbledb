@@ -13,10 +13,9 @@
 //! block and the footer. The output is readable by [`super::Reader`] and, for the
 //! supported formats, by Pebble/RocksDB.
 //!
-//! Scope: row-based data/index blocks, single-level index, CRC32C or xxHash64 checksums,
-//! in-place values, and a properties block; bloom filters and two-level indexes are
-//! added later in this phase. The default format is
-//! [`TableFormat::Pebble(2)`](super::TableFormat::Pebble).
+//! Scope: row-based data/index blocks with single- or two-level indexes, CRC32C or
+//! xxHash64 checksums, in-place values, a bloom filter, and a properties block. The
+//! default format is [`TableFormat::Pebble(2)`](super::TableFormat::Pebble).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -28,7 +27,7 @@ use crate::crc::{Crc32c, mask};
 use crate::{Error, Result};
 
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
-use super::properties::{BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, Properties};
+use super::properties::{BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, Properties, TWO_LEVEL_INDEX};
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
     VERSION_LEN,
@@ -61,6 +60,10 @@ pub struct WriterOptions {
     pub table_format: TableFormat,
     /// Bloom filter bits-per-key, or `None` to omit the filter (default `Some(10)`).
     pub filter_policy: Option<u32>,
+    /// Target size of a lower-level index block (index partition) before a new one is
+    /// started; once more than one partition is produced the table uses a two-level
+    /// index (default 256 KiB).
+    pub index_block_size: usize,
 }
 
 impl Default for WriterOptions {
@@ -72,6 +75,7 @@ impl Default for WriterOptions {
             checksum: ChecksumType::Crc32c,
             table_format: TableFormat::Pebble(2),
             filter_policy: Some(10),
+            index_block_size: 256 << 10,
         }
     }
 }
@@ -164,7 +168,18 @@ pub struct Writer<W: Write> {
     cmp: Arc<dyn Comparer>,
     offset: u64,
     data_block: BlockBuilder,
-    index_block: BlockBuilder,
+    /// The current lower-level index block (index partition).
+    index_partition: BlockBuilder,
+    /// The top-level index: separator -> index-partition handle.
+    top_level_index: BlockBuilder,
+    /// The separator most recently added to the current index partition (its last key).
+    last_index_sep: Vec<u8>,
+    /// Number of index partitions flushed so far.
+    partition_count: u64,
+    /// Handle of the first (and possibly only) index partition.
+    first_partition_handle: Option<BlockHandle>,
+    /// Total size of all index partitions.
+    index_size: u64,
     /// The last internal key added, used to enforce ordering and as a block separator.
     last_key: Vec<u8>,
     num_entries: u64,
@@ -189,7 +204,12 @@ impl<W: Write> Writer<W> {
             cmp,
             offset: 0,
             data_block: BlockBuilder::new(ri),
-            index_block: BlockBuilder::new(ri),
+            index_partition: BlockBuilder::new(ri),
+            top_level_index: BlockBuilder::new(ri),
+            last_index_sep: Vec::new(),
+            partition_count: 0,
+            first_partition_handle: None,
+            index_size: 0,
             last_key: Vec::new(),
             num_entries: 0,
             num_deletions: 0,
@@ -267,9 +287,45 @@ impl<W: Write> Writer<W> {
 
         let mut handle_enc = Vec::with_capacity(BLOCK_HANDLE_MAX_LEN);
         handle.encode_to(&mut handle_enc);
-        // last_key is the separator for the just-flushed block.
-        let sep = self.last_key.clone();
-        self.index_block.add(&sep, &handle_enc);
+        // last_key is the separator for the just-flushed block; add it to the current
+        // index partition and remember it as the partition's running last key.
+        self.index_partition.add(&self.last_key, &handle_enc);
+        self.last_index_sep.clear();
+        self.last_index_sep.extend_from_slice(&self.last_key);
+
+        if self.index_partition.size_estimate() >= self.opts.index_block_size {
+            self.flush_index_partition()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the current index partition (if non-empty) and records it in the top-level
+    /// index, keyed by the partition's last separator.
+    fn flush_index_partition(&mut self) -> Result<()> {
+        if self.index_partition.is_empty() {
+            return Ok(());
+        }
+        let handle = {
+            let raw = self.index_partition.finish();
+            write_block(
+                &mut self.w,
+                &mut self.offset,
+                raw,
+                self.opts.compression,
+                self.opts.checksum,
+            )?
+        };
+        self.index_partition.reset();
+        self.index_size += handle.length;
+        if self.first_partition_handle.is_none() {
+            self.first_partition_handle = Some(handle);
+        }
+        self.partition_count += 1;
+
+        let mut handle_enc = Vec::with_capacity(BLOCK_HANDLE_MAX_LEN);
+        handle.encode_to(&mut handle_enc);
+        let sep = self.last_index_sep.clone();
+        self.top_level_index.add(&sep, &handle_enc);
         Ok(())
     }
 
@@ -299,16 +355,26 @@ impl<W: Write> Writer<W> {
             meta_entries.push((super::filter::metaindex_key(&filter_policy_name), handle));
         }
 
-        // Index block (single-level), compressed like data blocks.
-        let index_handle = {
-            let raw = self.index_block.finish();
-            write_block(
+        // Flush the final index partition, then decide single- vs two-level. A single
+        // partition is used directly as the index; multiple partitions are summarized by
+        // a top-level index block.
+        self.flush_index_partition()?;
+        let (index_handle, index_type, top_level_index_size) = if self.partition_count <= 1 {
+            (
+                self.first_partition_handle.unwrap_or_default(),
+                BINARY_SEARCH_INDEX,
+                0,
+            )
+        } else {
+            let raw = self.top_level_index.finish();
+            let top = write_block(
                 &mut self.w,
                 &mut self.offset,
                 raw,
                 self.opts.compression,
                 self.opts.checksum,
-            )?
+            )?;
+            (top, TWO_LEVEL_INDEX, top.length)
         };
 
         // Properties block (uncompressed meta block), referenced from the metaindex.
@@ -320,8 +386,9 @@ impl<W: Write> Writer<W> {
             num_range_deletions: self.num_range_deletions,
             num_data_blocks: self.num_data_blocks,
             data_size: self.data_size,
-            index_size: index_handle.length,
-            index_type: BINARY_SEARCH_INDEX,
+            index_size: self.index_size,
+            index_type,
+            top_level_index_size,
             filter_size,
             comparer_name: self.cmp.name().to_string(),
             merger_name: "nullptr".to_string(),
@@ -709,6 +776,57 @@ mod tests {
             reader2.get(b"present0001", 10_000).unwrap(),
             Some((InternalKeyKind::Set, b"v".to_vec()))
         );
+    }
+
+    #[test]
+    fn two_level_index_roundtrip() {
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32)
+            .map(|i| {
+                (
+                    ikey(
+                        format!("k{i:06}").as_bytes(),
+                        i as u64 + 1,
+                        InternalKeyKind::Set,
+                    ),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect();
+        // Tiny data + index block sizes force many data blocks and several index
+        // partitions, triggering a two-level index.
+        let opts = WriterOptions {
+            block_size: 128,
+            index_block_size: 96,
+            ..Default::default()
+        };
+        let file = build(&entries, opts);
+        let reader = Arc::new(Reader::open(file, cmp).unwrap());
+        assert!(
+            reader.properties().is_two_level_index(),
+            "expected a two-level index"
+        );
+        assert!(reader.properties().top_level_index_size > 0);
+
+        // Point lookups traverse both index levels.
+        for i in (0..1000u32).step_by(53) {
+            assert_eq!(
+                reader.get(format!("k{i:06}").as_bytes(), 100_000).unwrap(),
+                Some((InternalKeyKind::Set, format!("value-{i}").into_bytes())),
+                "lookup k{i:06}"
+            );
+        }
+        assert_eq!(reader.get(b"k999999", 100_000).unwrap(), None);
+
+        // Full iteration flattens the two-level index and returns all entries in order.
+        let mut it = reader.iter().unwrap();
+        let mut count = 0;
+        let mut ok = it.first().unwrap();
+        while ok {
+            count += 1;
+            ok = it.next().unwrap();
+        }
+        assert_eq!(count, 1000);
     }
 
     #[test]
