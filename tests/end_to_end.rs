@@ -799,6 +799,80 @@ fn logger_receives_messages_and_archive_cleaner_keeps_files() {
 }
 
 #[test]
+fn indexed_batch_reads_its_own_writes() {
+    let dir = temp_dir("indexed-batch");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"a", b"committed-a").unwrap();
+    db.set(b"b", b"committed-b").unwrap();
+    db.set(b"old", b"present").unwrap();
+
+    let mut ib = db.indexed_batch();
+    ib.set(b"b", b"batch-b"); // overrides committed
+    ib.set(b"c", b"batch-c"); // new key not in db
+    ib.delete(b"a"); // hides committed
+    ib.delete_range(b"old", b"oldz"); // range-deletes a committed key
+
+    // Reads through the batch see its pending writes merged over the DB.
+    assert_eq!(ib.get(&db, b"a").unwrap(), None); // deleted in batch
+    assert_eq!(ib.get(&db, b"b").unwrap(), Some(b"batch-b".to_vec())); // overridden
+    assert_eq!(ib.get(&db, b"c").unwrap(), Some(b"batch-c".to_vec())); // batch-only
+    assert_eq!(ib.get(&db, b"old").unwrap(), None); // range-deleted
+    // A committed key untouched by the batch still reads through.
+    db.set(b"d", b"committed-d").unwrap();
+    assert_eq!(ib.get(&db, b"d").unwrap(), Some(b"committed-d".to_vec()));
+
+    // The merged scan reflects the same view, in sorted order.
+    let scan = ib.scan(&db).unwrap();
+    let got: Vec<(String, String)> = scan
+        .iter()
+        .map(|(k, v)| {
+            (
+                String::from_utf8_lossy(k).into_owned(),
+                String::from_utf8_lossy(v).into_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("b".into(), "batch-b".into()),
+            ("c".into(), "batch-c".into()),
+            ("d".into(), "committed-d".into()),
+        ]
+    );
+
+    // The DB itself is unchanged until the batch is committed.
+    assert_eq!(db.get(b"a").unwrap(), Some(b"committed-a".to_vec()));
+    db.write(ib.into_batch()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), None);
+    assert_eq!(db.get(b"b").unwrap(), Some(b"batch-b".to_vec()));
+    assert_eq!(db.get(b"c").unwrap(), Some(b"batch-c".to_vec()));
+    assert_eq!(db.get(b"old").unwrap(), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn indexed_batch_merges_over_committed_value() {
+    use pebbledb::ConcatMerger;
+    let dir = temp_dir("indexed-merge");
+    let opts = Options {
+        merger: Some(Arc::new(ConcatMerger)),
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    db.set(b"k", b"base").unwrap();
+
+    let mut ib = db.indexed_batch();
+    ib.merge(b"k", b"+1");
+    ib.merge(b"k", b"+2");
+    // ConcatMerger appends operands to the existing value.
+    assert_eq!(ib.get(&db, b"k").unwrap(), Some(b"base+1+2".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

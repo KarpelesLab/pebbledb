@@ -26,10 +26,12 @@
 
 mod compaction;
 mod filenames;
+mod indexed_batch;
 mod maintenance;
 mod merging_iter;
 mod options_file;
 
+pub use indexed_batch::IndexedBatch;
 use merging_iter::InternalIter;
 pub use merging_iter::{DbIterator, IterOptions};
 pub use options_file::{FormatMajorVersion, OptionsFile};
@@ -563,6 +565,13 @@ impl DbInner {
         self.fs.sync_dir(&self.dir)?;
         *cur = target;
         Ok(())
+    }
+
+    /// Creates an [`IndexedBatch`]: a write batch you can read from before committing
+    /// (read-your-own-writes). Commit it with [`DbInner::write`] after calling
+    /// [`IndexedBatch::into_batch`].
+    pub fn indexed_batch(&self) -> IndexedBatch {
+        IndexedBatch::new(self.merger.clone())
     }
 
     /// The largest sequence number assigned so far.
