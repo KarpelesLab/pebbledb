@@ -214,6 +214,7 @@ impl Db {
         for f in &c.overlap {
             edit.deleted_files.push((c.output_level, f.file_num));
         }
+        let num_outputs = outputs.len();
         for meta in outputs {
             edit.new_files.push(NewFileEntry {
                 level: c.output_level,
@@ -225,6 +226,14 @@ impl Db {
         if let Some(mw) = state.manifest.as_mut() {
             mw.write_record(&edit.encode())?;
             mw.sync_all()?;
+        }
+        state.compaction_count += 1;
+        if let Some(l) = &self.listener {
+            l.on_compaction_end(
+                c.output_level,
+                c.inputs.len() + c.overlap.len(),
+                num_outputs,
+            );
         }
 
         // Remove the obsolete input files from the cache and disk.

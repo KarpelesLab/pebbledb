@@ -100,7 +100,7 @@ refined as they are reached.
   `Compact`/`Flush`/`Close` maintenance APIs.
 - [ ] **Phase 27 — WAL manager & failover.** The `pebble/wal` package: multiple WAL
   directories, failover, recycling, and the sync queue.
-- [ ] **Phase 28 — Metrics & observability.** Complete `Metrics`, an `EventListener`, and
+- [x] **Phase 28 — Metrics & observability.** Complete `Metrics`, an `EventListener`, and
   logging/tracing hooks matching Pebble's surface.
 - [ ] **Phase 29 — Tooling.** Rust equivalents of the `pebble` CLI tools (sstable /
   manifest / WAL dump, DB inspection) and debug utilities.

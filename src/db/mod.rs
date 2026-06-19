@@ -58,6 +58,17 @@ pub struct Options {
     /// fsync the WAL after every write so committed data survives a crash (default
     /// `true`). Disabling trades durability for throughput.
     pub wal_sync: bool,
+    /// Optional listener notified of flush and compaction events.
+    pub event_listener: Option<Arc<dyn EventListener>>,
+}
+
+/// A listener notified of background-style events (flushes and compactions). All methods
+/// have default no-op implementations, so implementors override only what they need.
+pub trait EventListener: Send + Sync {
+    /// Called after a memtable is flushed to an L0 sstable.
+    fn on_flush_end(&self, _file_num: u64, _bytes: u64) {}
+    /// Called after a compaction completes.
+    fn on_compaction_end(&self, _output_level: usize, _input_files: usize, _output_files: usize) {}
 }
 
 impl Default for Options {
@@ -68,6 +79,7 @@ impl Default for Options {
             create_if_missing: true,
             read_only: false,
             wal_sync: true,
+            event_listener: None,
         }
     }
 }
@@ -81,6 +93,10 @@ struct State {
     wal_number: u64,
     manifest: Option<record::Writer<File>>,
     read_only: bool,
+    /// Number of memtable flushes performed this session.
+    flush_count: u64,
+    /// Number of compactions performed this session.
+    compaction_count: u64,
 }
 
 /// An on-disk LSM key-value database.
@@ -94,6 +110,8 @@ pub struct Db {
     /// Sequence numbers of currently-open snapshots. Compaction retains the versions
     /// they need.
     snapshots: Mutex<Vec<SeqNum>>,
+    /// Optional event listener.
+    listener: Option<Arc<dyn EventListener>>,
 }
 
 impl Db {
@@ -145,6 +163,8 @@ impl Db {
                 wal_number: 0,
                 manifest: None,
                 read_only: true,
+                flush_count: 0,
+                compaction_count: 0,
             };
             return Ok(Db {
                 dir,
@@ -154,6 +174,7 @@ impl Db {
                 state: Mutex::new(state),
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
+                listener: opts.event_listener.clone(),
             });
         }
 
@@ -184,6 +205,8 @@ impl Db {
             wal_number,
             manifest: Some(manifest),
             read_only: false,
+            flush_count: 0,
+            compaction_count: 0,
         };
         Ok(Db {
             dir,
@@ -193,6 +216,7 @@ impl Db {
             state: Mutex::new(state),
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
+            listener: opts.event_listener.clone(),
         })
     }
 
@@ -350,6 +374,7 @@ impl Db {
         let mem = Arc::clone(&state.mem);
         let file_num = state.vs.allocate_file_number();
         let meta = write_memtable_to_sstable(&self.dir, &self.cmp, file_num, &mem)?;
+        let flushed_bytes = meta.size;
 
         let new_wal = state.vs.allocate_file_number();
         let wal = record::Writer::with_log_num(
@@ -373,6 +398,10 @@ impl Db {
         if let Some(mw) = state.manifest.as_mut() {
             mw.write_record(&edit.encode())?;
             mw.sync_all()?;
+        }
+        state.flush_count += 1;
+        if let Some(l) = &self.listener {
+            l.on_flush_end(file_num, flushed_bytes);
         }
 
         // Remove logs that predate the new WAL; their data is now in the sstable.
@@ -524,6 +553,8 @@ impl Db {
             level_files,
             level_bytes,
             last_sequence: state.vs.last_sequence,
+            flush_count: state.flush_count,
+            compaction_count: state.compaction_count,
         }
     }
 
@@ -586,6 +617,10 @@ pub struct Metrics {
     pub level_bytes: [u64; NUM_LEVELS],
     /// The largest sequence number assigned so far.
     pub last_sequence: SeqNum,
+    /// Number of memtable flushes performed this session.
+    pub flush_count: u64,
+    /// Number of compactions performed this session.
+    pub compaction_count: u64,
 }
 
 /// Resolves a point entry against the maximum covering range-tombstone sequence number:
@@ -1097,6 +1132,55 @@ mod tests {
         db.set(b"trigger", b"z").unwrap();
         db.flush().unwrap();
         assert_eq!(db.get(b"pinned").unwrap(), Some(b"v2".to_vec()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metrics_and_event_listener() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Counter {
+            flushes: AtomicU64,
+            compactions: AtomicU64,
+        }
+        impl EventListener for Counter {
+            fn on_flush_end(&self, _file_num: u64, bytes: u64) {
+                assert!(bytes > 0);
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_compaction_end(&self, _lvl: usize, inputs: usize, _outputs: usize) {
+                assert!(inputs > 0);
+                self.compactions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Counter {
+            flushes: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
+        });
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            event_listener: Some(counter.clone()),
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        for i in 0..3000u32 {
+            db.set(format!("k{i:06}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+
+        let m = db.metrics();
+        assert!(m.flush_count >= 1, "flushes: {}", m.flush_count);
+        assert!(
+            m.compaction_count >= 1,
+            "compactions: {}",
+            m.compaction_count
+        );
+        assert_eq!(m.flush_count, counter.flushes.load(Ordering::Relaxed));
+        assert_eq!(
+            m.compaction_count,
+            counter.compactions.load(Ordering::Relaxed)
+        );
+        assert!(m.level_bytes.iter().sum::<u64>() > 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
