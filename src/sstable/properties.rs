@@ -182,6 +182,9 @@ pub const META_RANGE_DEL_NAME: &str = "rocksdb.range_del2";
 /// The metaindex key under which the range-key block is stored.
 pub const META_RANGE_KEY_NAME: &str = "pebble.range_key";
 
+/// The metaindex key under which the value-block index is stored.
+pub const META_VALUE_INDEX_NAME: &str = "pebble.value_index";
+
 #[cfg(test)]
 mod tests {
     use super::*;

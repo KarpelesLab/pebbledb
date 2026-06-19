@@ -20,14 +20,15 @@
 //! point lookups ([`Reader::get`]) and full ordered iteration ([`Reader::iter`]).
 //!
 //! Scope: this reader handles the row-based block format with single- and two-level
-//! binary-search indexes, bloom filters, properties, and CRC32C or xxHash64 checksums —
-//! the RocksDBv2 and Pebblev1/v2 table formats, plus the footer layouts of later Pebble
-//! versions. Value blocks (Pebblev3+) and the columnar format (Pebblev5+) are not yet
-//! supported.
+//! binary-search indexes, bloom filters, properties, range-del and range-key blocks,
+//! value blocks (Pebblev3+ value prefixes and out-of-line values), and CRC32C or
+//! xxHash64 checksums — the RocksDBv2 and Pebblev1..v4 table formats. The columnar block
+//! format (Pebblev5+) and blob files are not yet supported.
 
 pub mod block;
 pub mod filter;
 pub mod properties;
+pub mod valblk;
 pub mod writer;
 
 pub use properties::Properties;
@@ -78,10 +79,16 @@ impl TableFormat {
         }
     }
 
-    /// Whether values may be stored out-of-line in value blocks (Pebblev3+), which this
-    /// reader does not yet resolve.
-    fn has_value_blocks(self) -> bool {
+    /// Whether point values carry a value-prefix byte and may reference value blocks
+    /// (Pebble format v3+).
+    fn prefixes_values(self) -> bool {
         matches!(self, TableFormat::Pebble(v) if v >= 3)
+    }
+
+    /// Whether the table uses the columnar block format (Pebble format v5+), which this
+    /// reader does not yet support.
+    fn is_columnar(self) -> bool {
+        matches!(self, TableFormat::Pebble(v) if v >= 5)
     }
 }
 
@@ -165,6 +172,7 @@ struct MetaBlocks {
     filter: Option<Arc<[u8]>>,
     range_dels: Vec<RangeTombstone>,
     range_keys: Vec<RangeKeyEntry>,
+    value_block_handles: Vec<BlockHandle>,
 }
 
 /// Reads the metaindex and the meta blocks it references (`rocksdb.properties`,
@@ -177,6 +185,7 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
     let mut filter_handle = None;
     let mut range_del_handle = None;
     let mut range_key_handle = None;
+    let mut value_index: Option<valblk::IndexHandle> = None;
     while it.valid() {
         let key = it.key();
         if key == properties::META_PROPERTIES_NAME.as_bytes() {
@@ -185,6 +194,8 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
             range_del_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         } else if key == properties::META_RANGE_KEY_NAME.as_bytes() {
             range_key_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+        } else if key == properties::META_VALUE_INDEX_NAME.as_bytes() {
+            value_index = Some(valblk::decode_index_handle(it.value())?);
         } else if key.starts_with(b"fullfilter.") {
             filter_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         }
@@ -240,11 +251,18 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
         }
     }
 
+    let mut value_block_handles = Vec::new();
+    if let Some(ih) = value_index {
+        let index_block = read_block(file, ih.handle, footer.checksum)?;
+        value_block_handles = valblk::decode_index(&index_block, &ih)?;
+    }
+
     Ok(MetaBlocks {
         props,
         filter,
         range_dels,
         range_keys,
+        value_block_handles,
     })
 }
 
@@ -265,6 +283,10 @@ pub struct Reader {
     range_keys: Vec<RangeKeyEntry>,
     /// Whether the index is two-level (the footer index handle is the top-level index).
     two_level: bool,
+    /// Whether point values carry a value-prefix byte (Pebble format v3+).
+    prefixed_values: bool,
+    /// Handles of the table's value blocks, indexed by block number.
+    value_block_handles: Vec<BlockHandle>,
 }
 
 impl Reader {
@@ -272,11 +294,12 @@ impl Reader {
     pub fn open(file: impl Into<Arc<[u8]>>, cmp: Arc<dyn Comparer>) -> Result<Reader> {
         let file: Arc<[u8]> = file.into();
         let footer = parse_footer(&file)?;
-        if footer.format.has_value_blocks() {
+        if footer.format.is_columnar() {
             return Err(Error::Unsupported(
-                "sstable: value blocks (Pebblev3+) not yet supported",
+                "sstable: columnar block format (Pebblev5+) not yet supported",
             ));
         }
+        let prefixed_values = footer.format.prefixes_values();
         let meta = read_metaindex(&file, &footer)?;
         let two_level = meta.props.is_two_level_index();
         let index = read_block(&file, footer.index, footer.checksum)?;
@@ -285,6 +308,8 @@ impl Reader {
             cmp,
             footer,
             index,
+            prefixed_values,
+            value_block_handles: meta.value_block_handles,
             props: meta.props,
             filter: meta.filter,
             range_dels: meta.range_dels,
@@ -321,6 +346,39 @@ impl Reader {
     /// Reads and decodes the data block referenced by `handle`.
     fn read_data_block(&self, handle: BlockHandle) -> Result<Arc<[u8]>> {
         read_block(&self.file, handle, self.footer.checksum)
+    }
+
+    /// Resolves a value stored in a data block to the actual value bytes.
+    ///
+    /// For format versions without value prefixes the stored bytes *are* the value. For
+    /// v3+ the first byte is a value-prefix: an in-place value is the remaining bytes; a
+    /// value handle is decoded and the value is read from the referenced value block.
+    pub(crate) fn resolve_value(&self, stored: &[u8]) -> Result<Vec<u8>> {
+        if !self.prefixed_values {
+            return Ok(stored.to_vec());
+        }
+        if stored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kind = valblk::value_kind(stored[0]);
+        match kind {
+            valblk::KIND_IN_PLACE => Ok(stored[1..].to_vec()),
+            valblk::KIND_HANDLE => {
+                let h = valblk::decode_handle(&stored[1..])?;
+                let block_handle = *self
+                    .value_block_handles
+                    .get(h.block_num as usize)
+                    .ok_or_else(|| Error::corruption("sstable: value block number out of range"))?;
+                let block = read_block(&self.file, block_handle, self.footer.checksum)?;
+                let start = h.offset_in_block as usize;
+                let end = start + h.value_len as usize;
+                if end > block.len() {
+                    return Err(Error::corruption("sstable: value handle out of range"));
+                }
+                Ok(block[start..end].to_vec())
+            }
+            _ => Err(Error::Unsupported("sstable: blob-referenced value")),
+        }
     }
 
     /// Returns an iterator over the top-level index block.
@@ -426,7 +484,7 @@ impl Reader {
         }
         let trailer = crate::base::internal_key::encoded_trailer(it.key());
         let kind = trailer_kind(trailer);
-        Ok(Some((trailer >> 8, kind, it.value().to_vec())))
+        Ok(Some((trailer >> 8, kind, self.resolve_value(it.value())?)))
     }
 
     /// Returns an iterator over every entry in the table, in internal-key order.
@@ -440,6 +498,7 @@ impl Reader {
             handles,
             next_block: 0,
             data: None,
+            cur_value: Vec::new(),
         })
     }
 }
@@ -452,6 +511,8 @@ pub struct TableIter {
     /// Index into `handles` of the next block to load.
     next_block: usize,
     data: Option<BlockIter>,
+    /// The current entry's resolved value (value prefixes/handles already applied).
+    cur_value: Vec<u8>,
 }
 
 impl TableIter {
@@ -470,6 +531,16 @@ impl TableIter {
         Ok(true)
     }
 
+    /// Resolves and caches the current entry's value.
+    fn refresh_value(&mut self) -> Result<()> {
+        if let Some(d) = self.data.as_ref()
+            && d.valid()
+        {
+            self.cur_value = self.reader.resolve_value(d.value())?;
+        }
+        Ok(())
+    }
+
     /// Advances to the first entry and returns whether one exists.
     pub fn first(&mut self) -> Result<bool> {
         self.next_block = 0;
@@ -479,6 +550,7 @@ impl TableIter {
                 return Ok(false);
             }
             if self.data.as_ref().is_some_and(|d| d.valid()) {
+                self.refresh_value()?;
                 return Ok(true);
             }
         }
@@ -494,9 +566,9 @@ impl TableIter {
         self.data.as_ref().expect("valid").key()
     }
 
-    /// The current entry's value.
+    /// The current entry's resolved value.
     pub fn value(&self) -> &[u8] {
-        self.data.as_ref().expect("valid").value()
+        &self.cur_value
     }
 
     /// Advances to the next entry. Returns whether the iterator remains valid.
@@ -506,6 +578,7 @@ impl TableIter {
             Some(d) => {
                 d.next();
                 if d.valid() {
+                    self.refresh_value()?;
                     return Ok(true);
                 }
             }
@@ -517,6 +590,7 @@ impl TableIter {
                 return Ok(false);
             }
             if self.data.as_ref().is_some_and(|d| d.valid()) {
+                self.refresh_value()?;
                 return Ok(true);
             }
         }

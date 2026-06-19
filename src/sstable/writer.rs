@@ -29,7 +29,7 @@ use crate::{Error, Result};
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
 use super::properties::{
     BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME,
-    Properties, TWO_LEVEL_INDEX,
+    META_VALUE_INDEX_NAME, Properties, TWO_LEVEL_INDEX,
 };
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
@@ -67,6 +67,9 @@ pub struct WriterOptions {
     /// started; once more than one partition is produced the table uses a two-level
     /// index (default 256 KiB).
     pub index_block_size: usize,
+    /// For value-prefixing formats (Pebble v3+), values at least this large are stored
+    /// out-of-line in value blocks. `None` keeps every value in place (default `None`).
+    pub value_block_threshold: Option<usize>,
 }
 
 impl Default for WriterOptions {
@@ -79,6 +82,7 @@ impl Default for WriterOptions {
             table_format: TableFormat::Pebble(2),
             filter_policy: Some(10),
             index_block_size: 256 << 10,
+            value_block_threshold: None,
         }
     }
 }
@@ -204,6 +208,16 @@ pub struct Writer<W: Write> {
     data_size: u64,
     num_data_blocks: u64,
     filter: Option<super::filter::FilterWriter>,
+    /// Whether point values are prefixed (Pebble v3+).
+    prefix_values: bool,
+    /// Values at least this large go out-of-line to value blocks.
+    value_threshold: Option<usize>,
+    /// The current (open) value block's contents.
+    vblk_buf: Vec<u8>,
+    /// On-disk handles of completed value blocks, indexed by block number.
+    value_block_handles: Vec<BlockHandle>,
+    /// The current value block's number.
+    vblk_num: u32,
     finished: bool,
 }
 
@@ -212,6 +226,8 @@ impl<W: Write> Writer<W> {
     pub fn new(w: W, cmp: Arc<dyn Comparer>, opts: WriterOptions) -> Writer<W> {
         let ri = opts.block_restart_interval;
         let filter = opts.filter_policy.map(super::filter::FilterWriter::new);
+        let prefix_values = matches!(opts.table_format, TableFormat::Pebble(v) if v >= 3);
+        let value_threshold = opts.value_block_threshold;
         Writer {
             w,
             opts,
@@ -237,8 +253,111 @@ impl<W: Write> Writer<W> {
             data_size: 0,
             num_data_blocks: 0,
             filter,
+            prefix_values,
+            value_threshold,
+            vblk_buf: Vec::new(),
+            value_block_handles: Vec::new(),
+            vblk_num: 0,
             finished: false,
         }
+    }
+
+    /// Encodes a point value for storage in a data block. For value-prefixing formats
+    /// this prepends the value-prefix byte and may move large values to a value block,
+    /// returning the encoded value handle instead.
+    fn encode_point_value(&mut self, value: &[u8]) -> Result<Vec<u8>> {
+        use super::valblk;
+        if !self.prefix_values {
+            return Ok(value.to_vec());
+        }
+        // Large values go out-of-line to a value block.
+        if let Some(thresh) = self.value_threshold
+            && value.len() >= thresh
+            && !value.is_empty()
+        {
+            const TARGET_VALUE_BLOCK: usize = 1 << 16;
+            if !self.vblk_buf.is_empty() && self.vblk_buf.len() + value.len() > TARGET_VALUE_BLOCK {
+                self.flush_value_block()?;
+            }
+            let offset = self.vblk_buf.len() as u32;
+            self.vblk_buf.extend_from_slice(value);
+            let handle = valblk::ValueHandle {
+                value_len: value.len() as u32,
+                block_num: self.vblk_num,
+                offset_in_block: offset,
+            };
+            let mut enc = vec![valblk::KIND_HANDLE << 6];
+            enc.extend_from_slice(&valblk::encode_handle(handle));
+            Ok(enc)
+        } else {
+            // In-place: prefix byte 0 (KIND_IN_PLACE) followed by the value.
+            let mut enc = Vec::with_capacity(value.len() + 1);
+            enc.push(valblk::KIND_IN_PLACE << 6);
+            enc.extend_from_slice(value);
+            Ok(enc)
+        }
+    }
+
+    /// Writes the current value block (if any) and records its on-disk handle.
+    fn flush_value_block(&mut self) -> Result<()> {
+        if self.vblk_buf.is_empty() {
+            return Ok(());
+        }
+        let body = std::mem::take(&mut self.vblk_buf);
+        let handle = write_block(
+            &mut self.w,
+            &mut self.offset,
+            &body,
+            self.opts.compression,
+            self.opts.checksum,
+        )?;
+        self.value_block_handles.push(handle);
+        self.vblk_num += 1;
+        Ok(())
+    }
+
+    /// Writes the value-block index block and returns its metaindex `(name, value)`.
+    fn write_value_index(&mut self) -> Result<(String, Vec<u8>)> {
+        use super::valblk;
+        let max_offset = self
+            .value_block_handles
+            .iter()
+            .map(|h| h.offset)
+            .max()
+            .unwrap_or(0);
+        let max_len = self
+            .value_block_handles
+            .iter()
+            .map(|h| h.length)
+            .max()
+            .unwrap_or(0);
+        let block_num_len = valblk::min_width(self.value_block_handles.len() as u64);
+        let block_offset_len = valblk::min_width(max_offset);
+        let block_length_len = valblk::min_width(max_len);
+
+        let mut data = Vec::new();
+        for (i, h) in self.value_block_handles.iter().enumerate() {
+            valblk::put_uint_le(&mut data, i as u64, block_num_len);
+            valblk::put_uint_le(&mut data, h.offset, block_offset_len);
+            valblk::put_uint_le(&mut data, h.length, block_length_len);
+        }
+        let index_handle = write_block(
+            &mut self.w,
+            &mut self.offset,
+            &data,
+            CompressionType::None,
+            self.opts.checksum,
+        )?;
+        let ih = valblk::IndexHandle {
+            handle: index_handle,
+            block_num_len,
+            block_offset_len,
+            block_length_len,
+        };
+        Ok((
+            META_VALUE_INDEX_NAME.to_string(),
+            valblk::encode_index_handle(&ih),
+        ))
     }
 
     /// Adds an entry. `internal_key` is an encoded internal key and must be strictly
@@ -304,7 +423,10 @@ impl<W: Write> Writer<W> {
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
 
-        self.data_block.add(internal_key, value);
+        // For value-prefixing formats the stored value is the prefix-encoded value (and
+        // large values may be moved to a value block).
+        let stored = self.encode_point_value(value)?;
+        self.data_block.add(internal_key, &stored);
         self.num_entries += 1;
         self.raw_key_size += internal_key.len() as u64;
         self.raw_value_size += value.len() as u64;
@@ -397,9 +519,24 @@ impl<W: Write> Writer<W> {
 
         // Filter block (uncompressed), if a filter policy is configured and any keys
         // were added. Recorded in the metaindex under "fullfilter.<policy name>".
-        let mut meta_entries: Vec<(String, BlockHandle)> = Vec::new();
+        // Each metaindex entry is (name, encoded-value); most values are an encoded
+        // block handle, but the value-block index encodes extra column widths.
+        let mut meta_entries: Vec<(String, Vec<u8>)> = Vec::new();
         let mut filter_size = 0u64;
         let mut filter_policy_name = String::new();
+        let encode_handle = |h: BlockHandle| {
+            let mut e = Vec::new();
+            h.encode_to(&mut e);
+            e
+        };
+
+        // Value blocks (Pebble v3+): flush any open value block, then write the value
+        // index and its metaindex entry.
+        self.flush_value_block()?;
+        if !self.value_block_handles.is_empty() {
+            let entry = self.write_value_index()?;
+            meta_entries.push(entry);
+        }
 
         // Range-deletion block (compressed like data), referenced under
         // "rocksdb.range_del2".
@@ -412,7 +549,7 @@ impl<W: Write> Writer<W> {
                 self.opts.compression,
                 self.opts.checksum,
             )?;
-            meta_entries.push((META_RANGE_DEL_NAME.to_string(), handle));
+            meta_entries.push((META_RANGE_DEL_NAME.to_string(), encode_handle(handle)));
         }
 
         // Range-key block (compressed like data), referenced under "pebble.range_key".
@@ -425,7 +562,7 @@ impl<W: Write> Writer<W> {
                 self.opts.compression,
                 self.opts.checksum,
             )?;
-            meta_entries.push((META_RANGE_KEY_NAME.to_string(), handle));
+            meta_entries.push((META_RANGE_KEY_NAME.to_string(), encode_handle(handle)));
         }
         if let Some(fw) = self.filter.as_ref()
             && let Some(filter_bytes) = fw.finish()
@@ -439,7 +576,10 @@ impl<W: Write> Writer<W> {
                 CompressionType::None,
                 self.opts.checksum,
             )?;
-            meta_entries.push((super::filter::metaindex_key(&filter_policy_name), handle));
+            meta_entries.push((
+                super::filter::metaindex_key(&filter_policy_name),
+                encode_handle(handle),
+            ));
         }
 
         // Flush the final index partition, then decide single- vs two-level. A single
@@ -510,16 +650,17 @@ impl<W: Write> Writer<W> {
                 self.opts.checksum,
             )?
         };
-        meta_entries.push((META_PROPERTIES_NAME.to_string(), props_handle));
+        meta_entries.push((
+            META_PROPERTIES_NAME.to_string(),
+            encode_handle(props_handle),
+        ));
 
-        // Metaindex block (uncompressed): meta-block name -> handle, sorted by name.
+        // Metaindex block (uncompressed): meta-block name -> encoded value, sorted by name.
         meta_entries.sort_by(|a, b| a.0.cmp(&b.0));
         let metaindex_handle = {
             let mut mi = BlockBuilder::new(1);
-            for (name, handle) in &meta_entries {
-                let mut handle_enc = Vec::new();
-                handle.encode_to(&mut handle_enc);
-                mi.add(name.as_bytes(), &handle_enc);
+            for (name, value) in &meta_entries {
+                mi.add(name.as_bytes(), value);
             }
             write_block(
                 &mut self.w,
@@ -926,6 +1067,57 @@ mod tests {
             ok = it.next().unwrap();
         }
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn value_blocks_roundtrip() {
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        // Mix of small (in-place) and large (out-of-line) values in a Pebblev3 table.
+        let mut entries = Vec::new();
+        for i in 0..200u32 {
+            let value = if i % 2 == 0 {
+                format!("small-{i}").into_bytes()
+            } else {
+                vec![b'x'; 500] // large -> value block
+            };
+            entries.push((
+                ikey(
+                    format!("k{i:04}").as_bytes(),
+                    i as u64 + 1,
+                    InternalKeyKind::Set,
+                ),
+                value,
+            ));
+        }
+        let opts = WriterOptions {
+            block_size: 256,
+            table_format: TableFormat::Pebble(3),
+            value_block_threshold: Some(100),
+            ..Default::default()
+        };
+        let file = build(&entries, opts);
+        let reader = Arc::new(Reader::open(file, cmp).unwrap());
+        assert_eq!(reader.format(), TableFormat::Pebble(3));
+
+        // Point lookups resolve both in-place and value-block values.
+        for (i, (_, expected)) in entries.iter().enumerate() {
+            let got = reader.get(format!("k{i:04}").as_bytes(), 10_000).unwrap();
+            assert_eq!(
+                got,
+                Some((InternalKeyKind::Set, expected.clone())),
+                "lookup k{i:04}"
+            );
+        }
+        // Full iteration also resolves values.
+        let mut it = reader.iter().unwrap();
+        let mut n = 0;
+        let mut ok = it.first().unwrap();
+        while ok {
+            assert_eq!(it.value(), entries[n].1.as_slice());
+            n += 1;
+            ok = it.next().unwrap();
+        }
+        assert_eq!(n, 200);
     }
 
     #[test]

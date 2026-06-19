@@ -62,7 +62,7 @@ refined as they are reached.
   eliding).
 - [x] **Phase 14 — Range keys.** RANGEKEYSET / RANGEKEYUNSET / RANGEKEYDEL blocks,
   range-key iterators and masking, batch operations, and compaction of range keys.
-- [ ] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
+- [x] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
   indirection), Pebblev4 DELSIZED tombstones, and blob files for separated values with
   their MANIFEST blob-file edits and references.
 - [ ] **Phase 16 — Columnar blocks.** The Pebblev5+ columnar data / index / keyspan block
