@@ -29,7 +29,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   and a table iterator. Read real Pebble sstables.
 - [x] **Phase 6 — sstable write.** Block builder (restart interval), filter builder,
   properties, and a writer producing output that Go Pebble can read.
-- [ ] **Phase 7 — Manifest / Version.** `VersionEdit` tag stream, `FileMetadata`,
+- [x] **Phase 7 — Manifest / Version.** `VersionEdit` tag stream, `FileMetadata`,
   `Version` (L0..L6) and `VersionSet`, MANIFEST as a record log, marker / CURRENT files,
   OPTIONS file, and the file lock. Open an existing DB's manifest.
 - [ ] **Phase 8 — DB read path.** Open an existing Pebble DB read-only; merging iterator
