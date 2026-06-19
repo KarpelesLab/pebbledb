@@ -1,0 +1,344 @@
+// Copyright (c) 2011 The LevelDB-Go Authors. All rights reserved.
+// Copyright (c) 2024 The pebbledb (Rust port) Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found
+// in the LICENSE file.
+//
+// Ported from Pebble's sstable package (format.go, table.go, reader.go).
+
+//! Reading sorted-string tables (sstables).
+//!
+//! An sstable is an immutable, sorted file of internal key/value pairs. Its layout is:
+//!
+//! ```text
+//! [data block]+        prefix-compressed key/value entries (see [`block`])
+//! [metaindex block]    names -> handles for the filter/properties/range blocks
+//! [index block]        separator keys -> data block handles
+//! [footer]             checksum type, metaindex & index handles, version, magic
+//! ```
+//!
+//! [`Reader`] opens a table held entirely in memory, parses the footer, and supports
+//! point lookups ([`Reader::get`]) and full ordered iteration ([`Reader::iter`]).
+//!
+//! Scope: this reader handles the row-based block format with single-level binary-search
+//! indexes and CRC32C checksums — the RocksDBv2 and Pebblev1/v2 table formats, plus the
+//! footer layouts of later Pebble versions. Two-level indexes, value blocks (Pebblev3+),
+//! the columnar format (Pebblev5+), and xxHash checksums are not yet supported.
+
+pub mod block;
+
+use std::sync::Arc;
+
+use crate::base::comparer::Comparer;
+use crate::base::internal_key::{InternalKeyKind, SeqNum, encoded_user_key, trailer_kind};
+use crate::{Error, Result};
+
+use block::{BlockHandle, BlockIter, ChecksumType, read_block};
+
+const MAGIC_LEN: usize = 8;
+const VERSION_LEN: usize = 4;
+
+const LEVELDB_MAGIC: &[u8; 8] = b"\x57\xfb\x80\x8b\x24\x75\x47\xdb";
+const ROCKSDB_MAGIC: &[u8; 8] = b"\xf7\xcf\xf4\x85\xb7\x41\xe2\x88";
+const PEBBLE_MAGIC: &[u8; 8] = b"\xf0\x9f\xaa\xb3\xf0\x9f\xaa\xb3";
+
+const LEVELDB_FOOTER_LEN: usize = 48;
+const ROCKSDB_FOOTER_LEN: usize = 53;
+
+/// The table format: a (magic number, version) tuple that determines the footer layout
+/// and which features the table may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFormat {
+    /// Original LevelDB format (48-byte footer, implicit CRC32C, no checksum-type byte).
+    LevelDB,
+    /// RocksDB external format version 2 (53-byte footer).
+    RocksDBv2,
+    /// Pebble format version `v` (1-based). `v <= 5` uses the 53-byte footer.
+    Pebble(u8),
+}
+
+impl TableFormat {
+    fn footer_len(self) -> usize {
+        match self {
+            TableFormat::LevelDB => LEVELDB_FOOTER_LEN,
+            TableFormat::RocksDBv2 => ROCKSDB_FOOTER_LEN,
+            TableFormat::Pebble(v) => match v {
+                1..=5 => ROCKSDB_FOOTER_LEN,
+                6 => ROCKSDB_FOOTER_LEN + 4, // adds a footer checksum
+                _ => ROCKSDB_FOOTER_LEN + 4 + 4, // v7+ also adds an attributes word
+            },
+        }
+    }
+
+    /// Whether values may be stored out-of-line in value blocks (Pebblev3+), which this
+    /// reader does not yet resolve.
+    fn has_value_blocks(self) -> bool {
+        matches!(self, TableFormat::Pebble(v) if v >= 3)
+    }
+}
+
+/// The decoded sstable footer.
+#[derive(Clone, Copy, Debug)]
+struct Footer {
+    format: TableFormat,
+    checksum: ChecksumType,
+    index: BlockHandle,
+    #[allow(dead_code)]
+    metaindex: BlockHandle,
+}
+
+fn parse_footer(file: &[u8]) -> Result<Footer> {
+    let n = file.len();
+    if n < LEVELDB_FOOTER_LEN {
+        return Err(Error::corruption("sstable: file smaller than footer"));
+    }
+    let magic = &file[n - MAGIC_LEN..];
+
+    if magic == LEVELDB_MAGIC {
+        let f = &file[n - LEVELDB_FOOTER_LEN..];
+        let (metaindex, m) = BlockHandle::decode(f)
+            .ok_or_else(|| Error::corruption("sstable: bad metaindex handle"))?;
+        let (index, _) = BlockHandle::decode(&f[m..])
+            .ok_or_else(|| Error::corruption("sstable: bad index handle"))?;
+        return Ok(Footer {
+            format: TableFormat::LevelDB,
+            checksum: ChecksumType::Crc32c,
+            index,
+            metaindex,
+        });
+    }
+
+    if magic == ROCKSDB_MAGIC || magic == PEBBLE_MAGIC {
+        let version = u32::from_le_bytes(
+            file[n - MAGIC_LEN - VERSION_LEN..n - MAGIC_LEN]
+                .try_into()
+                .unwrap(),
+        );
+        let format = if magic == ROCKSDB_MAGIC {
+            if version != 2 {
+                return Err(Error::Corruption(format!(
+                    "sstable: unsupported rocksdb version {version}"
+                )));
+            }
+            TableFormat::RocksDBv2
+        } else {
+            if version == 0 || version > 8 {
+                return Err(Error::Corruption(format!(
+                    "sstable: unsupported pebble version {version}"
+                )));
+            }
+            TableFormat::Pebble(version as u8)
+        };
+        let footer_len = format.footer_len();
+        if n < footer_len {
+            return Err(Error::corruption("sstable: file smaller than footer"));
+        }
+        let f = &file[n - footer_len..];
+        let checksum = ChecksumType::from_u8(f[0])?;
+        // Handles are encoded immediately after the checksum-type byte for all of these
+        // formats; any v6+ footer checksum / attributes sit near the end and are ignored.
+        let (metaindex, m) = BlockHandle::decode(&f[1..])
+            .ok_or_else(|| Error::corruption("sstable: bad metaindex handle"))?;
+        let (index, _) = BlockHandle::decode(&f[1 + m..])
+            .ok_or_else(|| Error::corruption("sstable: bad index handle"))?;
+        return Ok(Footer {
+            format,
+            checksum,
+            index,
+            metaindex,
+        });
+    }
+
+    Err(Error::corruption("sstable: bad magic number"))
+}
+
+/// A reader over an in-memory sstable.
+pub struct Reader {
+    file: Arc<[u8]>,
+    cmp: Arc<dyn Comparer>,
+    footer: Footer,
+    /// The decoded top-level index block, cached at open.
+    index: Arc<[u8]>,
+}
+
+impl Reader {
+    /// Opens an sstable held entirely in `file`, comparing user keys with `cmp`.
+    pub fn open(file: impl Into<Arc<[u8]>>, cmp: Arc<dyn Comparer>) -> Result<Reader> {
+        let file: Arc<[u8]> = file.into();
+        let footer = parse_footer(&file)?;
+        if footer.format.has_value_blocks() {
+            return Err(Error::Unsupported(
+                "sstable: value blocks (Pebblev3+) not yet supported",
+            ));
+        }
+        let index = read_block(&file, footer.index, footer.checksum)?;
+        Ok(Reader {
+            file,
+            cmp,
+            footer,
+            index,
+        })
+    }
+
+    /// The table's format.
+    pub fn format(&self) -> TableFormat {
+        self.footer.format
+    }
+
+    /// The checksum type protecting the table's blocks.
+    pub fn checksum_type(&self) -> ChecksumType {
+        self.footer.checksum
+    }
+
+    /// Reads and decodes the data block referenced by `handle`.
+    fn read_data_block(&self, handle: BlockHandle) -> Result<Arc<[u8]>> {
+        read_block(&self.file, handle, self.footer.checksum)
+    }
+
+    /// Returns an iterator over the index block.
+    fn index_iter(&self) -> Result<BlockIter> {
+        BlockIter::new(Arc::clone(&self.index))
+    }
+
+    /// Looks up `user_key` as visible at `snapshot`, returning the kind and value of the
+    /// most recent matching entry with sequence number `<= snapshot`, or `None`.
+    ///
+    /// A returned [`InternalKeyKind::Delete`] / [`InternalKeyKind::SingleDelete`] is a
+    /// tombstone: the caller treats it as absent for this table.
+    pub fn get(
+        &self,
+        user_key: &[u8],
+        snapshot: SeqNum,
+    ) -> Result<Option<(InternalKeyKind, Vec<u8>)>> {
+        // The lookup internal key sorts just before any real entry at `snapshot`.
+        let mut lookup = user_key.to_vec();
+        lookup.extend_from_slice(&(((snapshot << 8) | 0xff).to_le_bytes()));
+
+        let mut index = self.index_iter()?;
+        index.seek_ge(&lookup, self.cmp.as_ref());
+        if !index.valid() {
+            return Ok(None);
+        }
+        let (handle, _) = BlockHandle::decode(index.value())
+            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        let data = self.read_data_block(handle)?;
+        let mut it = BlockIter::new(data)?;
+        it.seek_ge(&lookup, self.cmp.as_ref());
+        if !it.valid() {
+            return Ok(None);
+        }
+        if self.cmp.compare(encoded_user_key(it.key()), user_key) != std::cmp::Ordering::Equal {
+            return Ok(None);
+        }
+        let kind = trailer_kind(crate::base::internal_key::encoded_trailer(it.key()));
+        Ok(Some((kind, it.value().to_vec())))
+    }
+
+    /// Returns an iterator over every entry in the table, in internal-key order.
+    pub fn iter(&self) -> Result<TableIter<'_>> {
+        let mut index = self.index_iter()?;
+        index.first();
+        Ok(TableIter {
+            reader: self,
+            index,
+            data: None,
+        })
+    }
+}
+
+/// A forward iterator over all entries of an sstable, walking the index block and each
+/// data block it points to in turn.
+pub struct TableIter<'a> {
+    reader: &'a Reader,
+    index: BlockIter,
+    data: Option<BlockIter>,
+}
+
+impl TableIter<'_> {
+    /// Loads the data block for the current index entry, if any.
+    fn load_current_data_block(&mut self) -> Result<bool> {
+        if !self.index.valid() {
+            self.data = None;
+            return Ok(false);
+        }
+        let (handle, _) = BlockHandle::decode(self.index.value())
+            .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
+        let block = self.reader.read_data_block(handle)?;
+        let mut it = BlockIter::new(block)?;
+        it.first();
+        self.data = Some(it);
+        Ok(true)
+    }
+
+    /// Advances to the first entry and returns whether one exists.
+    pub fn first(&mut self) -> Result<bool> {
+        self.index.first();
+        // Skip any empty data blocks.
+        loop {
+            if !self.load_current_data_block()? {
+                return Ok(false);
+            }
+            if self.data.as_ref().is_some_and(|d| d.valid()) {
+                return Ok(true);
+            }
+            self.index.next();
+        }
+    }
+
+    /// Whether the iterator is at a valid entry.
+    pub fn valid(&self) -> bool {
+        self.data.as_ref().is_some_and(|d| d.valid())
+    }
+
+    /// The current entry's encoded internal key.
+    pub fn key(&self) -> &[u8] {
+        self.data.as_ref().expect("valid").key()
+    }
+
+    /// The current entry's value.
+    pub fn value(&self) -> &[u8] {
+        self.data.as_ref().expect("valid").value()
+    }
+
+    /// Advances to the next entry. Returns whether the iterator remains valid.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<bool> {
+        match self.data.as_mut() {
+            Some(d) => {
+                d.next();
+                if d.valid() {
+                    return Ok(true);
+                }
+            }
+            None => return Ok(false),
+        }
+        // Current data block exhausted; advance the index to the next block.
+        loop {
+            self.index.next();
+            if !self.load_current_data_block()? {
+                return Ok(false);
+            }
+            if self.data.as_ref().is_some_and(|d| d.valid()) {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The reader is exercised end-to-end against the writer in the Phase 6 sstable
+    // writer tests (build a table, then read it back). Footer parsing is covered there
+    // and via the round-trip integration tests.
+    use super::*;
+
+    #[test]
+    fn footer_too_short_is_rejected() {
+        assert!(parse_footer(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn bad_magic_is_rejected() {
+        let buf = vec![0u8; 64];
+        assert!(parse_footer(&buf).is_err());
+    }
+}

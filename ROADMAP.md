@@ -22,7 +22,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   op stream; encode/decode and apply to a memtable.
 - [x] **Phase 4 — MemTable.** Arena-backed concurrent skiplist (port of `arenaskl`)
   ordered by internal key, with an iterator.
-- [ ] **Phase 5 — sstable read.** Footer + magic + format versions (RocksDBv2,
+- [x] **Phase 5 — sstable read.** Footer + magic + format versions (RocksDBv2,
   Pebblev1..v5), metaindex, index (incl. two-level), prefix-compressed data blocks with
   restart arrays, block trailer (compression byte + checksum: CRC32C and xxhash64),
   decompression via `compcol`, bloom filters, properties, range-del / range-key blocks,
