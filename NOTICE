@@ -1,0 +1,35 @@
+pebbledb — a Rust port of CockroachDB's Pebble
+==============================================
+
+This project is a derivative work: a from-scratch Rust port of Pebble, the Go
+LSM key-value store maintained by Cockroach Labs.
+
+Upstream original work
+----------------------
+  Project:  Pebble
+  Source:   https://github.com/cockroachdb/pebble
+  License:  BSD-3-Clause ("Copyright (c) 2011 The LevelDB-Go Authors. All rights reserved.")
+
+Pebble itself descends from:
+  * LevelDB-Go  — https://github.com/golang/leveldb        (BSD-3-Clause)
+  * RocksDB     — https://github.com/facebook/rocksdb      (on-disk format reference)
+  * LevelDB     — https://github.com/google/leveldb        (BSD-3-Clause)
+
+Relationship to the original
+-----------------------------
+pebbledb reimplements Pebble's architecture and reproduces its on-disk binary
+formats (sstable, write-ahead log / record log, and MANIFEST) for compatibility,
+so that databases written by Pebble can be read by pebbledb and vice-versa.
+
+Source files that are direct ports of specific Pebble Go files carry an
+attribution header naming the upstream file they were ported from. Algorithms and
+format constants are reproduced from the Pebble/RocksDB/LevelDB sources cited above.
+
+This port is licensed under the same 3-clause BSD license as the upstream works;
+see the LICENSE file. The original copyright notice of The LevelDB-Go Authors is
+retained as required by that license.
+
+Third-party dependencies
+-------------------------
+  * compcol (https://github.com/KarpelesLab/compcol, MIT) — block compression
+    (snappy, zstd).

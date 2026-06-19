@@ -1,0 +1,21 @@
+[package]
+name = "pebbledb"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+description = "A Rust port of CockroachDB's Pebble — an LSM key-value store (LevelDB/RocksDB lineage), binary-compatible with Pebble's on-disk format."
+repository = "https://github.com/KarpelesLab/pebbledb"
+readme = "README.md"
+keywords = ["database", "lsm", "key-value", "pebble", "storage"]
+categories = ["database-implementations", "data-structures"]
+
+[dependencies]
+# Compression for sstable blocks. compcol is a pure-Rust, no_std, MSRV-1.88 crate that
+# exposes Pebble's two block compressors (snappy, zstd) behind a uniform API.
+compcol = { version = "0.6", default-features = false, features = ["std", "snappy", "zstd"] }
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
