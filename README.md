@@ -4,15 +4,18 @@ A Rust port of [CockroachDB's Pebble](https://github.com/cockroachdb/pebble) —
 LSM (log-structured merge-tree) key-value storage engine in the LevelDB / RocksDB
 lineage.
 
-> **Status: functional, pre-1.0.** All roadmap phases are implemented: the engine
-> opens/creates a store, supports `set`/`delete`/batch writes through a write-ahead log,
-> flushes memtables to sstables, performs leveled compaction, reads via point lookups and
-> snapshot-consistent iterators, and recovers on reopen. The on-disk formats (sstable,
-> record log, MANIFEST) are reproduced for binary compatibility. Several advanced areas
-> are intentionally scoped out for now — two-level sstable indexes, value blocks
-> (Pebblev3+), the columnar format (Pebblev5+), xxHash checksums, range keys, virtual
-> sstables, background/concurrent compaction, and `fsync`-level durability. See
-> [`ROADMAP.md`](ROADMAP.md) for details. The public API is **not** yet stable.
+> **Status: functional core, pre-1.0; full parity in progress.** The goal is a
+> **complete** port of Pebble — 100% of its functionality and on-disk format, with
+> nothing permanently out of scope. The core engine (Milestone 1) is done: open/create a
+> store, `set`/`delete`/batch writes through a write-ahead log, flush memtables to
+> sstables, leveled compaction, point lookups and snapshot-consistent iterators, and
+> recovery on reopen, with the sstable / record-log / MANIFEST formats reproduced for
+> binary compatibility. Milestone 2 extends this to everything else Pebble does —
+> two-level indexes, bloom filters, range keys and range deletions, value blocks and blob
+> files, the columnar table formats, the merge operator, background/concurrent
+> compaction, the full options and metrics surfaces, ingestion, and more. See
+> [`ROADMAP.md`](ROADMAP.md) for the phase-by-phase plan. The public API is **not** yet
+> stable.
 
 ## Usage
 
