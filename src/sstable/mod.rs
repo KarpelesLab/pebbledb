@@ -38,6 +38,7 @@ use std::sync::Arc;
 use crate::base::comparer::Comparer;
 use crate::base::internal_key::{InternalKeyKind, SeqNum, encoded_user_key, trailer_kind};
 use crate::base::range_del::RangeTombstone;
+use crate::base::range_key::RangeKeyEntry;
 use crate::{Error, Result};
 
 use block::{BlockHandle, BlockIter, ChecksumType, read_block};
@@ -163,6 +164,7 @@ struct MetaBlocks {
     props: Properties,
     filter: Option<Arc<[u8]>>,
     range_dels: Vec<RangeTombstone>,
+    range_keys: Vec<RangeKeyEntry>,
 }
 
 /// Reads the metaindex and the meta blocks it references (`rocksdb.properties`,
@@ -174,12 +176,15 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
     let mut props_handle = None;
     let mut filter_handle = None;
     let mut range_del_handle = None;
+    let mut range_key_handle = None;
     while it.valid() {
         let key = it.key();
         if key == properties::META_PROPERTIES_NAME.as_bytes() {
             props_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         } else if key == properties::META_RANGE_DEL_NAME.as_bytes() {
             range_del_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+        } else if key == properties::META_RANGE_KEY_NAME.as_bytes() {
+            range_key_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         } else if key.starts_with(b"fullfilter.") {
             filter_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         }
@@ -218,10 +223,28 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
         }
     }
 
+    let mut range_keys = Vec::new();
+    if let Some(handle) = range_key_handle {
+        let block = read_block(file, handle, footer.checksum)?;
+        let mut rit = BlockIter::new(block)?;
+        rit.first();
+        while rit.valid() {
+            let trailer = crate::base::internal_key::encoded_trailer(rit.key());
+            range_keys.push(RangeKeyEntry {
+                kind: trailer_kind(trailer),
+                start: encoded_user_key(rit.key()).to_vec(),
+                seqnum: crate::base::internal_key::trailer_seqnum(trailer),
+                value: rit.value().to_vec(),
+            });
+            rit.next();
+        }
+    }
+
     Ok(MetaBlocks {
         props,
         filter,
         range_dels,
+        range_keys,
     })
 }
 
@@ -238,6 +261,8 @@ pub struct Reader {
     filter: Option<Arc<[u8]>>,
     /// The table's range tombstones, parsed from the range-del block.
     range_dels: Vec<RangeTombstone>,
+    /// The table's range-key entries, parsed from the range-key block.
+    range_keys: Vec<RangeKeyEntry>,
     /// Whether the index is two-level (the footer index handle is the top-level index).
     two_level: bool,
 }
@@ -263,6 +288,7 @@ impl Reader {
             props: meta.props,
             filter: meta.filter,
             range_dels: meta.range_dels,
+            range_keys: meta.range_keys,
             two_level,
         })
     }
@@ -270,6 +296,11 @@ impl Reader {
     /// The table's range tombstones.
     pub fn range_tombstones(&self) -> &[RangeTombstone] {
         &self.range_dels
+    }
+
+    /// The table's range-key entries.
+    pub fn range_keys(&self) -> &[RangeKeyEntry] {
+        &self.range_keys
     }
 
     /// The table's properties.

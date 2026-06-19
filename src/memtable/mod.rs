@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::base::comparer::Comparer;
 use crate::base::internal_key::{InternalKeyKind, SeqNum, make_trailer, trailer_kind};
 use crate::base::range_del::RangeTombstone;
+use crate::base::range_key::RangeKeyEntry;
 use crate::batch::Batch;
 use crate::{Error, Result};
 
@@ -413,6 +414,8 @@ pub struct MemTable {
     skl: Skiplist,
     /// Range tombstones applied to this memtable, kept separate from point keys.
     range_dels: std::sync::Mutex<Vec<RangeTombstone>>,
+    /// Range-key entries applied to this memtable, kept separate from point keys.
+    range_keys: std::sync::Mutex<Vec<RangeKeyEntry>>,
 }
 
 impl MemTable {
@@ -421,6 +424,7 @@ impl MemTable {
         MemTable {
             skl: Skiplist::new(cmp, arena_size),
             range_dels: std::sync::Mutex::new(Vec::new()),
+            range_keys: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -443,6 +447,18 @@ impl MemTable {
                         seqnum,
                     ));
                 }
+                InternalKeyKind::RangeKeySet
+                | InternalKeyKind::RangeKeyUnset
+                | InternalKeyKind::RangeKeyDelete => {
+                    // start = key, value = encoded (end + payload); kept in the
+                    // range-key list.
+                    self.range_keys.lock().unwrap().push(RangeKeyEntry {
+                        kind: op.kind,
+                        start: op.key.to_vec(),
+                        seqnum,
+                        value: op.value.unwrap_or(&[]).to_vec(),
+                    });
+                }
                 _ => {
                     let trailer = make_trailer(seqnum, op.kind);
                     self.skl.add(op.key, trailer, op.value.unwrap_or(&[]))?;
@@ -455,6 +471,11 @@ impl MemTable {
     /// Returns a copy of the memtable's range tombstones.
     pub fn range_tombstones(&self) -> Vec<RangeTombstone> {
         self.range_dels.lock().unwrap().clone()
+    }
+
+    /// Returns a copy of the memtable's range-key entries.
+    pub fn range_keys(&self) -> Vec<RangeKeyEntry> {
+        self.range_keys.lock().unwrap().clone()
     }
 
     /// Inserts a single internal key/value pair directly.
@@ -498,9 +519,11 @@ impl MemTable {
         Some((it.trailer() >> 8, it.kind(), it.value().to_vec()))
     }
 
-    /// Whether the memtable has neither point keys nor range tombstones.
+    /// Whether the memtable has no point keys, range tombstones, or range keys.
     pub fn is_empty(&self) -> bool {
-        self.skl.is_empty() && self.range_dels.lock().unwrap().is_empty()
+        self.skl.is_empty()
+            && self.range_dels.lock().unwrap().is_empty()
+            && self.range_keys.lock().unwrap().is_empty()
     }
 
     /// The number of bytes allocated from the arena.

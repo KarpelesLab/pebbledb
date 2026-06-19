@@ -9,6 +9,7 @@
 pub mod comparer;
 pub mod internal_key;
 pub mod range_del;
+pub mod range_key;
 pub mod varint;
 
 pub use comparer::{Comparer, DefaultComparer};

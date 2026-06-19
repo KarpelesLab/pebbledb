@@ -28,7 +28,8 @@ use crate::{Error, Result};
 
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
 use super::properties::{
-    BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, META_RANGE_DEL_NAME, Properties, TWO_LEVEL_INDEX,
+    BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME,
+    Properties, TWO_LEVEL_INDEX,
 };
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
@@ -173,6 +174,11 @@ pub struct Writer<W: Write> {
     /// Range-deletion entries (start internal key -> end user key), written as a
     /// separate block referenced from the metaindex.
     range_del_block: BlockBuilder,
+    /// Range-key entries (start internal key -> encoded value), written as a separate
+    /// block referenced from the metaindex.
+    range_key_block: BlockBuilder,
+    /// The last range-key internal key added, used to enforce ordering.
+    last_range_key: Vec<u8>,
     /// The current lower-level index block (index partition).
     index_partition: BlockBuilder,
     /// The top-level index: separator -> index-partition handle.
@@ -213,6 +219,8 @@ impl<W: Write> Writer<W> {
             offset: 0,
             data_block: BlockBuilder::new(ri),
             range_del_block: BlockBuilder::new(ri),
+            range_key_block: BlockBuilder::new(ri),
+            last_range_key: Vec::new(),
             index_partition: BlockBuilder::new(ri),
             top_level_index: BlockBuilder::new(ri),
             last_index_sep: Vec::new(),
@@ -261,6 +269,27 @@ impl<W: Write> Writer<W> {
             self.range_del_block.add(internal_key, value);
             self.num_range_deletions += 1;
             self.num_deletions += 1;
+            return Ok(());
+        }
+
+        // Range keys likewise form their own sorted stream and block.
+        if matches!(
+            kind,
+            InternalKeyKind::RangeKeySet
+                | InternalKeyKind::RangeKeyUnset
+                | InternalKeyKind::RangeKeyDelete
+        ) {
+            if !self.last_range_key.is_empty()
+                && compare_encoded(self.cmp.as_ref(), &self.last_range_key, internal_key)
+                    != std::cmp::Ordering::Less
+            {
+                return Err(Error::InvalidState(
+                    "sstable: range-key keys must be added in increasing order".into(),
+                ));
+            }
+            self.last_range_key.clear();
+            self.last_range_key.extend_from_slice(internal_key);
+            self.range_key_block.add(internal_key, value);
             return Ok(());
         }
 
@@ -385,6 +414,19 @@ impl<W: Write> Writer<W> {
             )?;
             meta_entries.push((META_RANGE_DEL_NAME.to_string(), handle));
         }
+
+        // Range-key block (compressed like data), referenced under "pebble.range_key".
+        if !self.range_key_block.is_empty() {
+            let raw = self.range_key_block.finish();
+            let handle = write_block(
+                &mut self.w,
+                &mut self.offset,
+                raw,
+                self.opts.compression,
+                self.opts.checksum,
+            )?;
+            meta_entries.push((META_RANGE_KEY_NAME.to_string(), handle));
+        }
         if let Some(fw) = self.filter.as_ref()
             && let Some(filter_bytes) = fw.finish()
         {
@@ -404,7 +446,19 @@ impl<W: Write> Writer<W> {
         // partition is used directly as the index; multiple partitions are summarized by
         // a top-level index block.
         self.flush_index_partition()?;
-        let (index_handle, index_type, top_level_index_size) = if self.partition_count <= 1 {
+        let (index_handle, index_type, top_level_index_size) = if self.partition_count == 0 {
+            // No data blocks (e.g. a range-key/range-del-only table): write a valid,
+            // empty index block so the footer's index handle points at real bytes.
+            let mut empty = BlockBuilder::new(1);
+            let h = write_block(
+                &mut self.w,
+                &mut self.offset,
+                empty.finish(),
+                self.opts.compression,
+                self.opts.checksum,
+            )?;
+            (h, BINARY_SEARCH_INDEX, 0)
+        } else if self.partition_count == 1 {
             (
                 self.first_partition_handle.unwrap_or_default(),
                 BINARY_SEARCH_INDEX,

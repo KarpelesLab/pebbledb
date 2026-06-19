@@ -179,6 +179,9 @@ pub const META_PROPERTIES_NAME: &str = "rocksdb.properties";
 /// The metaindex key under which the v2 range-deletion block is stored.
 pub const META_RANGE_DEL_NAME: &str = "rocksdb.range_del2";
 
+/// The metaindex key under which the range-key block is stored.
+pub const META_RANGE_KEY_NAME: &str = "pebble.range_key";
+
 #[cfg(test)]
 mod tests {
     use super::*;

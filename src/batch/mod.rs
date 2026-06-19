@@ -194,6 +194,29 @@ impl Batch {
         self.add(InternalKeyKind::LogData, data, None);
     }
 
+    /// Sets a range key over `[start, end)` at `suffix` to `value`.
+    pub fn range_key_set(&mut self, start: &[u8], end: &[u8], suffix: &[u8], value: &[u8]) {
+        let v = crate::base::range_key::encode_set_value(
+            end,
+            &[crate::base::range_key::SuffixValue {
+                suffix: suffix.to_vec(),
+                value: value.to_vec(),
+            }],
+        );
+        self.add(InternalKeyKind::RangeKeySet, start, Some(&v));
+    }
+
+    /// Removes the range key at `suffix` over `[start, end)`.
+    pub fn range_key_unset(&mut self, start: &[u8], end: &[u8], suffix: &[u8]) {
+        let v = crate::base::range_key::encode_unset_value(end, &[suffix.to_vec()]);
+        self.add(InternalKeyKind::RangeKeyUnset, start, Some(&v));
+    }
+
+    /// Deletes all range keys over `[start, end)`.
+    pub fn range_key_delete(&mut self, start: &[u8], end: &[u8]) {
+        self.add(InternalKeyKind::RangeKeyDelete, start, Some(end));
+    }
+
     /// Iterates over the operations in the batch.
     pub fn iter(&self) -> BatchReader<'_> {
         BatchReader {

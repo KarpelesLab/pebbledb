@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::base::internal_key::{InternalKeyKind, encoded_trailer, encoded_user_key, trailer_kind};
 use crate::base::range_del::RangeTombstone;
+use crate::base::range_key::RangeKeyEntry;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEdit};
 use crate::sstable::{Writer, WriterOptions};
 
@@ -108,21 +109,31 @@ impl Db {
         // would be lost).
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
         let mut tombstones: Vec<RangeTombstone> = Vec::new();
+        let mut range_keys: Vec<RangeKeyEntry> = Vec::new();
         for f in c.inputs.iter().chain(c.overlap.iter()) {
             let reader = self.open_reader(f.file_num)?;
             tombstones.extend_from_slice(reader.range_tombstones());
+            range_keys.extend_from_slice(reader.range_keys());
             sources.push(Box::new(reader.iter()?));
         }
         let mut merge = MergingIter::new(sources, self.cmp.clone())?;
 
         // Tombstones (point and range) can be dropped only when compacting into the
-        // lowest level, where there is no older data left to shadow.
+        // lowest level, where there is no older data left to shadow. Range keys are
+        // always carried (their resolution is deferred to read time).
         let drop_tombstones = c.output_level == NUM_LEVELS - 1;
         let write_tombstones = !drop_tombstones && !tombstones.is_empty();
+        let write_range_keys = !range_keys.is_empty();
         tombstones.sort_by(|a, b| {
             self.cmp
                 .compare(&a.start, &b.start)
                 .then(b.seqnum.cmp(&a.seqnum))
+        });
+        range_keys.sort_by(|a, b| {
+            self.cmp
+                .compare(&a.start, &b.start)
+                .then(b.seqnum.cmp(&a.seqnum))
+                .then(b.kind.as_u8().cmp(&a.kind.as_u8()))
         });
 
         let mut outputs: Vec<FileMetadata> = Vec::new();
@@ -149,7 +160,13 @@ impl Db {
             }
 
             if builder.is_none() {
-                builder = Some(self.new_output(state, &tombstones, write_tombstones)?);
+                builder = Some(self.new_output(
+                    state,
+                    &tombstones,
+                    write_tombstones,
+                    &range_keys,
+                    write_range_keys,
+                )?);
             }
             let b = builder.as_mut().unwrap();
             b.add(&ikey, &value)?;
@@ -161,10 +178,16 @@ impl Db {
             outputs.push(b.finish()?);
         }
 
-        // If the compaction produced only range tombstones (no surviving point keys),
+        // If the compaction produced only range deletions/keys (no surviving point keys),
         // still emit a file to carry them.
-        if outputs.is_empty() && write_tombstones {
-            let b = self.new_output(state, &tombstones, true)?;
+        if outputs.is_empty() && (write_tombstones || write_range_keys) {
+            let b = self.new_output(
+                state,
+                &tombstones,
+                write_tombstones,
+                &range_keys,
+                write_range_keys,
+            )?;
             outputs.push(b.finish()?);
         }
 
@@ -201,18 +224,26 @@ impl Db {
         Ok(())
     }
 
-    /// Creates a fresh output builder, seeding it with the carried range tombstones.
+    /// Creates a fresh output builder, seeding it with the carried range tombstones and
+    /// range keys.
     fn new_output(
         &self,
         state: &mut State,
         tombstones: &[RangeTombstone],
         write_tombstones: bool,
+        range_keys: &[RangeKeyEntry],
+        write_range_keys: bool,
     ) -> Result<OutputBuilder> {
         let file_num = state.vs.allocate_file_number();
         let mut b = OutputBuilder::new(self, file_num)?;
         if write_tombstones {
             for t in tombstones {
                 b.add_range_del(&t.start, &t.end, t.seqnum)?;
+            }
+        }
+        if write_range_keys {
+            for rk in range_keys {
+                b.add_range_key(rk)?;
             }
         }
         Ok(b)
@@ -290,6 +321,18 @@ impl OutputBuilder {
         let end_ikey =
             InternalKey::new(end.to_vec(), seqnum, InternalKeyKind::RangeDelete).encode();
         self.extend_bounds(&end_ikey, seqnum);
+        Ok(())
+    }
+
+    fn add_range_key(&mut self, rk: &RangeKeyEntry) -> Result<()> {
+        use crate::base::internal_key::InternalKey;
+        let start_ikey = InternalKey::new(rk.start.clone(), rk.seqnum, rk.kind).encode();
+        self.writer.add(&start_ikey, &rk.value)?;
+        self.extend_bounds(&start_ikey, rk.seqnum);
+        if let Ok(end) = rk.end() {
+            let end_ikey = InternalKey::new(end, rk.seqnum, rk.kind).encode();
+            self.extend_bounds(&end_ikey, rk.seqnum);
+        }
         Ok(())
     }
 

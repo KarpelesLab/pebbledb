@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use crate::base::comparer::{Comparer, DefaultComparer};
 use crate::base::internal_key::{InternalKey, InternalKeyKind, SeqNum, encoded_user_key};
 use crate::base::range_del::max_covering_seqnum;
+use crate::base::range_key::RangeKeyEntry;
 use crate::batch::Batch;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, VersionEdit, VersionSet};
 use crate::memtable::MemTable;
@@ -213,6 +214,72 @@ impl Db {
         let mut b = Batch::new();
         b.delete_range(start, end);
         self.apply(b)
+    }
+
+    /// Sets a range key over `[start, end)` at `suffix` to `value`.
+    pub fn range_key_set(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        suffix: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let mut b = Batch::new();
+        b.range_key_set(start, end, suffix, value);
+        self.apply(b)
+    }
+
+    /// Removes the range key at `suffix` over `[start, end)`.
+    pub fn range_key_unset(&self, start: &[u8], end: &[u8], suffix: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.range_key_unset(start, end, suffix);
+        self.apply(b)
+    }
+
+    /// Deletes all range keys over `[start, end)`.
+    pub fn range_key_delete(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.range_key_delete(start, end);
+        self.apply(b)
+    }
+
+    /// Returns the range-key entries covering `user_key`, newest first (by sequence
+    /// number), across the memtable, immutable memtables, and all sstables.
+    ///
+    /// This returns the raw entries; coalescing `RANGEKEYSET`/`UNSET`/`DEL` into an
+    /// effective set of suffix/value pairs (and iterator masking) is refined in a later
+    /// phase.
+    pub fn range_keys_covering(&self, user_key: &[u8]) -> Result<Vec<RangeKeyEntry>> {
+        let (mem, imm, version) = {
+            let state = self.state.lock().unwrap();
+            (
+                Arc::clone(&state.mem),
+                state.imm.clone(),
+                state.vs.current.clone(),
+            )
+        };
+        let cmp = self.cmp.as_ref();
+        let mut out = Vec::new();
+        let mut collect = |entries: Vec<RangeKeyEntry>| -> Result<()> {
+            for e in entries {
+                if e.covers(cmp, user_key)? {
+                    out.push(e);
+                }
+            }
+            Ok(())
+        };
+        collect(mem.range_keys())?;
+        for m in imm.iter().rev() {
+            collect(m.range_keys())?;
+        }
+        for level in version.levels.iter() {
+            for f in level {
+                let reader = self.open_reader(f.file_num)?;
+                collect(reader.range_keys().to_vec())?;
+            }
+        }
+        out.sort_by_key(|e| std::cmp::Reverse(e.seqnum));
+        Ok(out)
     }
 
     /// Atomically applies all operations in `batch`. Alias for [`Db::apply`].
@@ -605,6 +672,32 @@ fn write_memtable_to_sstable(
         largest_seq = largest_seq.max(t.seqnum);
     }
 
+    // Write the memtable's range keys, in internal-key order, into the range-key block.
+    let mut range_keys = mem.range_keys();
+    range_keys.sort_by(|a, b| {
+        cmp.compare(&a.start, &b.start)
+            .then(b.seqnum.cmp(&a.seqnum))
+            .then(b.kind.as_u8().cmp(&a.kind.as_u8()))
+    });
+    for rk in &range_keys {
+        let start_ikey = InternalKey::new(rk.start.clone(), rk.seqnum, rk.kind).encode();
+        w.add(&start_ikey, &rk.value)?;
+        if smallest.is_none()
+            || cmp.compare(&rk.start, encoded_user_key(smallest.as_ref().unwrap()))
+                == std::cmp::Ordering::Less
+        {
+            smallest = Some(start_ikey.clone());
+        }
+        if let Ok(end) = rk.end()
+            && (largest.is_empty()
+                || cmp.compare(&end, encoded_user_key(&largest)) == std::cmp::Ordering::Greater)
+        {
+            largest = InternalKey::new(end, rk.seqnum, rk.kind).encode();
+        }
+        smallest_seq = smallest_seq.min(rk.seqnum);
+        largest_seq = largest_seq.max(rk.seqnum);
+    }
+
     w.finish()?;
 
     Ok(FileMetadata {
@@ -894,6 +987,50 @@ mod tests {
         assert_eq!(db.get(b"key00200").unwrap(), None);
         assert_eq!(db.get(b"key00299").unwrap(), None);
         assert_eq!(db.get(b"key00300").unwrap(), Some(b"v".to_vec()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn range_keys_set_and_query() {
+        use crate::base::internal_key::InternalKeyKind;
+        let dir = temp_dir();
+        let db = Db::open(&dir, Options::default()).unwrap();
+        db.range_key_set(b"b", b"f", b"@10", b"hello").unwrap();
+        db.range_key_set(b"d", b"h", b"@20", b"world").unwrap();
+
+        // "e" is covered by both spans [b,f) and [d,h).
+        let rks = db.range_keys_covering(b"e").unwrap();
+        assert_eq!(rks.len(), 2);
+        assert!(rks.iter().all(|r| r.kind == InternalKeyKind::RangeKeySet));
+        // "a" is covered by neither.
+        assert!(db.range_keys_covering(b"a").unwrap().is_empty());
+        // "c" only by [b,f).
+        assert_eq!(db.range_keys_covering(b"c").unwrap().len(), 1);
+
+        // Range keys survive a flush + reopen.
+        db.flush().unwrap();
+        drop(db);
+        let db = Db::open(&dir, Options::default()).unwrap();
+        assert_eq!(db.range_keys_covering(b"e").unwrap().len(), 2);
+        let rk = &db.range_keys_covering(b"c").unwrap()[0];
+        assert_eq!(rk.end().unwrap(), b"f");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn range_key_delete_clears() {
+        let dir = temp_dir();
+        let db = Db::open(&dir, Options::default()).unwrap();
+        db.range_key_set(b"a", b"z", b"@1", b"v").unwrap();
+        assert_eq!(db.range_keys_covering(b"m").unwrap().len(), 1);
+        // A range-key delete is recorded as a covering entry (newest first).
+        db.range_key_delete(b"a", b"z").unwrap();
+        let rks = db.range_keys_covering(b"m").unwrap();
+        assert_eq!(rks.len(), 2);
+        assert_eq!(
+            rks[0].kind,
+            crate::base::internal_key::InternalKeyKind::RangeKeyDelete
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

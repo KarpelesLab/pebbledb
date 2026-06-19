@@ -60,7 +60,7 @@ refined as they are reached.
 - [x] **Phase 13 — Range deletions.** RANGEDEL v1/v2 blocks (read + write),
   range-tombstone-aware iterators, `Get`, and compaction (truncation, fragmentation,
   eliding).
-- [ ] **Phase 14 — Range keys.** RANGEKEYSET / RANGEKEYUNSET / RANGEKEYDEL blocks,
+- [x] **Phase 14 — Range keys.** RANGEKEYSET / RANGEKEYUNSET / RANGEKEYDEL blocks,
   range-key iterators and masking, batch operations, and compaction of range keys.
 - [ ] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
   indirection), Pebblev4 DELSIZED tombstones, and blob files for separated values with
