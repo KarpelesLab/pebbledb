@@ -339,6 +339,146 @@ pub fn read_to_vec(mut r: impl Read) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
+// ---------------------------------------------------------------------------
+// DiskHealthCheckingFs
+// ---------------------------------------------------------------------------
+
+/// Details of a filesystem operation that exceeded the health-check threshold.
+#[derive(Debug, Clone)]
+pub struct DiskSlowInfo {
+    /// The operation name (e.g. `"create"`, `"write"`, `"sync"`).
+    pub op: &'static str,
+    /// The file involved.
+    pub path: PathBuf,
+    /// How long the operation took.
+    pub duration: std::time::Duration,
+}
+
+/// Callback invoked when an operation is slow.
+type SlowCallback = Arc<dyn Fn(DiskSlowInfo) + Send + Sync>;
+
+/// An [`Fs`] wrapper that times each operation and reports those exceeding a threshold via
+/// a callback — Pebble's disk-health checking (the source of its `DiskSlow` event). Wrap
+/// any inner filesystem; reads and writes are timed, including a writable file's
+/// `write`/`sync_all`.
+#[derive(Clone)]
+pub struct DiskHealthCheckingFs {
+    inner: Arc<dyn Fs>,
+    threshold: std::time::Duration,
+    on_slow: SlowCallback,
+}
+
+impl DiskHealthCheckingFs {
+    /// Wraps `inner`, invoking `on_slow` whenever an operation takes at least `threshold`.
+    pub fn new(
+        inner: Arc<dyn Fs>,
+        threshold: std::time::Duration,
+        on_slow: SlowCallback,
+    ) -> DiskHealthCheckingFs {
+        DiskHealthCheckingFs {
+            inner,
+            threshold,
+            on_slow,
+        }
+    }
+
+    fn timed<T>(&self, op: &'static str, path: &Path, f: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let r = f();
+        let elapsed = start.elapsed();
+        if elapsed >= self.threshold {
+            (self.on_slow)(DiskSlowInfo {
+                op,
+                path: path.to_path_buf(),
+                duration: elapsed,
+            });
+        }
+        r
+    }
+}
+
+/// A writable file whose `write`/`sync_all` are timed by [`DiskHealthCheckingFs`].
+struct HealthCheckedWritable {
+    inner: Box<dyn WritableFile>,
+    path: PathBuf,
+    threshold: std::time::Duration,
+    on_slow: SlowCallback,
+}
+
+impl Write for HealthCheckedWritable {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let start = std::time::Instant::now();
+        let r = self.inner.write(buf);
+        let elapsed = start.elapsed();
+        if elapsed >= self.threshold {
+            (self.on_slow)(DiskSlowInfo {
+                op: "write",
+                path: self.path.clone(),
+                duration: elapsed,
+            });
+        }
+        r
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl WritableFile for HealthCheckedWritable {
+    fn sync_all(&mut self) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        let r = self.inner.sync_all();
+        let elapsed = start.elapsed();
+        if elapsed >= self.threshold {
+            (self.on_slow)(DiskSlowInfo {
+                op: "sync",
+                path: self.path.clone(),
+                duration: elapsed,
+            });
+        }
+        r
+    }
+}
+
+impl Fs for DiskHealthCheckingFs {
+    fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+        let inner = self.timed("create", path, || self.inner.create(path))?;
+        Ok(Box::new(HealthCheckedWritable {
+            inner,
+            path: path.to_path_buf(),
+            threshold: self.threshold,
+            on_slow: Arc::clone(&self.on_slow),
+        }))
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.timed("read", path, || self.inner.read(path))
+    }
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.timed("remove", path, || self.inner.remove(path))
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.timed("rename", from, || self.inner.rename(from, to))
+    }
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        self.inner.list(dir)
+    }
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+    fn size(&self, path: &Path) -> io::Result<u64> {
+        self.inner.size(path)
+    }
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        self.timed("sync_dir", dir, || self.inner.sync_dir(dir))
+    }
+    fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+        self.inner.lock(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +518,81 @@ mod tests {
         assert!(fs.lock(p).is_err(), "second lock must fail");
         drop(lock);
         assert!(fs.lock(p).is_ok(), "lock released on drop");
+    }
+
+    #[test]
+    fn disk_health_check_reports_slow_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // An inner FS whose writable files sleep on write/sync, simulating a slow disk.
+        struct SlowFs(MemFs);
+        struct SlowWritable(Box<dyn WritableFile>);
+        impl Write for SlowWritable {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(5));
+                self.0.write(buf)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        impl WritableFile for SlowWritable {
+            fn sync_all(&mut self) -> io::Result<()> {
+                std::thread::sleep(Duration::from_millis(5));
+                self.0.sync_all()
+            }
+        }
+        impl Fs for SlowFs {
+            fn create(&self, p: &Path) -> io::Result<Box<dyn WritableFile>> {
+                Ok(Box::new(SlowWritable(self.0.create(p)?)))
+            }
+            fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+                self.0.read(p)
+            }
+            fn remove(&self, p: &Path) -> io::Result<()> {
+                self.0.remove(p)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+                self.0.rename(a, b)
+            }
+            fn list(&self, d: &Path) -> io::Result<Vec<String>> {
+                self.0.list(d)
+            }
+            fn create_dir_all(&self, p: &Path) -> io::Result<()> {
+                self.0.create_dir_all(p)
+            }
+            fn exists(&self, p: &Path) -> bool {
+                self.0.exists(p)
+            }
+            fn size(&self, p: &Path) -> io::Result<u64> {
+                self.0.size(p)
+            }
+            fn sync_dir(&self, d: &Path) -> io::Result<()> {
+                self.0.sync_dir(d)
+            }
+            fn lock(&self, p: &Path) -> io::Result<Box<dyn DirLock>> {
+                self.0.lock(p)
+            }
+        }
+
+        let slow_count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&slow_count);
+        let fs = DiskHealthCheckingFs::new(
+            Arc::new(SlowFs(MemFs::new())),
+            Duration::from_millis(1),
+            Arc::new(move |info: DiskSlowInfo| {
+                assert!(info.op == "write" || info.op == "sync");
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let mut f = fs.create(Path::new("/db/x")).unwrap();
+        f.write_all(b"data").unwrap();
+        f.sync_all().unwrap();
+        assert!(
+            slow_count.load(Ordering::SeqCst) >= 2,
+            "expected slow write + sync reports"
+        );
     }
 
     #[test]
