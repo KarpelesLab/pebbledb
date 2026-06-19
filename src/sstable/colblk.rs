@@ -28,12 +28,18 @@
 //! +-------------+
 //! ```
 //!
-//! This module parses the block header and locates each column's data. The per-column
-//! codecs ([`DataType::Uint`] width/delta encoding, [`DataType::PrefixBytes`] prefix
-//! compression, [`DataType::Bytes`], [`DataType::Bool`] bitmaps) and the data / index /
-//! keyspan block schemas built on top of them are still being ported; see the crate
-//! `ROADMAP.md`. Until then, [`crate::sstable::Reader`] reports a clear error for columnar
-//! tables rather than misreading them.
+//! This module provides the block header parser, the per-column codecs — the uint column
+//! ([`encode_uint_column`]/[`decode_uint_column`], variable width + optional delta base),
+//! the raw-bytes column ([`encode_raw_bytes`]/[`decode_raw_bytes`], an offsets table plus
+//! concatenated data), and the bool bitmap ([`encode_bitmap`]/[`decode_bitmap`]) — all
+//! matching Pebble's exact on-disk layouts, and a columnar [`DataBlockBuilder`] /
+//! [`DataBlockReader`] built on them (read + write).
+//!
+//! Still being ported (see `ROADMAP.md`): the [`DataType::PrefixBytes`] bundle
+//! prefix-compression codec, the columnar index and keyspan blocks, and integration into
+//! [`crate::sstable::Reader`]/`Writer` against Pebble's production key schema — until that
+//! lands the sstable reader reports a clear error for v5+ tables rather than misreading
+//! one written with a different schema.
 
 use crate::{Error, Result};
 
@@ -157,6 +163,452 @@ impl BlockHeader {
             return None;
         }
         Some((start, end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Column codecs
+//
+// These reproduce Pebble's `colblk` per-column on-disk encodings exactly, so the bytes
+// are compatible: the uint column (variable width + optional delta base), the raw-bytes
+// column (an offsets table + concatenated data), and the bool bitmap column.
+// ---------------------------------------------------------------------------
+
+/// Rounds `pos` up to the next multiple of `align` (a power of two: 1, 2, 4, or 8).
+fn align_up(pos: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (pos + align - 1) & !(align - 1)
+}
+
+/// The number of bytes needed to represent `v`: 0, 1, 2, 4, or 8.
+fn byte_width(v: u64) -> usize {
+    match 64 - v.leading_zeros() {
+        0 => 0,
+        1..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 4,
+        _ => 8,
+    }
+}
+
+const UINT_DELTA_BIT: u8 = 1 << 7;
+
+/// Chooses the uint encoding byte (width in the low bits, delta flag in the high bit) for
+/// a column of values in `[min, max]`, mirroring Pebble's `DetermineUintEncoding`.
+fn determine_uint_encoding(min: u64, max: u64, rows: usize) -> u8 {
+    let mut b = byte_width(max - min);
+    if b == 8 {
+        return 8;
+    }
+    let mut is_delta = max >= (1u64 << (b * 8));
+    if is_delta && rows < 8 {
+        let b_no_delta = byte_width(max);
+        if rows * (b_no_delta - b) < 8 {
+            b = b_no_delta;
+            is_delta = false;
+        }
+    }
+    b as u8 | if is_delta { UINT_DELTA_BIT } else { 0 }
+}
+
+fn read_uint_le(b: &[u8], width: usize) -> u64 {
+    let mut v = 0u64;
+    for (i, &byte) in b.iter().take(width).enumerate() {
+        v |= (byte as u64) << (i * 8);
+    }
+    v
+}
+
+/// Encodes a uint column at `offset` within `buf`, growing `buf` as needed. Returns the
+/// offset just past the column.
+pub fn encode_uint_column(values: &[u64], offset: usize, buf: &mut Vec<u8>) -> usize {
+    let rows = values.len();
+    let (min, max) = values
+        .iter()
+        .fold((u64::MAX, 0u64), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let (min, max) = if rows == 0 { (0, 0) } else { (min, max) };
+    let enc = determine_uint_encoding(min, max, rows);
+    let width = (enc & !UINT_DELTA_BIT) as usize;
+    let is_delta = enc & UINT_DELTA_BIT != 0;
+
+    if buf.len() < offset {
+        buf.resize(offset, 0);
+    }
+    buf.truncate(offset);
+    buf.push(enc);
+    let base = if is_delta {
+        buf.extend_from_slice(&min.to_le_bytes());
+        min
+    } else {
+        0
+    };
+    if width == 0 {
+        return buf.len();
+    }
+    let aligned = align_up(buf.len(), width);
+    buf.resize(aligned, 0);
+    for &v in values {
+        let delta = v - base;
+        buf.extend_from_slice(&delta.to_le_bytes()[..width]);
+    }
+    buf.len()
+}
+
+/// Decodes a uint column of `rows` values starting at `off` within `b`. Returns the values
+/// and the offset just past the column.
+pub fn decode_uint_column(b: &[u8], mut off: usize, rows: usize) -> Result<(Vec<u64>, usize)> {
+    let enc = *b
+        .get(off)
+        .ok_or_else(|| Error::corruption("colblk: truncated uint column"))?;
+    off += 1;
+    let width = (enc & !UINT_DELTA_BIT) as usize;
+    let is_delta = enc & UINT_DELTA_BIT != 0;
+    if !matches!(width, 0 | 1 | 2 | 4 | 8) {
+        return Err(Error::corruption("colblk: invalid uint width"));
+    }
+    let base = if is_delta {
+        let bytes = b
+            .get(off..off + 8)
+            .ok_or_else(|| Error::corruption("colblk: truncated uint base"))?;
+        off += 8;
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    } else {
+        0
+    };
+    if width == 0 {
+        return Ok((vec![base; rows], off));
+    }
+    off = align_up(off, width);
+    let end = off + rows * width;
+    if b.len() < end {
+        return Err(Error::corruption("colblk: truncated uint values"));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for i in 0..rows {
+        out.push(base + read_uint_le(&b[off + i * width..], width));
+    }
+    Ok((out, end))
+}
+
+/// Encodes a raw-bytes column (an offsets table of `count+1` entries followed by the
+/// concatenated slice data) at `offset` within `buf`. Returns the offset just past it.
+pub fn encode_raw_bytes(slices: &[&[u8]], offset: usize, buf: &mut Vec<u8>) -> usize {
+    if slices.is_empty() {
+        buf.truncate(offset);
+        return offset;
+    }
+    let mut offsets = Vec::with_capacity(slices.len() + 1);
+    let mut acc = 0u64;
+    offsets.push(0);
+    for s in slices {
+        acc += s.len() as u64;
+        offsets.push(acc);
+    }
+    let after_offsets = encode_uint_column(&offsets, offset, buf);
+    // String data follows the offset table; offsets are relative to here.
+    for s in slices {
+        buf.extend_from_slice(s);
+    }
+    let _ = after_offsets;
+    buf.len()
+}
+
+/// Decodes a raw-bytes column of `count` slices starting at `off`. Returns the slices and
+/// the offset just past the column.
+pub fn decode_raw_bytes(b: &[u8], off: usize, count: usize) -> Result<(Vec<&[u8]>, usize)> {
+    if count == 0 {
+        return Ok((Vec::new(), off));
+    }
+    let (offsets, data_start) = decode_uint_column(b, off, count + 1)?;
+    let mut out = Vec::with_capacity(count);
+    let mut end = data_start;
+    for i in 0..count {
+        let s = data_start + offsets[i] as usize;
+        let e = data_start + offsets[i + 1] as usize;
+        let slice = b
+            .get(s..e)
+            .ok_or_else(|| Error::corruption("colblk: raw-bytes slice out of range"))?;
+        out.push(slice);
+        end = e;
+    }
+    Ok((out, end))
+}
+
+const BITMAP_ZERO: u8 = 0;
+const BITMAP_DEFAULT: u8 = 1;
+
+/// Encodes a bool column as a bitmap at `offset` within `buf`. Returns the offset past it.
+pub fn encode_bitmap(bits: &[bool], offset: usize, buf: &mut Vec<u8>) -> usize {
+    buf.truncate(offset);
+    if !bits.iter().any(|&x| x) {
+        buf.push(BITMAP_ZERO);
+        return buf.len();
+    }
+    buf.push(BITMAP_DEFAULT);
+    let aligned = align_up(buf.len(), 8);
+    buf.resize(aligned, 0);
+    let n = bits.len();
+    let primary_words = n.div_ceil(64);
+    let summary_words = primary_words.div_ceil(64);
+    let mut words = vec![0u64; primary_words + summary_words];
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    for w in 0..primary_words {
+        if words[w] != 0 {
+            words[primary_words + w / 64] |= 1u64 << (w % 64);
+        }
+    }
+    for w in &words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf.len()
+}
+
+/// Decodes a bool bitmap of `bit_count` bits starting at `off`. Returns the bools and the
+/// offset just past the bitmap.
+pub fn decode_bitmap(b: &[u8], mut off: usize, bit_count: usize) -> Result<(Vec<bool>, usize)> {
+    let enc = *b
+        .get(off)
+        .ok_or_else(|| Error::corruption("colblk: truncated bitmap"))?;
+    off += 1;
+    if enc == BITMAP_ZERO {
+        return Ok((vec![false; bit_count], off));
+    }
+    off = align_up(off, 8);
+    let primary_words = bit_count.div_ceil(64);
+    let summary_words = primary_words.div_ceil(64);
+    let end = off + (primary_words + summary_words) * 8;
+    if b.len() < end {
+        return Err(Error::corruption("colblk: truncated bitmap data"));
+    }
+    let mut out = Vec::with_capacity(bit_count);
+    for i in 0..bit_count {
+        let word_off = off + (i / 64) * 8;
+        let word = u64::from_le_bytes(b[word_off..word_off + 8].try_into().unwrap());
+        out.push(word & (1u64 << (i % 64)) != 0);
+    }
+    Ok((out, end))
+}
+
+// ---------------------------------------------------------------------------
+// Columnar data block
+//
+// A concrete columnar data block built from the column primitives above: three columns
+// per row — the user key (raw bytes), the internal-key trailer (uint), and the value (raw
+// bytes). This is the columnar analogue of the row-oriented data block: it stores the same
+// information column-by-column and reconstructs `(internal_key, value)` pairs on read.
+// ---------------------------------------------------------------------------
+
+/// The columnar block format version this engine writes.
+const DATA_BLOCK_VERSION: u8 = 1;
+/// Column indices within a [`DataBlock`].
+const COL_USER_KEY: usize = 0;
+const COL_TRAILER: usize = 1;
+const COL_VALUE: usize = 2;
+const DATA_BLOCK_COLUMNS: usize = 3;
+
+/// Builds a columnar data block from `(user_key, trailer, value)` rows.
+#[derive(Default)]
+pub struct DataBlockBuilder {
+    user_keys: Vec<Vec<u8>>,
+    trailers: Vec<u64>,
+    values: Vec<Vec<u8>>,
+}
+
+impl DataBlockBuilder {
+    /// Creates an empty builder.
+    pub fn new() -> DataBlockBuilder {
+        DataBlockBuilder::default()
+    }
+
+    /// Appends one row: the user key, the internal-key trailer, and the value.
+    pub fn add(&mut self, user_key: &[u8], trailer: u64, value: &[u8]) {
+        self.user_keys.push(user_key.to_vec());
+        self.trailers.push(trailer);
+        self.values.push(value.to_vec());
+    }
+
+    /// Number of rows added so far.
+    pub fn rows(&self) -> usize {
+        self.trailers.len()
+    }
+
+    /// Serializes the block: a header, the three columns, and the trailing padding byte.
+    pub fn finish(&self) -> Vec<u8> {
+        let rows = self.trailers.len();
+        let mut buf = Vec::new();
+        // Header: version, column count, row count.
+        buf.push(DATA_BLOCK_VERSION);
+        buf.extend_from_slice(&(DATA_BLOCK_COLUMNS as u16).to_le_bytes());
+        buf.extend_from_slice(&(rows as u32).to_le_bytes());
+        // Reserve space for the column headers; fill the offsets in as columns are written.
+        let headers_at = buf.len();
+        buf.resize(headers_at + DATA_BLOCK_COLUMNS * COLUMN_HEADER_LEN, 0);
+
+        let key_refs: Vec<&[u8]> = self.user_keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<&[u8]> = self.values.iter().map(|v| v.as_slice()).collect();
+
+        let key_off = buf.len();
+        encode_raw_bytes(&key_refs, key_off, &mut buf);
+        let trailer_off = buf.len();
+        encode_uint_column(&self.trailers, trailer_off, &mut buf);
+        let value_off = buf.len();
+        encode_raw_bytes(&val_refs, value_off, &mut buf);
+
+        // Trailing padding byte (lets a column end be represented by a one-past pointer).
+        buf.push(0);
+
+        // Backfill the column headers (type + page offset).
+        for (i, (ty, off)) in [
+            (DataType::Bytes, key_off),
+            (DataType::Uint, trailer_off),
+            (DataType::Bytes, value_off),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let h = headers_at + i * COLUMN_HEADER_LEN;
+            buf[h] = match ty {
+                DataType::Bytes => 3,
+                DataType::Uint => 2,
+                _ => unreachable!(),
+            };
+            buf[h + 1..h + 5].copy_from_slice(&(*off as u32).to_le_bytes());
+        }
+        buf
+    }
+}
+
+/// A decoded data-block row: `(user_key, internal-key trailer, value)`.
+pub type DataBlockRow = (Vec<u8>, u64, Vec<u8>);
+
+/// A reader over a columnar data block produced by [`DataBlockBuilder`], reconstructing the
+/// `(user_key, trailer, value)` rows.
+pub struct DataBlockReader<'a> {
+    block: &'a [u8],
+    header: BlockHeader,
+}
+
+impl<'a> DataBlockReader<'a> {
+    /// Parses the block header.
+    pub fn new(block: &'a [u8]) -> Result<DataBlockReader<'a>> {
+        let header = BlockHeader::parse(block)?;
+        if header.columns.len() != DATA_BLOCK_COLUMNS {
+            return Err(Error::corruption(
+                "colblk: unexpected data-block column count",
+            ));
+        }
+        Ok(DataBlockReader { block, header })
+    }
+
+    /// The number of rows in the block.
+    pub fn rows(&self) -> usize {
+        self.header.rows as usize
+    }
+
+    /// Decodes all rows as `(user_key, trailer, value)`.
+    pub fn decode_all(&self) -> Result<Vec<DataBlockRow>> {
+        let rows = self.rows();
+        let key_off = self.header.columns[COL_USER_KEY].page_offset as usize;
+        let trailer_off = self.header.columns[COL_TRAILER].page_offset as usize;
+        let value_off = self.header.columns[COL_VALUE].page_offset as usize;
+
+        let (keys, _) = decode_raw_bytes(self.block, key_off, rows)?;
+        let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
+        let (values, _) = decode_raw_bytes(self.block, value_off, rows)?;
+
+        Ok((0..rows)
+            .map(|i| (keys[i].to_vec(), trailers[i], values[i].to_vec()))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod data_block_tests {
+    use super::*;
+
+    #[test]
+    fn data_block_roundtrips() {
+        let mut b = DataBlockBuilder::new();
+        let rows = [
+            (&b"apple"[..], 0x0102u64, &b"red"[..]),
+            (b"banana", 0x0203, b""),
+            (b"cherry", 0xdead_beef, b"a longer value here"),
+        ];
+        for (k, t, v) in rows {
+            b.add(k, t, v);
+        }
+        let block = b.finish();
+        let r = DataBlockReader::new(&block).unwrap();
+        assert_eq!(r.rows(), 3);
+        let got = r.decode_all().unwrap();
+        for (i, (k, t, v)) in rows.iter().enumerate() {
+            assert_eq!(got[i].0, *k);
+            assert_eq!(got[i].1, *t);
+            assert_eq!(got[i].2, *v);
+        }
+    }
+
+    #[test]
+    fn empty_data_block_roundtrips() {
+        let block = DataBlockBuilder::new().finish();
+        let r = DataBlockReader::new(&block).unwrap();
+        assert_eq!(r.rows(), 0);
+        assert!(r.decode_all().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    #[test]
+    fn uint_column_roundtrips_all_widths() {
+        for values in [
+            vec![],
+            vec![0u64; 5],           // all zero -> width 0
+            vec![7u64; 4],           // all equal -> const (delta width 0)
+            vec![1, 2, 3, 250],      // 1 byte
+            vec![1, 2, 65000],       // 2 bytes
+            vec![1, 100, 5_000_000], // 4 bytes
+            vec![1, u64::MAX],       // 8 bytes
+            vec![1000, 1001, 1002],  // delta from a base
+        ] {
+            let mut buf = Vec::new();
+            let end = encode_uint_column(&values, 0, &mut buf);
+            assert_eq!(end, buf.len());
+            let (got, off) = decode_uint_column(&buf, 0, values.len()).unwrap();
+            assert_eq!(got, values, "roundtrip {values:?}");
+            assert_eq!(off, end);
+        }
+    }
+
+    #[test]
+    fn raw_bytes_column_roundtrips() {
+        let slices: Vec<&[u8]> = vec![b"apple", b"", b"banana", b"c"];
+        let mut buf = Vec::new();
+        let end = encode_raw_bytes(&slices, 0, &mut buf);
+        let (got, off) = decode_raw_bytes(&buf, 0, slices.len()).unwrap();
+        assert_eq!(got, slices);
+        assert_eq!(off, end);
+    }
+
+    #[test]
+    fn bitmap_column_roundtrips() {
+        for bits in [
+            vec![false; 10],
+            vec![true, false, true, true, false],
+            (0..200).map(|i| i % 3 == 0).collect::<Vec<_>>(),
+        ] {
+            let mut buf = Vec::new();
+            let end = encode_bitmap(&bits, 0, &mut buf);
+            let (got, off) = decode_bitmap(&buf, 0, bits.len()).unwrap();
+            assert_eq!(got, bits);
+            assert_eq!(off, end);
+        }
     }
 }
 
