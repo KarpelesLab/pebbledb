@@ -25,8 +25,10 @@
 //! the columnar format (Pebblev5+), and xxHash checksums are not yet supported.
 
 pub mod block;
+pub mod properties;
 pub mod writer;
 
+pub use properties::Properties;
 pub use writer::{Writer, WriterOptions};
 
 use std::sync::Arc;
@@ -85,7 +87,6 @@ struct Footer {
     format: TableFormat,
     checksum: ChecksumType,
     index: BlockHandle,
-    #[allow(dead_code)]
     metaindex: BlockHandle,
 }
 
@@ -154,6 +155,34 @@ fn parse_footer(file: &[u8]) -> Result<Footer> {
     Err(Error::corruption("sstable: bad magic number"))
 }
 
+/// Reads the metaindex, locates the properties block, and decodes it. Returns the
+/// default (empty) properties if the table has no properties block.
+fn read_properties(file: &[u8], footer: &Footer) -> Result<Properties> {
+    let metaindex = read_block(file, footer.metaindex, footer.checksum)?;
+    let mut it = BlockIter::new(metaindex)?;
+    it.first();
+    let mut props_handle = None;
+    while it.valid() {
+        if it.key() == properties::META_PROPERTIES_NAME.as_bytes() {
+            props_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+            break;
+        }
+        it.next();
+    }
+
+    let mut props = Properties::default();
+    if let Some(handle) = props_handle {
+        let block = read_block(file, handle, footer.checksum)?;
+        let mut pit = BlockIter::new(block)?;
+        pit.first();
+        while pit.valid() {
+            props.decode_entry(pit.key(), pit.value());
+            pit.next();
+        }
+    }
+    Ok(props)
+}
+
 /// A reader over an in-memory sstable.
 pub struct Reader {
     file: Arc<[u8]>,
@@ -161,6 +190,8 @@ pub struct Reader {
     footer: Footer,
     /// The decoded top-level index block, cached at open.
     index: Arc<[u8]>,
+    /// The table's properties, parsed from the metaindex (default if absent).
+    props: Properties,
 }
 
 impl Reader {
@@ -173,13 +204,20 @@ impl Reader {
                 "sstable: value blocks (Pebblev3+) not yet supported",
             ));
         }
+        let props = read_properties(&file, &footer)?;
         let index = read_block(&file, footer.index, footer.checksum)?;
         Ok(Reader {
             file,
             cmp,
             footer,
             index,
+            props,
         })
+    }
+
+    /// The table's properties.
+    pub fn properties(&self) -> &Properties {
+        &self.props
     }
 
     /// The table's format.

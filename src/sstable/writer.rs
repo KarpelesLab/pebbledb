@@ -13,8 +13,9 @@
 //! block and the footer. The output is readable by [`super::Reader`] and, for the
 //! supported formats, by Pebble/RocksDB.
 //!
-//! Scope: row-based data/index blocks, single-level index, CRC32C checksums, in-place
-//! values, no filter or properties blocks yet. The default format is
+//! Scope: row-based data/index blocks, single-level index, CRC32C or xxHash64 checksums,
+//! in-place values, and a properties block; bloom filters and two-level indexes are
+//! added later in this phase. The default format is
 //! [`TableFormat::Pebble(2)`](super::TableFormat::Pebble).
 
 use std::io::Write;
@@ -27,10 +28,20 @@ use crate::crc::{Crc32c, mask};
 use crate::{Error, Result};
 
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
+use super::properties::{BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, Properties};
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
     VERSION_LEN,
 };
+
+/// The RocksDB compression-name string recorded in the properties block.
+fn compression_name(c: CompressionType) -> &'static str {
+    match c {
+        CompressionType::None => "NoCompression",
+        CompressionType::Snappy => "Snappy",
+        CompressionType::Zstd => "ZSTD",
+    }
+}
 
 /// The longest a block handle can be when encoded (two 10-byte varints).
 const BLOCK_HANDLE_MAX_LEN: usize = 20;
@@ -154,6 +165,12 @@ pub struct Writer<W: Write> {
     /// The last internal key added, used to enforce ordering and as a block separator.
     last_key: Vec<u8>,
     num_entries: u64,
+    num_deletions: u64,
+    num_range_deletions: u64,
+    raw_key_size: u64,
+    raw_value_size: u64,
+    data_size: u64,
+    num_data_blocks: u64,
     finished: bool,
 }
 
@@ -170,6 +187,12 @@ impl<W: Write> Writer<W> {
             index_block: BlockBuilder::new(ri),
             last_key: Vec::new(),
             num_entries: 0,
+            num_deletions: 0,
+            num_range_deletions: 0,
+            raw_key_size: 0,
+            raw_value_size: 0,
+            data_size: 0,
+            num_data_blocks: 0,
             finished: false,
         }
     }
@@ -189,6 +212,22 @@ impl<W: Write> Writer<W> {
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
         self.num_entries += 1;
+        self.raw_key_size += internal_key.len() as u64;
+        self.raw_value_size += value.len() as u64;
+        let kind = crate::base::internal_key::trailer_kind(
+            crate::base::internal_key::encoded_trailer(internal_key),
+        );
+        use crate::base::internal_key::InternalKeyKind;
+        if matches!(
+            kind,
+            InternalKeyKind::Delete | InternalKeyKind::SingleDelete | InternalKeyKind::DeleteSized
+        ) {
+            self.num_deletions += 1;
+        }
+        if kind == InternalKeyKind::RangeDelete {
+            self.num_range_deletions += 1;
+            self.num_deletions += 1;
+        }
 
         if self.data_block.size_estimate() >= self.opts.block_size {
             self.flush_data_block()?;
@@ -208,6 +247,8 @@ impl<W: Write> Writer<W> {
             write_block(&mut self.w, &mut self.offset, raw, &self.opts)?
         };
         self.data_block.reset();
+        self.data_size += handle.length;
+        self.num_data_blocks += 1;
 
         let mut handle_enc = Vec::with_capacity(BLOCK_HANDLE_MAX_LEN);
         handle.encode_to(&mut handle_enc);
@@ -217,24 +258,51 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Finishes the table: flushes the final data block, writes the index and metaindex
-    /// blocks and the footer, and returns the inner writer.
+    /// Finishes the table: flushes the final data block, then writes the index block, the
+    /// properties block, the metaindex block, and the footer (the canonical Pebble /
+    /// RocksDB order), and returns the inner writer.
     pub fn finish(mut self) -> Result<W> {
         self.flush_data_block()?;
 
-        // Metaindex block (currently empty: no filter/properties blocks yet).
-        let mut metaindex = BlockBuilder::new(self.opts.block_restart_interval);
-        let metaindex_handle = write_block(
-            &mut self.w,
-            &mut self.offset,
-            metaindex.finish(),
-            &self.opts,
-        )?;
-
-        // Index block.
+        // Index block (single-level).
         let index_handle = {
             let raw = self.index_block.finish();
             write_block(&mut self.w, &mut self.offset, raw, &self.opts)?
+        };
+
+        // Properties block, referenced from the metaindex.
+        let props = Properties {
+            num_entries: self.num_entries,
+            raw_key_size: self.raw_key_size,
+            raw_value_size: self.raw_value_size,
+            num_deletions: self.num_deletions,
+            num_range_deletions: self.num_range_deletions,
+            num_data_blocks: self.num_data_blocks,
+            data_size: self.data_size,
+            index_size: index_handle.length,
+            index_type: BINARY_SEARCH_INDEX,
+            comparer_name: self.cmp.name().to_string(),
+            merger_name: "nullptr".to_string(),
+            property_collectors: "[]".to_string(),
+            compression_name: compression_name(self.opts.compression).to_string(),
+            ..Default::default()
+        };
+        let props_handle = {
+            // Meta blocks use a restart interval of 1 (no prefix compression).
+            let mut pb = BlockBuilder::new(1);
+            for (name, value) in props.encode() {
+                pb.add(name.as_bytes(), &value);
+            }
+            write_block(&mut self.w, &mut self.offset, pb.finish(), &self.opts)?
+        };
+
+        // Metaindex block: meta-block name -> handle, sorted by name.
+        let metaindex_handle = {
+            let mut mi = BlockBuilder::new(1);
+            let mut handle_enc = Vec::new();
+            props_handle.encode_to(&mut handle_enc);
+            mi.add(META_PROPERTIES_NAME.as_bytes(), &handle_enc);
+            write_block(&mut self.w, &mut self.offset, mi.finish(), &self.opts)?
         };
 
         let footer = encode_footer(
@@ -502,6 +570,32 @@ mod tests {
                 Some((InternalKeyKind::Set, format!("v{i}").into_bytes()))
             );
         }
+    }
+
+    #[test]
+    fn properties_block_roundtrips() {
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (ikey(b"a", 5, InternalKeyKind::Set), b"v1".to_vec()),
+            (ikey(b"b", 6, InternalKeyKind::Delete), Vec::new()),
+            (ikey(b"c", 7, InternalKeyKind::Set), b"v3".to_vec()),
+        ];
+        let opts = WriterOptions {
+            block_size: 1 << 20, // single data block
+            compression: CompressionType::Snappy,
+            ..Default::default()
+        };
+        let file = build(&entries, opts);
+        let reader = Reader::open(file, cmp).unwrap();
+        let p = reader.properties();
+        assert_eq!(p.num_entries, 3);
+        assert_eq!(p.num_deletions, 1);
+        assert_eq!(p.num_data_blocks, 1);
+        assert_eq!(p.comparer_name, "leveldb.BytewiseComparator");
+        assert_eq!(p.merger_name, "nullptr");
+        assert_eq!(p.compression_name, "Snappy");
+        assert!(p.index_size > 0);
+        assert!(p.raw_value_size >= 4); // "v1" + "v3"
     }
 
     #[test]
