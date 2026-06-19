@@ -74,7 +74,7 @@ refined as they are reached.
   prefix/suffix, range-key bounds, blob references).
 - [ ] **Phase 18 — Merge operator.** A pluggable `Merger` and full MERGE resolution in
   `Get`, iteration, and compaction.
-- [ ] **Phase 19 — Snapshots & sequence semantics.** Registered snapshots that hold back
+- [x] **Phase 19 — Snapshots & sequence semantics.** Registered snapshots that hold back
   compaction (retain versions an open snapshot needs), correct SINGLEDEL semantics, and
   eventually-file-only snapshots.
 - [ ] **Phase 20 — Iterator surface.** Reverse iteration (`Prev`/`Last`/`SeekLT`) through

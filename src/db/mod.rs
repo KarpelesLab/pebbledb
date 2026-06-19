@@ -91,6 +91,9 @@ pub struct Db {
     wal_sync: bool,
     state: Mutex<State>,
     cache: Mutex<HashMap<u64, Arc<Reader>>>,
+    /// Sequence numbers of currently-open snapshots. Compaction retains the versions
+    /// they need.
+    snapshots: Mutex<Vec<SeqNum>>,
 }
 
 impl Db {
@@ -150,6 +153,7 @@ impl Db {
                 wal_sync: opts.wal_sync,
                 state: Mutex::new(state),
                 cache: Mutex::new(HashMap::new()),
+                snapshots: Mutex::new(Vec::new()),
             });
         }
 
@@ -188,6 +192,7 @@ impl Db {
             wal_sync: opts.wal_sync,
             state: Mutex::new(state),
             cache: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(Vec::new()),
         })
     }
 
@@ -523,12 +528,20 @@ impl Db {
     }
 
     /// Captures a read snapshot at the current sequence number. Reads through the
-    /// returned [`Snapshot`] see a consistent view even as later writes are applied.
+    /// returned [`Snapshot`] see a consistent view even as later writes are applied, and
+    /// compaction retains every version the snapshot can observe until it is dropped.
     pub fn snapshot(&self) -> Snapshot<'_> {
-        Snapshot {
-            db: self,
-            seqnum: self.last_sequence(),
-        }
+        let seqnum = self.last_sequence();
+        self.snapshots.lock().unwrap().push(seqnum);
+        Snapshot { db: self, seqnum }
+    }
+
+    /// The sorted sequence numbers of currently-open snapshots.
+    fn open_snapshots(&self) -> Vec<SeqNum> {
+        let mut s = self.snapshots.lock().unwrap().clone();
+        s.sort_unstable();
+        s.dedup();
+        s
     }
 }
 
@@ -552,6 +565,15 @@ impl Snapshot<'_> {
     /// Returns a forward iterator over the snapshot's view.
     pub fn iter(&self) -> Result<DbIterator> {
         self.db.iter_at(self.seqnum)
+    }
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        let mut snaps = self.db.snapshots.lock().unwrap();
+        if let Some(pos) = snaps.iter().position(|&s| s == self.seqnum) {
+            snaps.swap_remove(pos);
+        }
     }
 }
 
@@ -1043,6 +1065,38 @@ mod tests {
             rks[0].kind,
             crate::base::internal_key::InternalKeyKind::RangeKeyDelete
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_snapshot_survives_compaction() {
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        // Establish an initial value, then take a snapshot pinning it.
+        db.set(b"pinned", b"v1").unwrap();
+        let snap = db.snapshot();
+        // Overwrite the key many times and churn enough to force flushes + compaction.
+        db.set(b"pinned", b"v2").unwrap();
+        for i in 0..3000u32 {
+            db.set(format!("k{i:06}").as_bytes(), b"x").unwrap();
+        }
+        db.flush().unwrap();
+
+        // The snapshot still observes the pinned version despite compaction.
+        assert_eq!(snap.get(b"pinned").unwrap(), Some(b"v1".to_vec()));
+        // The live database sees the latest.
+        assert_eq!(db.get(b"pinned").unwrap(), Some(b"v2".to_vec()));
+
+        // After the snapshot is dropped, the old version may be collapsed; the latest
+        // remains correct regardless.
+        drop(snap);
+        db.set(b"trigger", b"z").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"pinned").unwrap(), Some(b"v2".to_vec()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

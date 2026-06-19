@@ -15,9 +15,9 @@
 //! are then removed and the change recorded in the MANIFEST.
 //!
 //! Scope: an L0-by-file-count trigger plus an L1+ size trigger, single-key-range output
-//! splitting by target file size. Because open snapshots are not tracked, compaction
-//! keeps only the newest version of each key; reads at old explicit snapshots may
-//! therefore observe collapsed history.
+//! splitting by target file size. Compaction keeps the newest version of each key within
+//! every open-snapshot stripe, so versions an open snapshot can observe are retained;
+//! tombstones are elided only at the bottom level and only above all snapshots.
 
 use std::fs::File;
 use std::sync::Arc;
@@ -136,9 +136,15 @@ impl Db {
                 .then(b.kind.as_u8().cmp(&a.kind.as_u8()))
         });
 
+        // Open snapshots define stripe boundaries: within each stripe (the versions
+        // between two consecutive snapshot sequence numbers) only the newest version is
+        // kept, so every snapshot can still observe the version it needs.
+        let snapshots = self.open_snapshots();
+
         let mut outputs: Vec<FileMetadata> = Vec::new();
         let mut builder: Option<OutputBuilder> = None;
         let mut prev_user: Option<Vec<u8>> = None;
+        let mut prev_stripe = usize::MAX;
 
         while merge.valid() {
             let ikey = merge.key().to_vec();
@@ -146,16 +152,21 @@ impl Db {
             merge.advance()?;
 
             let ukey = encoded_user_key(&ikey);
-            let is_new = prev_user
+            let seq = encoded_trailer(&ikey) >> 8;
+            let stripe = snapshot_stripe(&snapshots, seq);
+            let same_user = prev_user
                 .as_deref()
-                .is_none_or(|p| self.cmp.compare(p, ukey) != std::cmp::Ordering::Equal);
-            if !is_new {
-                continue; // an older, shadowed version of the same user key
+                .is_some_and(|p| self.cmp.compare(p, ukey) == std::cmp::Ordering::Equal);
+            if same_user && stripe == prev_stripe {
+                continue; // a shadowed version within the same snapshot stripe
             }
             prev_user = Some(ukey.to_vec());
+            prev_stripe = stripe;
 
             let kind = trailer_kind(encoded_trailer(&ikey));
-            if drop_tombstones && is_tombstone(kind) {
+            // Tombstones may be elided only at the bottom level and only in the top
+            // stripe (no open snapshot can observe them).
+            if drop_tombstones && is_tombstone(kind) && stripe == 0 {
                 continue;
             }
 
@@ -348,6 +359,14 @@ impl OutputBuilder {
             largest_seqnum: self.largest_seq,
         })
     }
+}
+
+/// Returns the snapshot stripe a version with sequence number `seq` belongs to: the
+/// number of open snapshots whose sequence number is `>= seq`. Versions in the same
+/// stripe (no snapshot boundary between them) are interchangeable, so only the newest is
+/// kept. Stripe `0` is the top stripe, above every snapshot.
+fn snapshot_stripe(snapshots: &[u64], seq: u64) -> usize {
+    snapshots.iter().filter(|&&s| s >= seq).count()
 }
 
 fn is_tombstone(kind: InternalKeyKind) -> bool {
