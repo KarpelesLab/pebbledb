@@ -25,6 +25,9 @@
 //! the columnar format (Pebblev5+), and xxHash checksums are not yet supported.
 
 pub mod block;
+pub mod writer;
+
+pub use writer::{Writer, WriterOptions};
 
 use std::sync::Arc;
 

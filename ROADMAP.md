@@ -27,7 +27,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   restart arrays, block trailer (compression byte + checksum: CRC32C and xxhash64),
   decompression via `compcol`, bloom filters, properties, range-del / range-key blocks,
   and a table iterator. Read real Pebble sstables.
-- [ ] **Phase 6 — sstable write.** Block builder (restart interval), filter builder,
+- [x] **Phase 6 — sstable write.** Block builder (restart interval), filter builder,
   properties, and a writer producing output that Go Pebble can read.
 - [ ] **Phase 7 — Manifest / Version.** `VersionEdit` tag stream, `FileMetadata`,
   `Version` (L0..L6) and `VersionSet`, MANIFEST as a record log, marker / CURRENT files,
