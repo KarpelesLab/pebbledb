@@ -9,10 +9,12 @@ markers) behind an **idiomatic Rust API** with Pebble semantics.
 
 ## Status
 
-All planned phases (the core engine and full-parity work, originally Phases 0–30) are
-**implemented, tested, and on `master`**. Quality gates run clean on every commit:
-`cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, `cargo test`,
-`cargo doc` (warnings denied), and `cargo +1.88 check` (MSRV).
+The original 30-phase build-out — a complete, working engine with broad Pebble parity — is
+**implemented, tested, and on `master`**. The "Remaining for 100% Pebble parity" section
+below enumerates the subsystems and breadth still needed to fully match upstream. Quality
+gates run clean on every commit: `cargo fmt --check`, `cargo clippy --all-targets
+--all-features -D warnings`, `cargo test`, `cargo doc` (warnings denied), and
+`cargo +1.88 check` (MSRV).
 
 Implemented, by area:
 
@@ -41,30 +43,110 @@ Implemented, by area:
 - **Tooling & testing** — `pebbledb` inspection CLI; a seeded metamorphic model test;
   bidirectional Go interop CI; a Miri job over the `unsafe` arena.
 
-## Remaining work (follow-ups)
+## Remaining for 100% Pebble parity
 
-These are refinements and breadth items beyond the implemented baseline; none block normal
-use.
+The baseline above is a complete, working engine. Reaching full parity with upstream
+Pebble means adding the subsystems and breadth below. This list is scoped to **Pebble
+itself**; see "CockroachDB boundary" for where we stop. Each group is a committed goal, not
+an exclusion.
 
-- **Columnar interop with Pebble's key schemas.** The columnar block formats and codecs
-  are implemented and self-round-trip, but reading/writing a *Pebble-written* columnar
-  table is gated on its pluggable `colblk.KeySchema`. See the interop follow-ups below.
-- **Compaction heuristics.** Read/write-amplification scoring, elision-only and
-  tombstone-density compactions, explicit L0 sublevels, deletion pacing.
-- **Commit pipeline.** True group-commit batching of multiple committers; multiple
-  concurrent background compaction threads.
-- **MANIFEST breadth.** Full *virtual-table* support (not just decode), `BulkVersionEdit`
-  accumulation, and excise / standalone blob-file / column-family records (currently
-  rejected rather than supported).
-- **Options breadth.** Per-level option blocks, a comparer/merger name→impl registry, and
-  on-disk format *migrations* beyond the version bump.
-- **Ingestion breadth.** Excise, flushable ingests, disk-usage estimation.
-- **WAL throughput.** Inode/space recycling of WAL files, batched sync queue.
-- **Iterator extras.** Bloom-skip during `seek_prefix_ge`; point/range/both key-type
-  selection.
-- **Tooling.** Additional `pebble` CLI subcommands (`bench`, `find`, space-amp analysis).
-- **Testing.** Port Pebble's data-driven test corpus; add a libFuzzer target (the seeded
-  model test provides randomized coverage in the meantime).
+### Batches & the write API
+- **Indexed batches** (`NewIndexedBatch`): read-your-own-writes, a batch iterator merged
+  into `DbIterator`, batch reuse/reset, and large batches handled as flushables.
+- Remaining write-API surface: `apply` options, `DeleteSized` write path, empty-value and
+  multi-op ergonomics parity.
+
+### Iterators
+- **Full `IterOptions`**: key-type selection (point / range / both), **range-key masking**,
+  table filters, **block-property filters**, `OnlyReadGuaranteedDurable`.
+- `SetBounds`, `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
+- **External iterators** (`NewExternalIter`: iterate sstables without ingesting) and
+  **`ScanInternal`** (raw internal-key scan used by replication / disaggregated storage).
+- Bloom-skip during `seek_prefix_ge`.
+
+### Block properties
+- The **block-property collector / filter mechanism** (Pebble): per-block and per-table
+  property accumulation, storage in the (row and columnar) index/properties, and
+  filter-driven block/table skipping during iteration and compaction. (The concrete
+  MVCC-time collector is CockroachDB's; we implement the mechanism + any Pebble built-ins.)
+
+### Compaction
+- **Compaction scheduler**: multiple concurrent background compactions, prioritization.
+- **Read-triggered compactions** (`read_compaction_queue`), **delete-only compactions**,
+  **elision-only** and **tombstone-density** compactions, **move** compactions,
+  **multilevel** compaction, and flush splitting.
+- **Table stats**: background collection (tombstone/range-key counts, point-deletion bytes)
+  feeding the above heuristics.
+- Read/write-amplification scoring, explicit **L0 sublevels**, and **deletion pacing**.
+
+### Commit pipeline
+- True **group commit** (batch many committers through one WAL sync + memtable apply).
+
+### Snapshots
+- **EventuallyFileOnlySnapshot** (EFOS) and the consistent `read_state` snapshotting model.
+
+### Value separation & blob files
+- **Value separation** at flush/compaction time (write large values to blob files),
+  **blob-file rewrite** during compaction, **ingest-with-blobs**, and blob-file references
+  carried through the MANIFEST. (Basic blob-file read + ingestion exist.)
+
+### Ingestion & maintenance
+- **Excise** + **virtual sstables**, **`IngestAndExcise`**, **external-file ingestion**,
+  **download** (rewrite remote/external files to local), flushable ingests, and
+  **`EstimateDiskUsage`**.
+- Checkpoint options (flush-WAL, restrict to spans). (Basic checkpoint exists.)
+
+### Remote / disaggregated storage
+- The **`objstorage` provider** abstraction (local provider + the `remote.Storage`
+  interface, shared/external sstables, the shared-object cache). Concrete cloud backends
+  (S3/GCS/Azure) are application-provided; we implement the Pebble interface and a
+  local/in-memory backend.
+
+### WAL
+- The full `pebble/wal` failover **manager** (have: multi-directory write-failover +
+  recovery), the **sync queue**, and WAL **recycling**.
+
+### vfs
+- **Disk-health-checking FS** (emit `DiskSlow`), syncing-FS guarantees, and the remaining
+  vfs surface. (Have: `DiskFs`, `MemFs`, directory locking + sync.)
+
+### Options, format & migrations
+- Full **`Options`** surface incl. per-level options; a **comparer/merger name→impl
+  registry**; **format-major-version migrations** (the on-disk upgrade step for each FMV,
+  not just the recorded version); complete `OPTIONS` round-trip.
+
+### Observability & file management
+- Full **`EventListener`** event set (compaction/flush begin-end, manifest/table/WAL
+  create-delete, table stats/validated, **write-stall** begin-end, disk-slow,
+  background-error).
+- Complete **`Metrics`**, a **`Logger`** hook, and **LSM view** debugging.
+- **Obsolete-file deletion** + the **`Cleaner`** interface (delete vs archive).
+- **Write stalls** (memtable/L0 stall thresholds and pacing).
+
+### Columnar (key schema)
+- Wire `colblk.DefaultKeySchema` (the schema a general Pebble KV store uses) into the
+  columnar writer/reader so v5+ tables round-trip against Pebble. See interop steps below.
+- Consistency checking (`level_checker`) over columnar tables.
+
+### Tooling & testing
+- Full `pebble` **CLI** (`db`, `sstable`, `manifest`, `wal`, `bench`, `find`, `lsm`).
+- Port Pebble's **data-driven test corpus** and a **metamorphic** harness; add a
+  **libFuzzer** target. (A seeded model test provides randomized coverage today.)
+
+## CockroachDB boundary
+
+Some code in the Pebble repository is CockroachDB-specific. For these we implement **only
+the Pebble-side mechanism / hook**, not the CockroachDB policy:
+
+- **`cockroachkvs`** (MVCC key/timestamp schema) → we implement the pluggable
+  `colblk.KeySchema` mechanism and `DefaultKeySchema`; not the Cockroach schema itself.
+- **MVCC block-property collector** → we implement the block-property collector/filter
+  mechanism; not the MVCC-time collector.
+- **Cockroach's comparer / split** → we implement the `Comparer` trait (with `Split`) and
+  the bytewise default; not Cockroach's `EngineComparer`.
+- **Cloud remote backends** (S3/GCS/Azure `remote.Storage`) → we implement the `objstorage`
+  / `remote.Storage` *interface* and a local backend; concrete cloud providers are
+  application code.
 
 ## Interop testing (CI)
 
