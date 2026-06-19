@@ -989,6 +989,40 @@ impl DbInner {
         std::array::from_fn(|i| state.vs.current.levels[i].len())
     }
 
+    /// Estimates the number of bytes of sstable storage occupied by keys in the user-key
+    /// range `[start, end)`. A file fully contained in the range contributes its whole
+    /// size; a file that only partially overlaps contributes a size proportional to the
+    /// fraction of its key range that intersects `[start, end)` (a coarse estimate, since
+    /// it does not read the file's index). Mirrors Pebble's `EstimateDiskUsage`.
+    pub fn estimate_disk_usage(&self, start: &[u8], end: &[u8]) -> u64 {
+        let state = self.state.lock().unwrap();
+        let cmp = self.cmp.as_ref();
+        let mut total = 0u64;
+        for level in state.vs.current.levels.iter() {
+            for f in level {
+                let fs = encoded_user_key(&f.smallest);
+                let fl = encoded_user_key(&f.largest);
+                // No overlap: file entirely before start or at/after end.
+                if cmp.compare(fl, start) == std::cmp::Ordering::Less
+                    || cmp.compare(fs, end) != std::cmp::Ordering::Less
+                {
+                    continue;
+                }
+                // Fully contained: [fs, fl] within [start, end).
+                if cmp.compare(fs, start) != std::cmp::Ordering::Less
+                    && cmp.compare(fl, end) == std::cmp::Ordering::Less
+                {
+                    total += f.size;
+                } else {
+                    // Partial overlap: estimate proportionally by the byte-prefix overlap
+                    // of the key ranges (coarse; avoids reading the file index).
+                    total += estimate_partial_overlap(fs, fl, start, end, f.size);
+                }
+            }
+        }
+        total
+    }
+
     /// Returns a point-in-time [`Metrics`] snapshot of the LSM tree.
     pub fn metrics(&self) -> Metrics {
         let state = self.state.lock().unwrap();
@@ -1077,6 +1111,30 @@ pub struct Metrics {
     pub block_cache_hits: u64,
     /// Number of block-cache misses so far (0 if caching is disabled).
     pub block_cache_misses: u64,
+}
+
+/// Maps a key to a fraction in `[0, 1]` using its leading bytes as a big-endian fixed
+/// point, for coarse range-overlap estimation.
+fn key_fraction(k: &[u8]) -> f64 {
+    let mut v = 0.0f64;
+    let mut scale = 1.0f64 / 256.0;
+    for &b in k.iter().take(8) {
+        v += b as f64 * scale;
+        scale /= 256.0;
+    }
+    v
+}
+
+/// Estimates the bytes of a file whose key range `[fs, fl]` only partially overlaps the
+/// query range `[start, end)`, proportional to the overlapping fraction of its key span.
+fn estimate_partial_overlap(fs: &[u8], fl: &[u8], start: &[u8], end: &[u8], size: u64) -> u64 {
+    let f0 = key_fraction(fs);
+    let f1 = key_fraction(fl);
+    let span = (f1 - f0).max(f64::MIN_POSITIVE);
+    let lo = f0.max(key_fraction(start));
+    let hi = f1.min(key_fraction(end));
+    let overlap = (hi - lo).clamp(0.0, span);
+    (size as f64 * (overlap / span)).round() as u64
 }
 
 /// The filename of the WAL with the given number.

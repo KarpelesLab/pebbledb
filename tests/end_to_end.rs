@@ -723,6 +723,34 @@ fn wal_failover_to_secondary_directory() {
 }
 
 #[test]
+fn estimate_disk_usage_tracks_range() {
+    let dir = temp_dir("disk-usage");
+    let opts = Options {
+        mem_table_size: 16 * 1024, // several sstables across the key space
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..3000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]).unwrap();
+    }
+    db.flush().unwrap();
+
+    let full = db.estimate_disk_usage(b"k00000", b"k99999");
+    assert!(full > 0, "full-range usage should be positive");
+
+    // A sub-range estimates less than the whole, and an empty range is ~0.
+    let part = db.estimate_disk_usage(b"k00000", b"k01000");
+    assert!(
+        part <= full,
+        "sub-range {part} should not exceed full {full}"
+    );
+    let none = db.estimate_disk_usage(b"zzzz0", b"zzzz9");
+    assert_eq!(none, 0, "disjoint range should estimate zero");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
