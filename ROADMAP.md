@@ -32,7 +32,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
 - [x] **Phase 7 — Manifest / Version.** `VersionEdit` tag stream, `FileMetadata`,
   `Version` (L0..L6) and `VersionSet`, MANIFEST as a record log, marker / CURRENT files,
   OPTIONS file, and the file lock. Open an existing DB's manifest.
-- [ ] **Phase 8 — DB read path.** Open an existing Pebble DB read-only; merging iterator
+- [x] **Phase 8 — DB read path.** Open an existing Pebble DB read-only; merging iterator
   across memtables and levels with range-tombstone / range-key handling; `Get`;
   snapshots. Interop: read a Go-written DB.
 - [ ] **Phase 9 — DB write path.** WAL append with group commit, memtable rotation,

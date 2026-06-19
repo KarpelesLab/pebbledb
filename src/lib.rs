@@ -26,6 +26,7 @@
 pub mod base;
 pub mod batch;
 pub mod crc;
+pub mod db;
 mod error;
 pub mod manifest;
 pub mod memtable;

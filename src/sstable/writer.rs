@@ -402,7 +402,7 @@ mod tests {
         };
         let file = build(&entries, opts);
 
-        let reader = Reader::open(file, cmp).unwrap();
+        let reader = Arc::new(Reader::open(file, cmp).unwrap());
         assert_eq!(reader.format(), format);
 
         // Point lookups for every key.

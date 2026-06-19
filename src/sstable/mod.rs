@@ -237,11 +237,14 @@ impl Reader {
     }
 
     /// Returns an iterator over every entry in the table, in internal-key order.
-    pub fn iter(&self) -> Result<TableIter<'_>> {
+    ///
+    /// The iterator holds a shared reference to the reader, so it can outlive the
+    /// borrow and be stored (e.g. in a merging iterator).
+    pub fn iter(self: &Arc<Reader>) -> Result<TableIter> {
         let mut index = self.index_iter()?;
         index.first();
         Ok(TableIter {
-            reader: self,
+            reader: Arc::clone(self),
             index,
             data: None,
         })
@@ -250,13 +253,13 @@ impl Reader {
 
 /// A forward iterator over all entries of an sstable, walking the index block and each
 /// data block it points to in turn.
-pub struct TableIter<'a> {
-    reader: &'a Reader,
+pub struct TableIter {
+    reader: Arc<Reader>,
     index: BlockIter,
     data: Option<BlockIter>,
 }
 
-impl TableIter<'_> {
+impl TableIter {
     /// Loads the data block for the current index entry, if any.
     fn load_current_data_block(&mut self) -> Result<bool> {
         if !self.index.valid() {
