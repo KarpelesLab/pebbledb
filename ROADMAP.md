@@ -12,7 +12,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
 - [x] **Phase 0 — Scaffold.** Cargo manifest (MSRV 1.88, edition 2024, BSD-3-Clause),
   LICENSE/NOTICE/README, CI (fmt, clippy, docs, MSRV), release-plz, crate skeleton,
   `compcol` wired for compression.
-- [~] **Phase 1 — base layer.** `Comparer` / `DefaultComparer` (bytewise), `InternalKey`
+- [x] **Phase 1 — base layer.** `Comparer` / `DefaultComparer` (bytewise), `InternalKey`
   / `InternalKeyKind` / `SeqNum` and the 8-byte trailer, varint + fixed-LE encoders,
   CRC32C (Castagnoli) with the RocksDB mask.
 - [ ] **Phase 2 — record log (WAL).** Reader/writer over 32 KiB blocks; 7-byte header

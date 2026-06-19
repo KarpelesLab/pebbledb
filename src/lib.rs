@@ -23,6 +23,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod base;
+pub mod crc;
 mod error;
 
 pub use error::{Error, Result};
