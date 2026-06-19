@@ -1,0 +1,60 @@
+name: Interop
+
+# Cross-implementation interop against the upstream Go Pebble: a Go program writes a real
+# Pebble database that the Rust engine must read back, and the Rust engine writes a
+# database that Go Pebble must read back. This proves the on-disk formats (sstable, WAL,
+# MANIFEST, markers, OPTIONS) are binary-compatible in both directions.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: Go Pebble <-> Rust pebbledb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: interop
+
+      - name: Build the Go interop tool
+        working-directory: interop/go
+        run: go build -o ../../target/interop-tool .
+
+      - name: Build the Rust engine and example
+        run: cargo build --example interop_gen
+
+      # Forward: Go writes a Pebble DB, the Rust engine reads it back.
+      - name: Go generates a Pebble database
+        run: ./target/interop-tool generate "$RUNNER_TEMP/from-go"
+
+      - name: Rust reads the Go-written database
+        env:
+          PEBBLEDB_INTEROP_DIR: ${{ runner.temp }}/from-go
+        run: cargo test --test interop -- --nocapture
+
+      # Reverse: the Rust engine writes a DB, Go Pebble reads it back.
+      - name: Rust generates a pebbledb database
+        run: cargo run --example interop_gen -- "$RUNNER_TEMP/from-rust"
+
+      - name: Go reads the Rust-written database
+        run: ./target/interop-tool verify "$RUNNER_TEMP/from-rust"

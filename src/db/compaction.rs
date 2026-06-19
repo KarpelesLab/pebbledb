@@ -256,6 +256,23 @@ impl Db {
             prev_user = Some(ukey.to_vec());
             prev_stripe = stripe;
 
+            // A point key covered by an input range tombstone with a higher sequence
+            // number in the same snapshot stripe is deleted by it: drop the key (and, as a
+            // terminator, the older versions in this stripe). Same-stripe is required so a
+            // snapshot positioned between the key and the tombstone still sees the key.
+            // Without this, eliding the range tombstone at the bottom level would resurface
+            // the very keys it deleted.
+            if !is_tombstone(kind)
+                && tombstones.iter().any(|t| {
+                    t.seqnum > seq
+                        && snapshot_stripe(&snapshots, t.seqnum) == stripe
+                        && t.covers(self.cmp.as_ref(), ukey)
+                })
+            {
+                terminated = true;
+                continue;
+            }
+
             // Tombstones may be elided only at the bottom level and only in the top
             // stripe (no open snapshot can observe them); doing so also shadows older
             // versions in this stripe.

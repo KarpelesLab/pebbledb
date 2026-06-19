@@ -130,12 +130,18 @@ refined as they are reached.
   subcommands, with human-readable internal-key and byte-escaping formatting. Integration
   tests drive each subcommand against freshly-built on-disk files. (Further `pebble`
   subcommands — `bench`, `find`, space-amplification analysis — remain a follow-up.)
-- [ ] **Phase 30 — Interop & correctness hardening.** Bidirectional interop verified in
-  **GitHub Actions**: a CI job installs Go and `cockroachdb/pebble`, generates fixtures
-  (sstables, WAL, MANIFEST, full DBs) that pebbledb must read, and verifies Go Pebble can
-  read pebbledb's output — both directions, across table-format versions. Plus ports of
-  Pebble's data-driven tests, metamorphic testing, fuzzing, and Miri over the `unsafe`
-  arena code.
+- [x] **Phase 30 — Interop & correctness hardening.** Bidirectional interop in **GitHub
+  Actions** (`.github/workflows/interop.yml`): a job installs Go + `cockroachdb/pebble`,
+  the Go `interop` tool (`interop/go`) generates a real Pebble DB the Rust engine reads
+  back, and the Rust `interop_gen` example writes a DB Go Pebble reads back. A
+  deterministic, seeded metamorphic/model test (`tests/model.rs`) cross-checks the engine
+  against a `BTreeMap` across set/delete/range-delete/flush/compact/reopen — it already
+  caught and drove fixes for two real bugs (range tombstones not eliding covered point
+  keys during bottom-level compaction; recovery replaying already-flushed WALs and
+  stranding recovered data). A Miri CI job runs the `unsafe` arena/skiplist tests under
+  UB-checking. (Direct ports of Pebble's data-driven test corpus and a libFuzzer target
+  remain a follow-up; the seeded model test provides randomized coverage in the
+  meantime.)
 
 ## Interop testing (CI)
 

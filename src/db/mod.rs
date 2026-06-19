@@ -169,7 +169,7 @@ impl Db {
         names.sort();
 
         let cmp = opts.comparer.clone();
-        let mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
+        let mut mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
 
         // Resolve the format major version: an existing OPTIONS file's value (validated
         // against the configured comparer), or the option for a fresh store.
@@ -254,6 +254,25 @@ impl Db {
             &filenames::manifest(manifest_num),
         )?;
         fs.sync_dir(&dir)?;
+
+        // If recovery loaded data from un-flushed WALs into the memtable, persist it to an
+        // L0 sstable now. Otherwise advancing `log_number` to this session's WAL would
+        // strand that data: the older WALs holding it become obsolete and are skipped on
+        // the next open.
+        if !mem.is_empty() {
+            let file_num = vs.allocate_file_number();
+            let meta = write_memtable_to_sstable(fs.as_ref(), &dir, &cmp, file_num, &mem)?;
+            let edit = VersionEdit {
+                next_file_number: Some(vs.next_file_number),
+                last_sequence: Some(vs.last_sequence),
+                new_files: vec![NewFileEntry { level: 0, meta }],
+                ..Default::default()
+            };
+            vs.apply(&edit)?;
+            manifest.write_record(&edit.encode())?;
+            manifest.sync_all()?;
+            mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
+        }
 
         let wal = record::Writer::with_log_num(
             fs.create(&dir.join(wal_filename(wal_number)))?,
@@ -860,8 +879,13 @@ fn wal_filename(num: u64) -> String {
     format!("{num:06}.log")
 }
 
-/// Replays every `*.log` file present (in increasing number order) into `mem`, returning
-/// the version set with `last_sequence` advanced past the recovered batches.
+/// Replays the *un-flushed* `*.log` files (those with number `>= vs.log_number`, in
+/// increasing order) into `mem`, returning the version set with `last_sequence` advanced
+/// past the recovered batches.
+///
+/// WALs numbered below the manifest's `log_number` hold data already captured in sstables;
+/// replaying them would inject stale versions into the memtable that, being consulted
+/// first, would wrongly shadow the newer on-disk data.
 fn recover_wals(
     fs: &dyn Fs,
     dir: &Path,
@@ -869,6 +893,7 @@ fn recover_wals(
     mem: &Arc<MemTable>,
     mut vs: VersionSet,
 ) -> Result<VersionSet> {
+    let min_unflushed = vs.log_number;
     let mut logs: Vec<(u64, &String)> = names
         .iter()
         .filter_map(|n| {
@@ -876,6 +901,7 @@ fn recover_wals(
                 .and_then(|s| s.parse().ok())
                 .map(|num| (num, n))
         })
+        .filter(|(num, _)| *num >= min_unflushed)
         .collect();
     logs.sort_by_key(|(num, _)| *num);
 

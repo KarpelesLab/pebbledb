@@ -63,6 +63,28 @@ jobs:
       - name: cargo check --all-features --all-targets
         run: cargo check --all-features --all-targets
 
+  miri:
+    name: Miri (unsafe arena skiplist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Miri checks the `unsafe` arena/skiplist code (raw pointers + atomics in
+      # UnsafeCell) for undefined behavior. It cannot do filesystem I/O, so we
+      # scope it to the in-memory `memtable` tests rather than the whole suite.
+      - name: Install Rust nightly + Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+
+      - name: cargo miri test (memtable)
+        run: cargo miri test --lib memtable
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest
