@@ -32,11 +32,13 @@
 //! ([`encode_uint_column`]/[`decode_uint_column`], variable width + optional delta base),
 //! the raw-bytes column ([`encode_raw_bytes`]/[`decode_raw_bytes`], an offsets table plus
 //! concatenated data), and the bool bitmap ([`encode_bitmap`]/[`decode_bitmap`]) — all
-//! matching Pebble's exact on-disk layouts, and a columnar [`DataBlockBuilder`] /
-//! [`DataBlockReader`] built on them (read + write).
+//! matching Pebble's exact on-disk layouts, and the three columnar block formats built on
+//! them, each read + write: the data block ([`DataBlockBuilder`] / [`DataBlockReader`]),
+//! the index block ([`IndexBlockBuilder`] / [`decode_index_block`]), and the keyspan block
+//! ([`KeyspanBlockBuilder`] / [`decode_keyspan_block`]).
 //!
 //! Still being ported (see `ROADMAP.md`): the [`DataType::PrefixBytes`] bundle
-//! prefix-compression codec, the columnar index and keyspan blocks, and integration into
+//! prefix-compression codec, and integration of these blocks into
 //! [`crate::sstable::Reader`]/`Writer` against Pebble's production key schema — until that
 //! lands the sstable reader reports a clear error for v5+ tables rather than misreading
 //! one written with a different schema.
@@ -523,6 +525,246 @@ impl<'a> DataBlockReader<'a> {
         Ok((0..rows)
             .map(|i| (keys[i].to_vec(), trailers[i], values[i].to_vec()))
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Columnar index block
+//
+// Maps each data block's separator key to its block handle. Columns: separator key (raw
+// bytes), block offset (uint), block length (uint).
+// ---------------------------------------------------------------------------
+
+const INDEX_BLOCK_COLUMNS: usize = 3;
+const IDX_COL_SEPARATOR: usize = 0;
+const IDX_COL_OFFSET: usize = 1;
+const IDX_COL_LENGTH: usize = 2;
+
+/// One index entry: a separator key and the `(offset, length)` of the block it points at.
+pub type IndexEntry = (Vec<u8>, u64, u64);
+
+/// Builds a columnar index block.
+#[derive(Default)]
+pub struct IndexBlockBuilder {
+    separators: Vec<Vec<u8>>,
+    offsets: Vec<u64>,
+    lengths: Vec<u64>,
+}
+
+impl IndexBlockBuilder {
+    /// Creates an empty index-block builder.
+    pub fn new() -> IndexBlockBuilder {
+        IndexBlockBuilder::default()
+    }
+
+    /// Adds an entry mapping `separator` to the block at `(offset, length)`.
+    pub fn add(&mut self, separator: &[u8], offset: u64, length: u64) {
+        self.separators.push(separator.to_vec());
+        self.offsets.push(offset);
+        self.lengths.push(length);
+    }
+
+    /// Serializes the index block.
+    pub fn finish(&self) -> Vec<u8> {
+        let rows = self.offsets.len();
+        let mut buf = Vec::new();
+        buf.push(DATA_BLOCK_VERSION);
+        buf.extend_from_slice(&(INDEX_BLOCK_COLUMNS as u16).to_le_bytes());
+        buf.extend_from_slice(&(rows as u32).to_le_bytes());
+        let headers_at = buf.len();
+        buf.resize(headers_at + INDEX_BLOCK_COLUMNS * COLUMN_HEADER_LEN, 0);
+
+        let sep_refs: Vec<&[u8]> = self.separators.iter().map(|s| s.as_slice()).collect();
+        let sep_off = buf.len();
+        encode_raw_bytes(&sep_refs, sep_off, &mut buf);
+        let off_off = buf.len();
+        encode_uint_column(&self.offsets, off_off, &mut buf);
+        let len_off = buf.len();
+        encode_uint_column(&self.lengths, len_off, &mut buf);
+        buf.push(0); // trailing padding
+
+        for (i, (ty, off)) in [
+            (3u8, sep_off), // Bytes
+            (2u8, off_off), // Uint
+            (2u8, len_off), // Uint
+        ]
+        .iter()
+        .enumerate()
+        {
+            let h = headers_at + i * COLUMN_HEADER_LEN;
+            buf[h] = *ty;
+            buf[h + 1..h + 5].copy_from_slice(&(*off as u32).to_le_bytes());
+        }
+        buf
+    }
+}
+
+/// Reads a columnar index block, returning its entries.
+pub fn decode_index_block(block: &[u8]) -> Result<Vec<IndexEntry>> {
+    let header = BlockHeader::parse(block)?;
+    if header.columns.len() != INDEX_BLOCK_COLUMNS {
+        return Err(Error::corruption(
+            "colblk: unexpected index-block column count",
+        ));
+    }
+    let rows = header.rows as usize;
+    let (seps, _) = decode_raw_bytes(
+        block,
+        header.columns[IDX_COL_SEPARATOR].page_offset as usize,
+        rows,
+    )?;
+    let (offsets, _) = decode_uint_column(
+        block,
+        header.columns[IDX_COL_OFFSET].page_offset as usize,
+        rows,
+    )?;
+    let (lengths, _) = decode_uint_column(
+        block,
+        header.columns[IDX_COL_LENGTH].page_offset as usize,
+        rows,
+    )?;
+    Ok((0..rows)
+        .map(|i| (seps[i].to_vec(), offsets[i], lengths[i]))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Columnar keyspan block
+//
+// Encodes fragmented key spans (range deletions / range keys). Columns: start user key
+// (raw bytes), end user key (raw bytes), trailer (uint), value (raw bytes).
+// ---------------------------------------------------------------------------
+
+const KEYSPAN_BLOCK_COLUMNS: usize = 4;
+
+/// One key span: `(start, end, trailer, value)`.
+pub type KeyspanEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>);
+
+/// Builds a columnar keyspan block.
+#[derive(Default)]
+pub struct KeyspanBlockBuilder {
+    starts: Vec<Vec<u8>>,
+    ends: Vec<Vec<u8>>,
+    trailers: Vec<u64>,
+    values: Vec<Vec<u8>>,
+}
+
+impl KeyspanBlockBuilder {
+    /// Creates an empty keyspan-block builder.
+    pub fn new() -> KeyspanBlockBuilder {
+        KeyspanBlockBuilder::default()
+    }
+
+    /// Adds a fragmented span `[start, end)` with the given trailer and value.
+    pub fn add(&mut self, start: &[u8], end: &[u8], trailer: u64, value: &[u8]) {
+        self.starts.push(start.to_vec());
+        self.ends.push(end.to_vec());
+        self.trailers.push(trailer);
+        self.values.push(value.to_vec());
+    }
+
+    /// Serializes the keyspan block.
+    pub fn finish(&self) -> Vec<u8> {
+        let rows = self.trailers.len();
+        let mut buf = Vec::new();
+        buf.push(DATA_BLOCK_VERSION);
+        buf.extend_from_slice(&(KEYSPAN_BLOCK_COLUMNS as u16).to_le_bytes());
+        buf.extend_from_slice(&(rows as u32).to_le_bytes());
+        let headers_at = buf.len();
+        buf.resize(headers_at + KEYSPAN_BLOCK_COLUMNS * COLUMN_HEADER_LEN, 0);
+
+        let start_refs: Vec<&[u8]> = self.starts.iter().map(|s| s.as_slice()).collect();
+        let end_refs: Vec<&[u8]> = self.ends.iter().map(|s| s.as_slice()).collect();
+        let val_refs: Vec<&[u8]> = self.values.iter().map(|s| s.as_slice()).collect();
+
+        let start_off = buf.len();
+        encode_raw_bytes(&start_refs, start_off, &mut buf);
+        let end_off = buf.len();
+        encode_raw_bytes(&end_refs, end_off, &mut buf);
+        let trailer_off = buf.len();
+        encode_uint_column(&self.trailers, trailer_off, &mut buf);
+        let value_off = buf.len();
+        encode_raw_bytes(&val_refs, value_off, &mut buf);
+        buf.push(0);
+
+        for (i, (ty, off)) in [
+            (3u8, start_off),
+            (3u8, end_off),
+            (2u8, trailer_off),
+            (3u8, value_off),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let h = headers_at + i * COLUMN_HEADER_LEN;
+            buf[h] = *ty;
+            buf[h + 1..h + 5].copy_from_slice(&(*off as u32).to_le_bytes());
+        }
+        buf
+    }
+}
+
+/// Reads a columnar keyspan block, returning its spans.
+pub fn decode_keyspan_block(block: &[u8]) -> Result<Vec<KeyspanEntry>> {
+    let header = BlockHeader::parse(block)?;
+    if header.columns.len() != KEYSPAN_BLOCK_COLUMNS {
+        return Err(Error::corruption(
+            "colblk: unexpected keyspan-block column count",
+        ));
+    }
+    let rows = header.rows as usize;
+    let (starts, _) = decode_raw_bytes(block, header.columns[0].page_offset as usize, rows)?;
+    let (ends, _) = decode_raw_bytes(block, header.columns[1].page_offset as usize, rows)?;
+    let (trailers, _) = decode_uint_column(block, header.columns[2].page_offset as usize, rows)?;
+    let (values, _) = decode_raw_bytes(block, header.columns[3].page_offset as usize, rows)?;
+    Ok((0..rows)
+        .map(|i| {
+            (
+                starts[i].to_vec(),
+                ends[i].to_vec(),
+                trailers[i],
+                values[i].to_vec(),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    #[test]
+    fn index_block_roundtrips() {
+        let mut b = IndexBlockBuilder::new();
+        b.add(b"apple", 0, 4096);
+        b.add(b"mango", 4096, 8192);
+        b.add(b"zebra", 12288, 1000);
+        let block = b.finish();
+        let got = decode_index_block(&block).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (b"apple".to_vec(), 0, 4096),
+                (b"mango".to_vec(), 4096, 8192),
+                (b"zebra".to_vec(), 12288, 1000),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyspan_block_roundtrips() {
+        let mut b = KeyspanBlockBuilder::new();
+        b.add(b"a", b"e", 0xff00, b"");
+        b.add(b"f", b"g", 0x1234, b"payload");
+        let block = b.finish();
+        let got = decode_keyspan_block(&block).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"e".to_vec(), 0xff00, b"".to_vec()),
+                (b"f".to_vec(), b"g".to_vec(), 0x1234, b"payload".to_vec()),
+            ]
+        );
     }
 }
 

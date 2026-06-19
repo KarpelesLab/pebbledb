@@ -65,15 +65,21 @@ refined as they are reached.
 - [x] **Phase 15 — Value blocks & blob files.** Pebblev3 value blocks (write + `Get`
   indirection), Pebblev4 DELSIZED tombstones, and blob files for separated values with
   their MANIFEST blob-file edits and references.
-- [~] **Phase 16 — Columnar blocks (in progress).** Table-format versions v5–v8 and the
-  v6/v7 footer (checksum + attributes) are recognized by the footer parser, and the
-  columnar block header (`sstable::colblk`: version, column count, row count, per-column
-  type + page offset, trailing padding) plus the `DataType` enum are parsed and tested
-  against the documented layout. **Remaining (the bulk of this phase):** the per-column
-  codecs (uint width/delta, prefix-bytes prefix compression, raw bytes, bool bitmaps) and
-  the columnar data / index / keyspan block iterators on top of them — a large subsystem
-  that the interop CI is the right vehicle to validate. Until it lands, the reader returns
-  a clear "columnar format not yet supported" error rather than misreading a v5+ table.
+- [~] **Phase 16 — Columnar blocks (largely implemented).** Table-format versions v5–v8
+  and the v6/v7 footer (checksum + attributes) are recognized by the footer parser. The
+  `sstable::colblk` module implements, matching Pebble's exact byte layouts and all
+  round-trip tested: the columnar block header + `DataType`; the per-column codecs — uint
+  (variable width 0/1/2/4/8 + optional delta base, with `DetermineUintEncoding` width
+  selection and alignment), raw-bytes (offsets table + concatenated data), and bool
+  bitmaps (aligned primary + summary words); and all three columnar block formats **read +
+  write** — data (`DataBlockBuilder`/`DataBlockReader`), index
+  (`IndexBlockBuilder`/`decode_index_block`), and keyspan
+  (`KeyspanBlockBuilder`/`decode_keyspan_block`). **Remaining:** the `PrefixBytes` bundle
+  prefix-compression column codec, and wiring these blocks into the sstable
+  `Reader`/`Writer` against Pebble's production key schema (e.g. `cockroachkvs`) so the
+  engine reads/writes a v5+ table end-to-end — the interop CI is the right validator for
+  that final step. Until it lands, the reader returns a clear "columnar format not yet
+  supported" error rather than misreading a v5+ table written with a different schema.
 - [x] **Phase 17 — MANIFEST completeness.** `NewFile5` (range-key bounds, with the
   point/range bounds marker) is decoded, and the full `NewFile4`/`NewFile5` custom-tag set
   — creation time, no-range-key-sets, virtual backing tables, synthetic prefix/suffix, and
