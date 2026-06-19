@@ -352,10 +352,13 @@ impl DbInner {
             );
         }
 
-        // Remove the obsolete input files from the cache and disk.
+        // Dispose of the obsolete input files (cache + on disk, via the cleaner).
         for (_, file_num) in &edit.deleted_files {
             self.cache.lock().unwrap().remove(file_num);
-            let _ = self.fs.remove(&self.dir.join(filenames::table(*file_num)));
+            self.clean_file(&self.dir.join(filenames::table(*file_num)));
+            if let Some(l) = &self.listener {
+                l.on_table_deleted(*file_num);
+            }
         }
         Ok(())
     }

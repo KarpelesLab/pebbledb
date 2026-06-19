@@ -751,6 +751,54 @@ fn estimate_disk_usage_tracks_range() {
 }
 
 #[test]
+fn logger_receives_messages_and_archive_cleaner_keeps_files() {
+    use pebbledb::{ArchiveCleaner, Logger};
+    use std::sync::Mutex;
+
+    struct VecLogger(Mutex<Vec<String>>);
+    impl Logger for VecLogger {
+        fn info(&self, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+    }
+
+    let dir = temp_dir("logger-archive");
+    let archive = dir.join("archive");
+    let logger = Arc::new(VecLogger(Mutex::new(Vec::new())));
+    let opts = Options {
+        mem_table_size: 16 * 1024,
+        logger: Some(logger.clone()),
+        cleaner: Arc::new(ArchiveCleaner {
+            dir: archive.clone(),
+        }),
+        ..Default::default()
+    };
+    {
+        let db = Db::open(&dir, opts).unwrap();
+        for i in 0..2000u32 {
+            db.set(format!("k{i:05}").as_bytes(), &[b'v'; 32]).unwrap();
+        }
+        db.flush().unwrap();
+        db.compact_range(None, None).unwrap(); // produce obsolete inputs to archive
+    }
+
+    // The logger saw flush messages.
+    let msgs = logger.0.lock().unwrap();
+    assert!(
+        msgs.iter().any(|m| m.contains("flushed memtable")),
+        "expected flush log messages, got {msgs:?}"
+    );
+
+    // The archive cleaner moved obsolete files there instead of deleting them.
+    let archived = std::fs::read_dir(&archive)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert!(archived > 0, "archive dir should hold obsolete files");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

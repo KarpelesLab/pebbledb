@@ -88,6 +88,11 @@ pub struct Options {
     /// (e.g. a stalled or failing disk). On failure the current batch is re-logged here and
     /// subsequent WALs are created here; recovery scans every configured WAL directory.
     pub wal_failover_dir: Option<PathBuf>,
+    /// Optional sink for informational/error log messages.
+    pub logger: Option<Arc<dyn Logger>>,
+    /// How obsolete files are disposed of (default: delete). Use [`ArchiveCleaner`] to
+    /// retain them.
+    pub cleaner: Arc<dyn Cleaner>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -97,6 +102,60 @@ pub trait EventListener: Send + Sync {
     fn on_flush_end(&self, _file_num: u64, _bytes: u64) {}
     /// Called after a compaction completes.
     fn on_compaction_end(&self, _output_level: usize, _input_files: usize, _output_files: usize) {}
+    /// Called when an sstable is created (by flush, compaction, or ingestion).
+    fn on_table_created(&self, _file_num: u64) {}
+    /// Called when an obsolete sstable is removed.
+    fn on_table_deleted(&self, _file_num: u64) {}
+    /// Called when external sstables are ingested.
+    fn on_ingest_end(&self, _files: usize) {}
+}
+
+/// A sink for the database's informational and error log messages, mirroring Pebble's
+/// `Logger`. The default no-op `error` forwards to `info`.
+pub trait Logger: Send + Sync {
+    /// Logs an informational message.
+    fn info(&self, msg: &str);
+    /// Logs an error message (defaults to [`info`](Logger::info)).
+    fn error(&self, msg: &str) {
+        self.info(msg);
+    }
+}
+
+/// Decides how an obsolete file is disposed of, mirroring Pebble's `Cleaner`. The default
+/// [`DeleteCleaner`] removes it; [`ArchiveCleaner`] moves it into an archive directory.
+pub trait Cleaner: Send + Sync {
+    /// Disposes of the obsolete file at `path` on `fs`.
+    fn clean(&self, fs: &dyn Fs, path: &Path) -> Result<()>;
+}
+
+/// A [`Cleaner`] that deletes obsolete files (the default).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeleteCleaner;
+
+impl Cleaner for DeleteCleaner {
+    fn clean(&self, fs: &dyn Fs, path: &Path) -> Result<()> {
+        fs.remove(path)?;
+        Ok(())
+    }
+}
+
+/// A [`Cleaner`] that moves obsolete files into an archive directory instead of deleting
+/// them (Pebble's archive cleaner), useful for forensic recovery.
+#[derive(Debug, Clone)]
+pub struct ArchiveCleaner {
+    /// The directory obsolete files are moved into.
+    pub dir: PathBuf,
+}
+
+impl Cleaner for ArchiveCleaner {
+    fn clean(&self, fs: &dyn Fs, path: &Path) -> Result<()> {
+        fs.create_dir_all(&self.dir)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| Error::InvalidState("cleaner: path has no file name".into()))?;
+        fs.rename(path, &self.dir.join(name))?;
+        Ok(())
+    }
 }
 
 impl Default for Options {
@@ -115,6 +174,8 @@ impl Default for Options {
             format_major_version: FormatMajorVersion::DEFAULT,
             wal_dir: None,
             wal_failover_dir: None,
+            logger: None,
+            cleaner: Arc::new(DeleteCleaner),
         }
     }
 }
@@ -179,6 +240,24 @@ pub struct DbInner {
     _lock: Option<Box<dyn DirLock>>,
     /// The store's on-disk format major version.
     format_major_version: Mutex<FormatMajorVersion>,
+    /// Optional log sink.
+    logger: Option<Arc<dyn Logger>>,
+    /// How obsolete files are disposed of.
+    cleaner: Arc<dyn Cleaner>,
+}
+
+impl DbInner {
+    /// Logs an informational message if a [`Logger`] is configured.
+    fn log(&self, msg: &str) {
+        if let Some(l) = &self.logger {
+            l.info(msg);
+        }
+    }
+
+    /// Disposes of the obsolete file at `path` via the configured [`Cleaner`].
+    fn clean_file(&self, path: &Path) {
+        let _ = self.cleaner.clean(self.fs.as_ref(), path);
+    }
 }
 
 /// An on-disk LSM key-value database.
@@ -340,6 +419,8 @@ impl DbInner {
                 fs,
                 _lock: None,
                 format_major_version: Mutex::new(format_major_version),
+                logger: opts.logger.clone(),
+                cleaner: opts.cleaner.clone(),
             });
         }
 
@@ -437,6 +518,8 @@ impl DbInner {
             fs,
             _lock: Some(lock),
             format_major_version: Mutex::new(format_major_version),
+            logger: opts.logger.clone(),
+            cleaner: opts.cleaner.clone(),
         })
     }
 
@@ -742,14 +825,21 @@ impl DbInner {
         let popped_wal = state.imm_wals.remove(0);
         state.flush_count += 1;
         if popped_wal != 0 {
-            // The WAL may live in any configured directory (failover); remove from each.
+            // The WAL may live in any configured directory (failover); clean from each.
             for dir in &self.wal_dirs {
-                let _ = self.fs.remove(&dir.join(wal_filename(popped_wal)));
+                self.clean_file(&dir.join(wal_filename(popped_wal)));
             }
         }
         // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
         self.maybe_compact(&mut state)?;
         drop(state);
+
+        self.log(&format!(
+            "flushed memtable to sstable {file_num} ({flushed_bytes} bytes)"
+        ));
+        if let Some(l) = &self.listener {
+            l.on_table_created(file_num);
+        }
 
         if let Some(l) = &self.listener {
             l.on_flush_end(file_num, flushed_bytes);

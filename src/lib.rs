@@ -63,7 +63,7 @@ pub use base::comparer::{Comparer, DefaultComparer};
 pub use base::merge::{ConcatMerger, Merger};
 pub use batch::Batch;
 pub use db::{
-    Db, DbIterator, EventListener, FormatMajorVersion, IterOptions, Metrics, Options, OptionsFile,
-    Snapshot,
+    ArchiveCleaner, Cleaner, Db, DbIterator, DeleteCleaner, EventListener, FormatMajorVersion,
+    IterOptions, Logger, Metrics, Options, OptionsFile, Snapshot,
 };
 pub use error::{Error, Result};
