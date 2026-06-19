@@ -15,9 +15,13 @@
 //! that block's rows.
 //!
 //! Scope: this is pebbledb's own columnar table layout (keys stored as raw-bytes columns).
-//! Byte-for-byte interchange with Pebble's production columnar tables additionally requires
-//! the `PrefixBytes` key codec and Pebble's application key schema; that final
-//! schema-coupling is validated by the interop CI (see `ROADMAP.md`).
+//! Byte-for-byte interchange with a columnar table written by Pebble additionally depends
+//! on the pluggable key schema it was written with. The schema a general Pebble KV store
+//! uses once columnar is enabled is `colblk.DefaultKeySchema(comparer, 16)` (a
+//! `PrefixBytes` prefix column split by the comparer + a `Bytes` suffix column); matching
+//! that decomposition is the concrete next interop step. CockroachDB's `cockroachkvs`
+//! schema is a separate, opt-in case. This schema-coupling is validated by the interop CI
+//! (see `ROADMAP.md`).
 
 use std::sync::Arc;
 

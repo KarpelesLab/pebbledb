@@ -40,11 +40,14 @@
 //! The [`DataType::PrefixBytes`] bundle prefix-compression codec
 //! ([`encode_prefix_bytes`]/[`decode_prefix_bytes`]) is also implemented. These blocks are
 //! assembled into a complete columnar sstable by [`crate::sstable::columnar`] (read +
-//! write). Note: `PrefixBytes`'s offset sub-table uses the standard uint-column encoding
-//! here; Pebble omits the always-zero delta base in the rare wide-offset case, so
-//! byte-for-byte interchange of a delta-encoded offset table — and reading Pebble's
-//! production tables, which use their application key schema — is validated by the interop
-//! CI (see `ROADMAP.md`).
+//! write). Two notes on cross-implementation parity (validated by the interop CI):
+//! `PrefixBytes`'s offset sub-table uses the standard uint-column encoding here, whereas
+//! Pebble omits the always-zero delta base in the rare wide-offset case; and a columnar
+//! data block's *key* columns are defined by a pluggable `colblk.KeySchema`. The schema a
+//! general Pebble KV store uses once columnar is enabled is
+//! `colblk.DefaultKeySchema(comparer, 16)` — a `PrefixBytes` prefix column (split by the
+//! comparer) plus a `Bytes` suffix column — which is the concrete interop target; the
+//! CockroachDB `cockroachkvs` schema is a separate, opt-in case. See `ROADMAP.md`.
 
 use crate::{Error, Result};
 

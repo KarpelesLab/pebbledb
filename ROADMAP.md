@@ -78,10 +78,25 @@ refined as they are reached.
   (`ColumnarWriter`/`ColumnarReader`) assembles these into a complete columnar sstable —
   data blocks + columnar index + metaindex + properties + v5 footer — and reads it back
   end-to-end (full ordered iteration + point lookups), round-trip tested over 2000 keys
-  across multiple blocks. Note: byte-for-byte interchange with Pebble's *production*
-  columnar tables additionally depends on their application key schema (e.g.
-  `cockroachkvs`) and the delta-offset sub-encoding nuance noted in `colblk`; that
-  cross-implementation parity is what the interop CI validates.
+  across multiple blocks.
+
+  Cross-implementation byte parity (validated by the interop CI, not assertable from
+  format code alone) hinges on the *key schema* a columnar data block was written with,
+  since the key columns are pluggable (`colblk.KeySchema`):
+  - **General Pebble-as-a-KV-store target: `colblk.DefaultKeySchema(comparer, 16)`** — what
+    a plain `pebble.Open` user gets once columnar is enabled (`FormatColumnarBlocks`+).
+    It decomposes each user key into a `PrefixBytes` prefix column (split by the comparer)
+    plus a `Bytes` suffix column, alongside the data block's standard trailer/value
+    columns. pebbledb already has every primitive this needs (`PrefixBytes`, raw bytes,
+    uint); the concrete next interop step is implementing this exact column decomposition
+    and writing the `KeySchema` name into the table.
+  - **CockroachDB-specific case: `cockroachkvs`** (also vendored in the Pebble repo, but
+    only used when an application explicitly configures it) — its MVCC key/timestamp
+    decomposition is a later, Cockroach-specific interop target.
+  - Plus the `PrefixBytes` delta-offset sub-encoding nuance noted in `colblk`.
+
+  Note that columnar is opt-in in Pebble (`FormatDefault` → `FormatMinSupported`, a row
+  format); a default `pebble.Open` writes row blocks, which pebbledb already reads/writes.
 - [x] **Phase 17 — MANIFEST completeness.** `NewFile5` (range-key bounds, with the
   point/range bounds marker) is decoded, and the full `NewFile4`/`NewFile5` custom-tag set
   — creation time, no-range-key-sets, virtual backing tables, synthetic prefix/suffix, and
@@ -183,6 +198,20 @@ fixtures or a local Go toolchain dependency: a workflow installs Go + Pebble, ro
 data through both engines, and fails if the byte formats or semantics diverge. This keeps
 the crate's own build dependency-light while still proving binary compatibility against
 upstream on every run.
+
+### Concrete interop follow-ups
+
+The interop workflow currently round-trips at `FormatMostCompatible` (the **row** format),
+which the engine reads and writes. The remaining, well-specified interop work is columnar:
+
+1. **Columnar interop at `colblk.DefaultKeySchema(comparer, 16)`** — the schema a general
+   Pebble KV user gets once columnar is enabled. Implement its key column decomposition
+   (a `PrefixBytes` prefix column split by the comparer + a `Bytes` suffix column) in the
+   columnar table writer/reader and record the `KeySchema` name; then extend the interop
+   workflow to open Pebble at `FormatColumnarBlocks`+ and round-trip a table both ways.
+2. **`cockroachkvs` interop** — the CockroachDB MVCC key/timestamp schema (vendored in the
+   Pebble repo), only relevant for interop with a CockroachDB store.
+3. The `PrefixBytes` delta-offset sub-encoding nuance (see `sstable::colblk`).
 
 ## Format references
 
