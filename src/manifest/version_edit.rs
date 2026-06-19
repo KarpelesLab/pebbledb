@@ -13,10 +13,13 @@
 //! next file number, and last sequence number. Replaying every edit in order
 //! reconstructs the current set of live sstables.
 //!
-//! Scope: the common tags plus the `NewFile`/`NewFile2`/`NewFile3`/`NewFile4` (point-key)
-//! file records are decoded; `NewFile5` (range-key bounds), blob files, virtual backing
-//! tables beyond simple skipping, column families, and excise records are not yet
-//! handled. Edits are written using `NewFile2`, which Pebble reads.
+//! Scope: every `NewFile`/`NewFile2`/`NewFile3`/`NewFile4`/`NewFile5` file record is
+//! decoded, including the full custom-tag set — creation time, virtual backing tables,
+//! synthetic prefix/suffix, and blob references — so a MANIFEST written by upstream Pebble
+//! parses without error (details this engine does not model are parsed for stream
+//! alignment but discarded). Edits are written using `NewFile2`, which Pebble reads.
+//! Excise records, standalone blob-file records, and column-family records remain
+//! explicitly unsupported (they are rejected rather than mis-parsed).
 
 use crate::base::varint::{get_uvarint, put_uvarint};
 use crate::{Error, Result};
@@ -47,6 +50,18 @@ const CUSTOM_TAG_NEEDS_COMPACTION: u64 = 2;
 const CUSTOM_TAG_CREATION_TIME: u64 = 6;
 const CUSTOM_TAG_NO_RANGE_KEY_SETS: u64 = 7;
 const CUSTOM_TAG_NON_SAFE_IGNORE_MASK: u64 = 1 << 6;
+const CUSTOM_TAG_PATH_ID: u64 = 65;
+const CUSTOM_TAG_VIRTUAL: u64 = 66;
+const CUSTOM_TAG_SYNTHETIC_PREFIX: u64 = 67;
+const CUSTOM_TAG_SYNTHETIC_SUFFIX: u64 = 68;
+const CUSTOM_TAG_BLOB_REFERENCES: u64 = 69;
+const CUSTOM_TAG_BLOB_REFERENCES2: u64 = 70;
+
+// NewFile5 bounds-marker bit flags: whether the file has point keys, and whether the
+// file's overall smallest / largest bound is taken from the point keys (vs the range keys).
+const BOUNDS_MASK_CONTAINS_POINT_KEYS: u8 = 1 << 0;
+const BOUNDS_MASK_SMALLEST_IS_POINT: u8 = 1 << 1;
+const BOUNDS_MASK_LARGEST_IS_POINT: u8 = 1 << 2;
 
 /// Metadata describing a single sstable in the LSM tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +140,15 @@ impl<'a> Decoder<'a> {
         let out = &self.b[self.pos..end];
         self.pos = end;
         Ok(out)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        let b = *self
+            .b
+            .get(self.pos)
+            .ok_or_else(|| Error::corruption("version edit: truncated byte"))?;
+        self.pos += 1;
+        Ok(b)
     }
 
     fn level(&mut self) -> Result<usize> {
@@ -240,6 +264,12 @@ fn put_bytes(dst: &mut Vec<u8>, s: &[u8]) {
 }
 
 /// Decodes a `NewFile*` record (the level and file metadata) for the given tag.
+///
+/// Handles the LevelDB/RocksDB `NewFile`/`NewFile2`/`NewFile3`/`NewFile4` layouts and the
+/// Pebble `NewFile5` (range-key bounds) layout, including the full custom-tag set
+/// (creation time, virtual backing tables, synthetic prefix/suffix, and blob references).
+/// Information this engine does not model (virtual/synthetic/blob details) is parsed for
+/// stream-position correctness but discarded; the file's overall key bounds are kept.
 fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
     let level = d.level()?;
     let file_num = d.uvarint()?;
@@ -248,14 +278,35 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
     }
     let size = d.uvarint()?;
 
-    if tag == TAG_NEW_FILE5 {
-        return Err(Error::Unsupported(
-            "version edit: NewFile5 (range-key bounds) not yet supported",
-        ));
-    }
-
-    let smallest = d.bytes()?.to_vec();
-    let largest = d.bytes()?.to_vec();
+    // Key bounds. NewFile5 introduces a bounds marker selecting the file's overall
+    // smallest/largest from its point-key and/or range-key bounds.
+    let (smallest, largest) = if tag == TAG_NEW_FILE5 {
+        let marker = d.byte()?;
+        let (mut sp, mut lp) = (None, None);
+        if marker & BOUNDS_MASK_CONTAINS_POINT_KEYS != 0 {
+            sp = Some(d.bytes()?.to_vec());
+            lp = Some(d.bytes()?.to_vec());
+        }
+        let sr = d.bytes()?.to_vec();
+        let lr = d.bytes()?.to_vec();
+        let smallest = if marker & BOUNDS_MASK_SMALLEST_IS_POINT != 0 {
+            sp.ok_or_else(|| {
+                Error::corruption("version edit: NewFile5 smallest is point but no point keys")
+            })?
+        } else {
+            sr
+        };
+        let largest = if marker & BOUNDS_MASK_LARGEST_IS_POINT != 0 {
+            lp.ok_or_else(|| {
+                Error::corruption("version edit: NewFile5 largest is point but no point keys")
+            })?
+        } else {
+            lr
+        };
+        (smallest, largest)
+    } else {
+        (d.bytes()?.to_vec(), d.bytes()?.to_vec())
+    };
 
     let (smallest_seqnum, largest_seqnum) = if tag != TAG_NEW_FILE {
         (d.uvarint()?, d.uvarint()?)
@@ -263,31 +314,8 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
         (0, 0)
     };
 
-    if tag == TAG_NEW_FILE4 {
-        // Custom tags terminated by CUSTOM_TAG_TERMINATE. Safe-to-ignore tags carry a
-        // single bytes field; tags at/above the non-safe mask are not handled.
-        loop {
-            let custom = d.uvarint()?;
-            if custom == CUSTOM_TAG_TERMINATE {
-                break;
-            }
-            match custom {
-                CUSTOM_TAG_NEEDS_COMPACTION
-                | CUSTOM_TAG_CREATION_TIME
-                | CUSTOM_TAG_NO_RANGE_KEY_SETS => {
-                    let _field = d.bytes()?;
-                }
-                c if c & CUSTOM_TAG_NON_SAFE_IGNORE_MASK == 0 => {
-                    // Unknown but safe to ignore: format is always a bytes field.
-                    let _field = d.bytes()?;
-                }
-                other => {
-                    return Err(Error::Corruption(format!(
-                        "version edit: unsupported custom tag {other}"
-                    )));
-                }
-            }
-        }
+    if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
+        decode_custom_tags(d)?;
     }
 
     Ok(NewFileEntry {
@@ -301,6 +329,56 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             largest_seqnum,
         },
     })
+}
+
+/// Consumes the custom-tag stream of a `NewFile4`/`NewFile5` record up to the terminator.
+/// Each tag's payload is parsed exactly so the stream stays aligned; payloads for features
+/// this engine does not model are discarded.
+fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<()> {
+    loop {
+        let custom = d.uvarint()?;
+        match custom {
+            CUSTOM_TAG_TERMINATE => break,
+            CUSTOM_TAG_CREATION_TIME
+            | CUSTOM_TAG_NO_RANGE_KEY_SETS
+            | CUSTOM_TAG_NEEDS_COMPACTION => {
+                let _field = d.bytes()?;
+            }
+            CUSTOM_TAG_VIRTUAL => {
+                // Virtual table: the backing file's disk number follows.
+                let _backing_file_num = d.uvarint()?;
+            }
+            CUSTOM_TAG_SYNTHETIC_PREFIX | CUSTOM_TAG_SYNTHETIC_SUFFIX => {
+                let _field = d.bytes()?;
+            }
+            CUSTOM_TAG_BLOB_REFERENCES | CUSTOM_TAG_BLOB_REFERENCES2 => {
+                let _depth = d.uvarint()?;
+                let n = d.uvarint()?;
+                for _ in 0..n {
+                    let _file_id = d.uvarint()?;
+                    let _value_size = d.uvarint()?;
+                    if custom == CUSTOM_TAG_BLOB_REFERENCES2 {
+                        let _backing_value_size = d.uvarint()?;
+                    }
+                }
+            }
+            CUSTOM_TAG_PATH_ID => {
+                return Err(Error::Unsupported(
+                    "version edit: NewFile path-id field not supported",
+                ));
+            }
+            c if c & CUSTOM_TAG_NON_SAFE_IGNORE_MASK == 0 => {
+                // Unknown but safe to ignore: the format is always a single bytes field.
+                let _field = d.bytes()?;
+            }
+            other => {
+                return Err(Error::Corruption(format!(
+                    "version edit: unsupported custom tag {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -384,12 +462,96 @@ mod tests {
     }
 
     #[test]
-    fn new_file5_is_unsupported() {
+    fn decode_new_file5_with_point_and_range_bounds_and_custom_tags() {
+        // Hand-encode a NewFile5 record (Pebble's range-key layout): bounds marker with
+        // point keys present and the overall smallest/largest taken from the point keys,
+        // followed by virtual and blob-reference custom tags this engine parses but does
+        // not model.
+        let mut buf = Vec::new();
+        put_uvarint(&mut buf, TAG_NEW_FILE5);
+        put_uvarint(&mut buf, 1); // level
+        put_uvarint(&mut buf, 77); // file_num
+        put_uvarint(&mut buf, 8192); // size
+
+        let sp = InternalKey::new(b"aaa".to_vec(), 50, InternalKeyKind::Set).encode();
+        let lp = InternalKey::new(b"mmm".to_vec(), 40, InternalKeyKind::Set).encode();
+        let sr = InternalKey::new(b"bbb".to_vec(), 49, InternalKeyKind::RangeKeySet).encode();
+        let lr = InternalKey::new(b"nnn".to_vec(), 41, InternalKeyKind::RangeKeySet).encode();
+        let marker = BOUNDS_MASK_CONTAINS_POINT_KEYS
+            | BOUNDS_MASK_SMALLEST_IS_POINT
+            | BOUNDS_MASK_LARGEST_IS_POINT;
+        buf.push(marker);
+        put_bytes(&mut buf, &sp);
+        put_bytes(&mut buf, &lp);
+        put_bytes(&mut buf, &sr);
+        put_bytes(&mut buf, &lr);
+        put_uvarint(&mut buf, 10); // smallest seqnum
+        put_uvarint(&mut buf, 50); // largest seqnum
+
+        // Virtual backing table custom tag.
+        put_uvarint(&mut buf, CUSTOM_TAG_VIRTUAL);
+        put_uvarint(&mut buf, 12); // backing file num
+        // Blob references (v2) custom tag: depth, count, then per-ref fields.
+        put_uvarint(&mut buf, CUSTOM_TAG_BLOB_REFERENCES2);
+        put_uvarint(&mut buf, 1); // depth
+        put_uvarint(&mut buf, 2); // count
+        for (fid, vsz, bsz) in [(1u64, 100u64, 110u64), (2, 200, 210)] {
+            put_uvarint(&mut buf, fid);
+            put_uvarint(&mut buf, vsz);
+            put_uvarint(&mut buf, bsz);
+        }
+        put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
+
+        let edit = VersionEdit::decode(&buf).unwrap();
+        assert_eq!(edit.new_files.len(), 1);
+        let nf = &edit.new_files[0];
+        assert_eq!(nf.level, 1);
+        assert_eq!(nf.meta.file_num, 77);
+        assert_eq!(nf.meta.size, 8192);
+        // Overall bounds taken from the point keys per the marker.
+        assert_eq!(nf.meta.smallest, sp);
+        assert_eq!(nf.meta.largest, lp);
+        assert_eq!((nf.meta.smallest_seqnum, nf.meta.largest_seqnum), (10, 50));
+    }
+
+    #[test]
+    fn decode_new_file5_range_keys_only() {
+        // A file with no point keys: the bounds come entirely from range keys.
         let mut buf = Vec::new();
         put_uvarint(&mut buf, TAG_NEW_FILE5);
         put_uvarint(&mut buf, 0);
-        put_uvarint(&mut buf, 1);
-        put_uvarint(&mut buf, 100);
-        assert!(VersionEdit::decode(&buf).is_err());
+        put_uvarint(&mut buf, 5);
+        put_uvarint(&mut buf, 256);
+        let sr = InternalKey::new(b"k1".to_vec(), 9, InternalKeyKind::RangeKeySet).encode();
+        let lr = InternalKey::new(b"k9".to_vec(), 8, InternalKeyKind::RangeKeySet).encode();
+        buf.push(0); // marker: no point keys, bounds from range keys
+        put_bytes(&mut buf, &sr);
+        put_bytes(&mut buf, &lr);
+        put_uvarint(&mut buf, 8);
+        put_uvarint(&mut buf, 9);
+        put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
+
+        let edit = VersionEdit::decode(&buf).unwrap();
+        let nf = &edit.new_files[0];
+        assert_eq!(nf.meta.smallest, sr);
+        assert_eq!(nf.meta.largest, lr);
+    }
+
+    #[test]
+    fn excise_and_blob_file_records_are_rejected_not_misparsed() {
+        // These tags are explicitly unsupported; decoding must error rather than silently
+        // mis-parse the remainder of the edit.
+        for tag in [
+            10u64, /* excise */
+            107,   /* new blob file */
+            200,   /* column family */
+        ] {
+            let mut buf = Vec::new();
+            put_uvarint(&mut buf, tag);
+            assert!(
+                VersionEdit::decode(&buf).is_err(),
+                "tag {tag} should be rejected"
+            );
+        }
     }
 }

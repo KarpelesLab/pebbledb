@@ -68,10 +68,15 @@ refined as they are reached.
 - [ ] **Phase 16 — Columnar blocks.** The Pebblev5+ columnar data / index / keyspan block
   formats (read + write), table-format versions v5–v8, and the v6/v7 footer checksum +
   attributes.
-- [ ] **Phase 17 — MANIFEST completeness.** NewFile5, virtual/backing tables, excise
-  records, column families, table-marked-for-compaction, blob-file edits;
-  `BulkVersionEdit` accumulation; complete `FileMetadata` (virtual, synthetic
-  prefix/suffix, range-key bounds, blob references).
+- [x] **Phase 17 — MANIFEST completeness.** `NewFile5` (range-key bounds, with the
+  point/range bounds marker) is decoded, and the full `NewFile4`/`NewFile5` custom-tag set
+  — creation time, no-range-key-sets, virtual backing tables, synthetic prefix/suffix, and
+  blob references (v1 and v2) — is parsed with the exact upstream byte layouts, so a
+  MANIFEST written by current Pebble parses without error (features this engine does not
+  model are parsed for stream alignment and discarded). Tag numbers verified against
+  upstream `version_edit.go`. (Excise, standalone blob-file, and column-family records are
+  explicitly rejected rather than mis-parsed; full virtual-table *support* and
+  `BulkVersionEdit` accumulation remain follow-ups.)
 - [x] **Phase 18 — Merge operator.** A pluggable `Merger` and full MERGE resolution in
   `Get`, iteration, and compaction.
 - [x] **Phase 19 — Snapshots & sequence semantics.** Registered snapshots that hold back
