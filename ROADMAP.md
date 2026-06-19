@@ -37,7 +37,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   snapshots. Interop: read a Go-written DB.
 - [x] **Phase 9 — DB write path.** WAL append with group commit, memtable rotation,
   flush of a memtable to an L0 sstable, and crash recovery from the WAL.
-- [ ] **Phase 10 — Compaction.** Compaction picker, L0→Lbase and leveled compaction,
+- [x] **Phase 10 — Compaction.** Compaction picker, L0→Lbase and leveled compaction,
   obsolete-file deletion, basic read/write-amplification accounting.
 - [ ] **Phase 11 — Hardening.** Block and table caches, the full `Options` surface,
   metrics, a concurrency review, fuzzing, bidirectional interop tests against Go Pebble,

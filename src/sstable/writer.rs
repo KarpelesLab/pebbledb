@@ -252,6 +252,13 @@ impl<W: Write> Writer<W> {
     pub fn num_entries(&self) -> u64 {
         self.num_entries
     }
+
+    /// The number of bytes written to the underlying sink so far (excluding any data
+    /// still buffered in the open data block). Useful for deciding when to split output
+    /// files during compaction.
+    pub fn estimated_size(&self) -> u64 {
+        self.offset
+    }
 }
 
 /// Compresses `raw`, appends the trailer (compression byte + checksum), writes the whole

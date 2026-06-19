@@ -15,10 +15,12 @@
 //! synchronously to an L0 sstable and recorded in the MANIFEST. Reads consult the
 //! mutable memtable, then immutable memtables, then the sstables of each level.
 //!
-//! Scope: a synchronous, single-MANIFEST, single-WAL engine without background
-//! compaction (that is Phase 10). Flushes happen inline when the memtable fills or on an
-//! explicit [`Db::flush`]. Durability uses buffered writes (no explicit fsync yet).
+//! Scope: a synchronous, single-MANIFEST, single-WAL engine. Flushes happen inline when
+//! the memtable fills or on an explicit [`Db::flush`], and leveled compaction runs inline
+//! afterward (L0-by-count and L1+ by-size triggers). Durability uses buffered writes (no
+//! explicit fsync yet).
 
+mod compaction;
 mod filenames;
 mod merging_iter;
 
@@ -279,6 +281,9 @@ impl Db {
                 let _ = std::fs::remove_file(self.dir.join(wal_filename(num)));
             }
         }
+
+        // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
+        self.maybe_compact(state)?;
         Ok(())
     }
 
@@ -367,6 +372,13 @@ impl Db {
     /// The user-key comparer.
     pub fn comparer(&self) -> &Arc<dyn Comparer> {
         &self.cmp
+    }
+
+    /// The number of live sstables at each level (`[0]` is L0). Useful for tests and
+    /// metrics.
+    pub fn level_file_counts(&self) -> [usize; NUM_LEVELS] {
+        let state = self.state.lock().unwrap();
+        std::array::from_fn(|i| state.vs.current.levels[i].len())
     }
 }
 
@@ -615,6 +627,75 @@ mod tests {
         assert_eq!(db.get(b"k001999").unwrap(), Some(b"v001999".to_vec()));
         assert_eq!(db.get(b"k002000").unwrap(), None);
         assert_eq!(collect(&db).len(), 2000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_drains_l0_and_preserves_reads() {
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        // Many distinct keys across many flushes; L0 should be compacted into deeper
+        // levels rather than growing without bound.
+        for i in 0..3000u32 {
+            db.set(format!("k{i:06}").as_bytes(), format!("v{i:06}").as_bytes())
+                .unwrap();
+        }
+        let counts = db.level_file_counts();
+        assert!(counts[0] < 4, "L0 should be drained, got {counts:?}");
+        assert!(
+            counts[1..].iter().sum::<usize>() > 0,
+            "deeper levels should hold files, got {counts:?}"
+        );
+        // All reads remain correct after compaction.
+        for i in (0..3000u32).step_by(137) {
+            assert_eq!(
+                db.get(format!("k{i:06}").as_bytes()).unwrap(),
+                Some(format!("v{i:06}").into_bytes())
+            );
+        }
+        assert_eq!(collect(&db).len(), 3000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_collapses_overwrites_and_deletes() {
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        // Repeatedly overwrite a small key set, then delete half — forcing flushes and
+        // compactions that must collapse history correctly.
+        for round in 0..200u32 {
+            for k in 0..20u32 {
+                db.set(
+                    format!("key{k:02}").as_bytes(),
+                    format!("round{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        for k in 0..10u32 {
+            db.delete(format!("key{k:02}").as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+
+        // Deleted keys are gone; survivors hold the final round's value.
+        for k in 0..10u32 {
+            assert_eq!(db.get(format!("key{k:02}").as_bytes()).unwrap(), None);
+        }
+        for k in 10..20u32 {
+            assert_eq!(
+                db.get(format!("key{k:02}").as_bytes()).unwrap(),
+                Some(b"round199".to_vec())
+            );
+        }
+        assert_eq!(collect(&db).len(), 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 

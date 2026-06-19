@@ -72,7 +72,10 @@ impl InternalIter for OwnedMemIter {
 }
 
 /// Interleaves several internal iterators, exposing the globally smallest internal key.
-struct MergingIter {
+///
+/// Used both by [`DbIterator`] (with snapshot collapsing on top) and directly by
+/// compaction (which keeps the newest version of each user key).
+pub(crate) struct MergingIter {
     sources: Vec<Box<dyn InternalIter>>,
     cmp: Arc<dyn Comparer>,
     /// Index of the source holding the current smallest key, if any.
@@ -80,7 +83,10 @@ struct MergingIter {
 }
 
 impl MergingIter {
-    fn new(mut sources: Vec<Box<dyn InternalIter>>, cmp: Arc<dyn Comparer>) -> Result<MergingIter> {
+    pub(crate) fn new(
+        mut sources: Vec<Box<dyn InternalIter>>,
+        cmp: Arc<dyn Comparer>,
+    ) -> Result<MergingIter> {
         for s in &mut sources {
             s.first()?;
         }
@@ -114,20 +120,20 @@ impl MergingIter {
         self.cur = best;
     }
 
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.cur.is_some()
     }
 
-    fn key(&self) -> &[u8] {
+    pub(crate) fn key(&self) -> &[u8] {
         self.sources[self.cur.expect("valid")].key()
     }
 
-    fn value(&self) -> &[u8] {
+    pub(crate) fn value(&self) -> &[u8] {
         self.sources[self.cur.expect("valid")].value()
     }
 
     /// Advances past the current smallest key.
-    fn advance(&mut self) -> Result<()> {
+    pub(crate) fn advance(&mut self) -> Result<()> {
         let i = self.cur.expect("valid");
         self.sources[i].advance()?;
         self.refresh_min();
