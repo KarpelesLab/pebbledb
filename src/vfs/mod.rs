@@ -46,7 +46,7 @@ impl WritableFile for Box<dyn WritableFile> {
 }
 
 /// An acquired exclusive lock on a database directory. Dropping it releases the lock.
-pub trait DirLock: Send {}
+pub trait DirLock: Send + Sync {}
 
 /// A filesystem the database performs all of its I/O through.
 pub trait Fs: Send + Sync {

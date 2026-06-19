@@ -84,9 +84,16 @@ refined as they are reached.
   `seek_prefix_ge` prefix iteration on `DbIterator`, with reverse merge/range-tombstone
   resolution shared with the forward path. (Bloom-skip during `seek_prefix_ge` and
   point/range/both key-type selection remain a perf/range-key follow-up.)
-- [ ] **Phase 21 — Concurrency & commit pipeline.** Group commit, a background flush
-  worker, concurrent background compactions, non-blocking memtable rotation, and
-  read/write concurrency under load.
+- [x] **Phase 21 — Concurrency & commit pipeline.** The engine state lives behind an
+  `Arc<DbInner>` with a dedicated background flush/compaction worker thread (joined on
+  `Db` drop). A full memtable is rotated into an immutable queue — a cheap, non-blocking
+  operation off the writer's path — and the worker flushes it to L0 with the state lock
+  released during the sstable write, so foreground reads and writes proceed; flushes are
+  serialized by a flush lock so the worker and an explicit `flush` never double-flush.
+  Reads consult the immutable queue newest-first. Verified by a multi-threaded
+  writers+reader stress test and the reopen-heavy model test. (True group commit batching
+  multiple committers and multiple concurrent compaction threads remain throughput
+  follow-ups.)
 - [x] **Phase 22 — vfs abstraction.** An `Fs` trait (`vfs` module) with `DiskFs` and
   `MemFs`, threaded through the whole engine: open/recovery, flush, compaction, MANIFEST,
   WAL, table reads, atomic markers, and directory syncing all go through it. True

@@ -9,17 +9,20 @@
 //!
 //! [`Db::open`] opens (or creates) a store: it locates the current MANIFEST via the
 //! atomic marker files Pebble writes, replays it into a [`VersionSet`], recovers any
-//! write-ahead logs into a fresh memtable, then rotates in a new MANIFEST and WAL for the
-//! session. Writes ([`Db::set`], [`Db::delete`], [`Db::apply`]) assign sequence numbers,
-//! append to the WAL, and update the mutable memtable; when it fills it is flushed
-//! synchronously to an L0 sstable and recorded in the MANIFEST. Reads consult the
-//! mutable memtable, then immutable memtables, then the sstables of each level.
+//! un-flushed write-ahead logs into a fresh memtable, then rotates in a new MANIFEST and
+//! WAL for the session and spawns a background flush/compaction worker. Writes
+//! (`set`, `delete`, `apply`) assign sequence numbers, append to the WAL, and update the
+//! mutable memtable; when it fills it is rotated into an immutable queue (a cheap,
+//! non-blocking operation) and the worker flushes it to an L0 sstable off the writer's
+//! path. Reads consult the mutable memtable, then the immutable memtables newest-first,
+//! then the sstables of each level.
 //!
-//! Scope: a synchronous, single-MANIFEST, single-WAL engine. Flushes happen inline when
-//! the memtable fills or on an explicit [`Db::flush`], and leveled compaction runs inline
-//! afterward (L0-by-count and L1+ by-size triggers). The WAL is fsynced after each write
-//! when `Options::wal_sync` is set (the default), and the MANIFEST is fsynced on every
-//! edit.
+//! Scope: a single-MANIFEST, single active-WAL engine with one background worker. The
+//! memtable is rotated when it fills or on an explicit [`DbInner::flush`]; flushes run on the
+//! worker (an explicit `flush` cooperates and waits for completion), and leveled
+//! compaction runs after each flush (a score-based picker plus manual
+//! [`DbInner::compact_range`]). The WAL is fsynced after each write when `Options::wal_sync` is
+//! set (the default), and the MANIFEST is fsynced on every edit.
 
 mod compaction;
 mod filenames;
@@ -33,7 +36,7 @@ pub use options_file::{FormatMajorVersion, OptionsFile};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::base::comparer::{Comparer, DefaultComparer};
 use crate::base::internal_key::{InternalKey, InternalKeyKind, SeqNum, encoded_user_key};
@@ -111,24 +114,38 @@ impl Default for Options {
 struct State {
     vs: VersionSet,
     mem: Arc<MemTable>,
+    /// Memtables rotated out of `mem` and awaiting flush, oldest first. Reads consult
+    /// them newest-first (after `mem`). `imm_wals[i]` is the WAL number holding `imm[i]`'s
+    /// data, removed once that memtable is flushed.
     imm: Vec<Arc<MemTable>>,
+    imm_wals: Vec<u64>,
     wal: Option<record::Writer<Box<dyn WritableFile>>>,
     wal_number: u64,
     manifest: Option<record::Writer<Box<dyn WritableFile>>>,
     read_only: bool,
+    /// Set on close to tell the background worker to exit.
+    shutdown: bool,
     /// Number of memtable flushes performed this session.
     flush_count: u64,
     /// Number of compactions performed this session.
     compaction_count: u64,
 }
 
-/// An on-disk LSM key-value database.
-pub struct Db {
+/// The shared inner state of a [`Db`], held behind an `Arc` so the background flush worker
+/// can operate on it concurrently with foreground reads and writes.
+pub struct DbInner {
     dir: PathBuf,
     cmp: Arc<dyn Comparer>,
     mem_table_size: usize,
     wal_sync: bool,
     state: Mutex<State>,
+    /// Serializes flush execution between the background worker and an explicit
+    /// [`flush`](DbInner::flush), so a memtable is never flushed twice.
+    flush_lock: Mutex<()>,
+    /// Signaled when a memtable is rotated into `imm`, waking the background worker.
+    work_cv: Condvar,
+    /// Signaled when a flush completes, waking any waiter draining the immutable queue.
+    drained_cv: Condvar,
     cache: Mutex<HashMap<u64, Arc<Reader>>>,
     /// Sequence numbers of currently-open snapshots. Compaction retains the versions
     /// they need.
@@ -149,9 +166,63 @@ pub struct Db {
     format_major_version: Mutex<FormatMajorVersion>,
 }
 
+/// An on-disk LSM key-value database.
+///
+/// Owns the shared [`DbInner`] and the background flush/compaction worker thread, which is
+/// signaled to stop and joined when the `Db` is dropped.
+pub struct Db {
+    inner: Arc<DbInner>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::ops::Deref for Db {
+    type Target = DbInner;
+    fn deref(&self) -> &DbInner {
+        &self.inner
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        // Tell the worker to exit and wait for it. Any data still in memtables is durable
+        // in the WALs and will be recovered on the next open.
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.shutdown = true;
+        }
+        self.inner.work_cv.notify_all();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 impl Db {
     /// Opens the database in `dir`, creating it if `opts.create_if_missing` and absent.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
+        let inner = Arc::new(DbInner::open_inner(dir, opts)?);
+        // Spawn the background flush/compaction worker for writable databases.
+        let worker = if inner.state.lock().unwrap().read_only {
+            None
+        } else {
+            let w = Arc::clone(&inner);
+            Some(std::thread::spawn(move || w.background_loop()))
+        };
+        Ok(Db { inner, worker })
+    }
+
+    /// Opens the database in `dir` read-only.
+    pub fn open_read_only(dir: impl AsRef<Path>, mut opts: Options) -> Result<Db> {
+        opts.read_only = true;
+        opts.create_if_missing = false;
+        Db::open(dir, opts)
+    }
+}
+
+impl DbInner {
+    /// Opens (or creates) the database, building the shared inner state. The caller wraps
+    /// the result in an `Arc` and spawns the worker.
+    fn open_inner(dir: impl AsRef<Path>, opts: Options) -> Result<DbInner> {
         let dir = dir.as_ref().to_path_buf();
         let fs = opts.fs.clone();
         let exists = fs.exists(&dir);
@@ -205,19 +276,24 @@ impl Db {
                 vs,
                 mem,
                 imm: Vec::new(),
+                imm_wals: Vec::new(),
                 wal: None,
                 wal_number: 0,
                 manifest: None,
                 read_only: true,
+                shutdown: false,
                 flush_count: 0,
                 compaction_count: 0,
             };
-            return Ok(Db {
+            return Ok(DbInner {
                 dir,
                 cmp,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
                 state: Mutex::new(state),
+                flush_lock: Mutex::new(()),
+                work_cv: Condvar::new(),
+                drained_cv: Condvar::new(),
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
                 listener: opts.event_listener.clone(),
@@ -297,19 +373,24 @@ impl Db {
             vs,
             mem,
             imm: Vec::new(),
+            imm_wals: Vec::new(),
             wal: Some(wal),
             wal_number,
             manifest: Some(manifest),
             read_only: false,
+            shutdown: false,
             flush_count: 0,
             compaction_count: 0,
         };
-        Ok(Db {
+        Ok(DbInner {
             dir,
             cmp,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
             state: Mutex::new(state),
+            flush_lock: Mutex::new(()),
+            work_cv: Condvar::new(),
+            drained_cv: Condvar::new(),
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
             listener: opts.event_listener.clone(),
@@ -368,13 +449,6 @@ impl Db {
         self.fs.sync_dir(&self.dir)?;
         *cur = target;
         Ok(())
-    }
-
-    /// Opens the database in `dir` read-only.
-    pub fn open_read_only(dir: impl AsRef<Path>, mut opts: Options) -> Result<Db> {
-        opts.read_only = true;
-        opts.create_if_missing = false;
-        Db::open(dir, opts)
     }
 
     /// The largest sequence number assigned so far.
@@ -477,7 +551,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Atomically applies all operations in `batch`. Alias for [`Db::apply`].
+    /// Atomically applies all operations in `batch`. Alias for [`DbInner::apply`].
     pub fn write(&self, batch: Batch) -> Result<()> {
         self.apply(batch)
     }
@@ -492,11 +566,13 @@ impl Db {
             return Err(Error::InvalidState("db: opened read-only".into()));
         }
 
-        // Flush once the memtable has used half its arena, leaving the rest as headroom
+        // Rotate once the memtable has used half its arena, leaving the rest as headroom
         // for this batch (the arena fills faster than wire bytes due to per-node
-        // overhead, so the threshold is measured in arena bytes).
+        // overhead, so the threshold is measured in arena bytes). The actual flush of the
+        // rotated memtable runs on the background worker, off this writer's path.
         if state.mem.size() as usize >= self.mem_table_size / 2 {
-            self.flush_locked(&mut state)?;
+            self.rotate_memtable(&mut state)?;
+            self.work_cv.notify_one();
         }
 
         let base = state.vs.last_sequence + 1;
@@ -514,65 +590,123 @@ impl Db {
         Ok(())
     }
 
-    /// Flushes the active memtable to an L0 sstable.
+    /// Flushes the active memtable to an L0 sstable, returning once all data written so
+    /// far is durable in sstables (and any triggered compactions have run).
     pub fn flush(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.read_only {
-            return Err(Error::InvalidState("db: opened read-only".into()));
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.read_only {
+                return Err(Error::InvalidState("db: opened read-only".into()));
+            }
+            self.rotate_memtable(&mut state)?;
         }
-        self.flush_locked(&mut state)
+        // Drain the immutable queue synchronously (cooperating with the worker, which may
+        // also be draining — `flush_one` is serialized by `flush_lock`).
+        while self.flush_one()? {}
+        Ok(())
     }
 
-    /// Flushes the current memtable (if non-empty) to a new L0 sstable, rotates the WAL,
-    /// records the change in the MANIFEST, and removes the now-obsolete logs.
-    fn flush_locked(&self, state: &mut State) -> Result<()> {
+    /// Rotates the current memtable into the immutable queue and opens a fresh WAL for the
+    /// new active memtable. Cheap: no sstable is written. A no-op if the memtable is empty.
+    fn rotate_memtable(&self, state: &mut State) -> Result<()> {
         if state.mem.is_empty() {
             return Ok(());
         }
-        let mem = Arc::clone(&state.mem);
-        let file_num = state.vs.allocate_file_number();
-        let meta =
-            write_memtable_to_sstable(self.fs.as_ref(), &self.dir, &self.cmp, file_num, &mem)?;
-        let flushed_bytes = meta.size;
-
         let new_wal = state.vs.allocate_file_number();
         let wal = record::Writer::with_log_num(
             self.fs.create(&self.dir.join(wal_filename(new_wal)))?,
             new_wal as u32,
         );
+        let old_mem = std::mem::replace(
+            &mut state.mem,
+            Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size)),
+        );
         let old_wal = state.wal_number;
         state.wal = Some(wal);
         state.wal_number = new_wal;
-        state.mem = Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size));
-        state.vs.log_number = new_wal;
+        state.imm.push(old_mem);
+        state.imm_wals.push(old_wal);
+        // `log_number` (the oldest un-flushed WAL) is unchanged: it was `old_wal`, which is
+        // now `imm_wals[0]` if this is the first immutable, or already older.
+        Ok(())
+    }
 
+    /// Flushes the oldest immutable memtable (if any) to an L0 sstable, records it in the
+    /// MANIFEST, removes its WAL, and runs any triggered compaction. Returns whether a
+    /// memtable was flushed. The expensive sstable write happens with the state lock
+    /// released so foreground reads and writes proceed; flushes are serialized by
+    /// `flush_lock` so the worker and an explicit `flush` never double-flush.
+    fn flush_one(&self) -> Result<bool> {
+        let _flushing = self.flush_lock.lock().unwrap();
+
+        let (mem, file_num) = {
+            let mut state = self.state.lock().unwrap();
+            if state.imm.is_empty() {
+                return Ok(false);
+            }
+            let mem = Arc::clone(&state.imm[0]);
+            let file_num = state.vs.allocate_file_number();
+            (mem, file_num)
+        };
+
+        // Write the sstable without holding the state lock.
+        let meta =
+            write_memtable_to_sstable(self.fs.as_ref(), &self.dir, &self.cmp, file_num, &mem)?;
+        let flushed_bytes = meta.size;
+
+        let mut state = self.state.lock().unwrap();
+        // The new oldest un-flushed WAL once this immutable is removed.
+        let new_log = state.imm_wals.get(1).copied().unwrap_or(state.wal_number);
         let edit = VersionEdit {
-            log_number: Some(new_wal),
+            log_number: Some(new_log),
             next_file_number: Some(state.vs.next_file_number),
             last_sequence: Some(state.vs.last_sequence),
             new_files: vec![NewFileEntry { level: 0, meta }],
             ..Default::default()
         };
         state.vs.apply(&edit)?;
+        state.vs.log_number = new_log;
         if let Some(mw) = state.manifest.as_mut() {
             mw.write_record(&edit.encode())?;
             mw.sync_all()?;
         }
+        state.imm.remove(0);
+        let popped_wal = state.imm_wals.remove(0);
         state.flush_count += 1;
+        if popped_wal != 0 {
+            let _ = self.fs.remove(&self.dir.join(wal_filename(popped_wal)));
+        }
+        // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
+        self.maybe_compact(&mut state)?;
+        drop(state);
+
         if let Some(l) = &self.listener {
             l.on_flush_end(file_num, flushed_bytes);
         }
+        self.drained_cv.notify_all();
+        Ok(true)
+    }
 
-        // Remove logs that predate the new WAL; their data is now in the sstable.
-        for num in [old_wal] {
-            if num != 0 && num != new_wal {
-                let _ = self.fs.remove(&self.dir.join(wal_filename(num)));
+    /// The background worker loop: waits for a rotated memtable and flushes it (and runs
+    /// any triggered compaction), until the database is dropped.
+    fn background_loop(&self) {
+        loop {
+            {
+                let mut state = self.state.lock().unwrap();
+                while state.imm.is_empty() && !state.shutdown {
+                    state = self.work_cv.wait(state).unwrap();
+                }
+                if state.shutdown {
+                    return; // any pending data stays in the WALs for recovery
+                }
+            }
+            // Flush outside the state lock guard; errors are surfaced via the next
+            // foreground flush/open rather than panicking the worker.
+            if self.flush_one().is_err() {
+                // Back off briefly so a persistent error doesn't spin the CPU.
+                std::thread::yield_now();
             }
         }
-
-        // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
-        self.maybe_compact(state)?;
-        Ok(())
     }
 
     /// Looks up `key`, returning its value or `None` if absent or deleted.
@@ -825,7 +959,7 @@ impl Db {
 
 /// A consistent read view of the database at a fixed sequence number.
 pub struct Snapshot<'a> {
-    db: &'a Db,
+    db: &'a DbInner,
     seqnum: SeqNum,
 }
 

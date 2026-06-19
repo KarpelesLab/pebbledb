@@ -22,9 +22,9 @@ use crate::record;
 use crate::sstable::{Reader, Writer, WriterOptions};
 use crate::vfs::WritableFile;
 
-use super::{Db, filenames, update_marker};
+use super::{DbInner, filenames, update_marker};
 
-impl Db {
+impl DbInner {
     /// Writes a consistent, self-contained copy of the database into `dest`, which must
     /// not already be an open database. The active memtable is first flushed so all data
     /// lives in sstables; those sstables are copied and a fresh single-record MANIFEST
@@ -34,12 +34,11 @@ impl Db {
         let dest = dest.as_ref();
         self.fs.create_dir_all(dest)?;
 
-        let mut state = self.state.lock().unwrap();
-        if !state.read_only {
-            // Make every live key durable in an sstable before snapshotting the version.
-            self.flush_locked(&mut state)?;
+        // Make every live key durable in an sstable before snapshotting the version.
+        if !self.state.lock().unwrap().read_only {
+            self.flush()?;
         }
-
+        let state = self.state.lock().unwrap();
         let edit = state.vs.snapshot_edit();
 
         // Copy each live sstable verbatim.

@@ -30,7 +30,7 @@ use crate::sstable::{Writer, WriterOptions};
 use crate::vfs::{Fs, WritableFile};
 
 use super::merging_iter::{InternalIter, MergingIter};
-use super::{Db, State, filenames};
+use super::{DbInner, State, filenames};
 
 /// Number of L0 files that triggers an L0 -> L1 compaction.
 const L0_COMPACTION_THRESHOLD: usize = 4;
@@ -57,16 +57,17 @@ fn level_budget(level: usize) -> u64 {
     budget
 }
 
-impl Db {
+impl DbInner {
     /// Manually compacts every level overlapping the user-key range `[start, end)` down
     /// toward the bottom level. `None` bounds mean unbounded. Flushes the memtable first
     /// so its data participates. Useful to reclaim space after a large range delete.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.read_only {
+        if self.state.lock().unwrap().read_only {
             return Err(crate::Error::InvalidState("db: opened read-only".into()));
         }
-        self.flush_locked(&mut state)?;
+        // Flush the memtable (and drain the immutable queue) so its data participates.
+        self.flush()?;
+        let mut state = self.state.lock().unwrap();
 
         // Walk levels from the top, pushing any file overlapping the range one level down,
         // until the data has reached the bottom level. The loop is bounded by the work
@@ -400,7 +401,7 @@ struct OutputBuilder {
 }
 
 impl OutputBuilder {
-    fn new(db: &Db, file_num: u64) -> Result<OutputBuilder> {
+    fn new(db: &DbInner, file_num: u64) -> Result<OutputBuilder> {
         let path = db.dir.join(filenames::table(file_num));
         let writer = Writer::new(
             db.fs.create(&path)?,

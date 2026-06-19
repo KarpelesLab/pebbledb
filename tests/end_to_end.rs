@@ -505,6 +505,73 @@ fn manual_compact_range_drains_upper_levels() {
 }
 
 #[test]
+fn concurrent_writers_and_readers() {
+    // Many writer threads share one Db (Arc), each owning a disjoint key range, while a
+    // reader thread concurrently scans. The background flush/compaction worker runs the
+    // whole time. Afterward every written key must be present exactly once.
+    let dir = temp_dir("concurrent");
+    let db = Arc::new(
+        Db::open(
+            &dir,
+            Options {
+                mem_table_size: 16 * 1024, // force background flushes during the run
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    let writers = 8;
+    let per_writer = 1000u32;
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let db = Arc::clone(&db);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..per_writer {
+                let k = format!("w{w:02}-k{i:05}");
+                db.set(k.as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+        }));
+    }
+    // A concurrent reader: just exercises the read path under contention.
+    let reader = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                let _ = db.get(b"w00-k00000").unwrap();
+                let mut it = db.iter().unwrap();
+                it.first().unwrap();
+                let mut n = 0;
+                while it.valid() {
+                    n += 1;
+                    it.next().unwrap();
+                }
+                let _ = n;
+            }
+        })
+    };
+    for h in handles {
+        h.join().unwrap();
+    }
+    reader.join().unwrap();
+
+    // Every key from every writer is present with the right value.
+    for w in 0..writers {
+        for i in [0u32, 1, 499, per_writer - 1] {
+            let k = format!("w{w:02}-k{i:05}");
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes()),
+                "missing {k}"
+            );
+        }
+    }
+    assert_eq!(collect(&db).len(), (writers as usize) * per_writer as usize);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
