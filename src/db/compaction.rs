@@ -213,7 +213,7 @@ impl Db {
         state.vs.apply(&edit)?;
         if let Some(mw) = state.manifest.as_mut() {
             mw.write_record(&edit.encode())?;
-            mw.flush()?;
+            mw.sync_all()?;
         }
 
         // Remove the obsolete input files from the cache and disk.

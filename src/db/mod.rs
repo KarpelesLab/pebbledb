@@ -17,8 +17,9 @@
 //!
 //! Scope: a synchronous, single-MANIFEST, single-WAL engine. Flushes happen inline when
 //! the memtable fills or on an explicit [`Db::flush`], and leveled compaction runs inline
-//! afterward (L0-by-count and L1+ by-size triggers). Durability uses buffered writes (no
-//! explicit fsync yet).
+//! afterward (L0-by-count and L1+ by-size triggers). The WAL is fsynced after each write
+//! when `Options::wal_sync` is set (the default), and the MANIFEST is fsynced on every
+//! edit.
 
 mod compaction;
 mod filenames;
@@ -54,6 +55,9 @@ pub struct Options {
     pub create_if_missing: bool,
     /// Open read-only: no WAL, no flushing, no MANIFEST rotation.
     pub read_only: bool,
+    /// fsync the WAL after every write so committed data survives a crash (default
+    /// `true`). Disabling trades durability for throughput.
+    pub wal_sync: bool,
 }
 
 impl Default for Options {
@@ -63,6 +67,7 @@ impl Default for Options {
             mem_table_size: 4 << 20,
             create_if_missing: true,
             read_only: false,
+            wal_sync: true,
         }
     }
 }
@@ -83,6 +88,7 @@ pub struct Db {
     dir: PathBuf,
     cmp: Arc<dyn Comparer>,
     mem_table_size: usize,
+    wal_sync: bool,
     state: Mutex<State>,
     cache: Mutex<HashMap<u64, Arc<Reader>>>,
 }
@@ -141,6 +147,7 @@ impl Db {
                 dir,
                 cmp,
                 mem_table_size: opts.mem_table_size,
+                wal_sync: opts.wal_sync,
                 state: Mutex::new(state),
                 cache: Mutex::new(HashMap::new()),
             });
@@ -157,7 +164,7 @@ impl Db {
         let mut manifest =
             record::Writer::new(File::create(dir.join(filenames::manifest(manifest_num)))?);
         manifest.write_record(&vs.snapshot_edit().encode())?;
-        manifest.flush()?;
+        manifest.sync_all()?;
         update_marker(&dir, &names, &filenames::manifest(manifest_num))?;
 
         let wal = record::Writer::with_log_num(
@@ -178,6 +185,7 @@ impl Db {
             dir,
             cmp,
             mem_table_size: opts.mem_table_size,
+            wal_sync: opts.wal_sync,
             state: Mutex::new(state),
             cache: Mutex::new(HashMap::new()),
         })
@@ -308,7 +316,11 @@ impl Db {
         batch.set_seqnum(base);
         if let Some(wal) = state.wal.as_mut() {
             wal.write_record(batch.as_bytes())?;
-            wal.flush()?;
+            if self.wal_sync {
+                wal.sync_all()?;
+            } else {
+                wal.flush()?;
+            }
         }
         state.mem.apply(&batch)?;
         state.vs.last_sequence = base + u64::from(batch.count()) - 1;
@@ -355,7 +367,7 @@ impl Db {
         state.vs.apply(&edit)?;
         if let Some(mw) = state.manifest.as_mut() {
             mw.write_record(&edit.encode())?;
-            mw.flush()?;
+            mw.sync_all()?;
         }
 
         // Remove logs that predate the new WAL; their data is now in the sstable.
