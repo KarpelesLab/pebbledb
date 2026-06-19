@@ -103,10 +103,14 @@ refined as they are reached.
   read/write-amplification heuristics, elision-only, tombstone-density, L0 sublevels,
   intra-L0), manual compaction, range-key/range-del compaction, deletion pacing, and
   obsolete-file cleanup.
-- [ ] **Phase 25 — Options & durability.** The full `Options` surface (per-level config,
-  `FilterPolicy`, `Merger`, comparer registry, cache, event listeners), WAL fsync / sync
-  modes, OPTIONS file read/write/validation, and format-major-version ratcheting +
-  migrations.
+- [x] **Phase 25 — Options & durability.** An INI-style `OPTIONS-NNNNNN` file
+  (`OptionsFile`, Pebble-compatible layout) written on every read-write open and parsed +
+  validated on reopen (comparer-name mismatch and too-new format are rejected). A
+  `FormatMajorVersion` type with monotonic `Db::ratchet_format_major_version` that
+  persists a new OPTIONS file, surfaced via `Db::format_major_version`. WAL fsync /
+  no-sync modes (`Options::wal_sync`) and the block-cache / open-files / merger / listener
+  options are wired. (Per-level option blocks, a comparer/merger registry for name→impl
+  resolution, and on-disk format *migrations* beyond the version bump remain a follow-up.)
 - [x] **Phase 26 — Ingestion & maintenance.** `Db::checkpoint` writes a self-contained,
   openable copy (flush, copy live sstables, fresh MANIFEST + marker). `Db::ingest` adds
   external sstables — rewritten through the engine's writer at one freshly-assigned

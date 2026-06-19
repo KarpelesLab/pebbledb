@@ -380,6 +380,93 @@ fn ingest_external_sstable() {
 }
 
 #[test]
+fn format_major_version_persists_and_ratchets() {
+    use pebbledb::FormatMajorVersion;
+
+    let dir = temp_dir("fmv");
+    // Create at the most-compatible format.
+    {
+        let db = Db::open(
+            &dir,
+            Options {
+                format_major_version: FormatMajorVersion::MOST_COMPATIBLE,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.format_major_version(),
+            FormatMajorVersion::MOST_COMPATIBLE
+        );
+        db.set(b"k", b"v").unwrap();
+        // Ratchet upward; a lower target is a no-op.
+        db.ratchet_format_major_version(FormatMajorVersion::MOST_COMPATIBLE)
+            .unwrap();
+        db.ratchet_format_major_version(FormatMajorVersion::VALUE_BLOCKS)
+            .unwrap();
+        assert_eq!(db.format_major_version(), FormatMajorVersion::VALUE_BLOCKS);
+    }
+    // The ratcheted version is recovered from the OPTIONS file on reopen, ignoring the
+    // option passed for fresh stores.
+    {
+        let db = Db::open(
+            &dir,
+            Options {
+                format_major_version: FormatMajorVersion::MOST_COMPATIBLE,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.format_major_version(), FormatMajorVersion::VALUE_BLOCKS);
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_rejects_comparer_mismatch() {
+    use pebbledb::{Comparer, DefaultComparer};
+    use std::cmp::Ordering;
+
+    // A comparer that behaves bytewise but reports a different name.
+    struct Renamed(DefaultComparer);
+    impl Comparer for Renamed {
+        fn name(&self) -> &str {
+            "test.RenamedComparator"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+            self.0.compare(a, b)
+        }
+        fn abbreviated_key(&self, key: &[u8]) -> u64 {
+            self.0.abbreviated_key(key)
+        }
+        fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]) {
+            self.0.separator(dst, a, b)
+        }
+        fn successor(&self, dst: &mut Vec<u8>, a: &[u8]) {
+            self.0.successor(dst, a)
+        }
+    }
+
+    let dir = temp_dir("cmp-mismatch");
+    {
+        let db = Db::open(&dir, Options::default()).unwrap(); // default comparer name
+        db.set(b"k", b"v").unwrap();
+    }
+    // Reopening with a differently-named comparer must fail validation.
+    let err = Db::open(
+        &dir,
+        Options {
+            comparer: Arc::new(Renamed(DefaultComparer)),
+            ..Default::default()
+        },
+    );
+    assert!(err.is_err(), "open with mismatched comparer should fail");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

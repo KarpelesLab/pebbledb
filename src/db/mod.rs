@@ -25,9 +25,11 @@ mod compaction;
 mod filenames;
 mod maintenance;
 mod merging_iter;
+mod options_file;
 
 use merging_iter::InternalIter;
 pub use merging_iter::{DbIterator, IterOptions};
+pub use options_file::{FormatMajorVersion, OptionsFile};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +75,9 @@ pub struct Options {
     /// The filesystem the database performs all of its I/O through (default [`DiskFs`]).
     /// Use [`crate::vfs::MemFs`] for fully in-memory operation.
     pub fs: Arc<dyn Fs>,
+    /// The on-disk format major version a newly created store is initialized to (default
+    /// [`FormatMajorVersion::DEFAULT`]). Existing stores keep their recorded version.
+    pub format_major_version: FormatMajorVersion,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -97,6 +102,7 @@ impl Default for Options {
             block_cache_size: 8 << 20,
             max_open_files: 1000,
             fs: Arc::new(DiskFs),
+            format_major_version: FormatMajorVersion::DEFAULT,
         }
     }
 }
@@ -139,6 +145,8 @@ pub struct Db {
     fs: Arc<dyn Fs>,
     /// The held exclusive directory lock (released on drop). `None` when read-only.
     _lock: Option<Box<dyn DirLock>>,
+    /// The store's on-disk format major version.
+    format_major_version: Mutex<FormatMajorVersion>,
 }
 
 impl Db {
@@ -162,6 +170,18 @@ impl Db {
 
         let cmp = opts.comparer.clone();
         let mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
+
+        // Resolve the format major version: an existing OPTIONS file's value (validated
+        // against the configured comparer), or the option for a fresh store.
+        let format_major_version = match filenames::current_options(&names) {
+            Some(name) => {
+                let text = String::from_utf8_lossy(&fs.read(&dir.join(&name))?).into_owned();
+                let of = OptionsFile::decode(&text)?;
+                of.validate(cmp.name())?;
+                of.format_major_version
+            }
+            None => opts.format_major_version,
+        };
 
         let mut vs = match filenames::current_manifest(&names) {
             Some(manifest_name) => {
@@ -212,6 +232,7 @@ impl Db {
                 max_open_files: opts.max_open_files.max(1),
                 fs,
                 _lock: None,
+                format_major_version: Mutex::new(format_major_version),
             });
         }
 
@@ -238,6 +259,20 @@ impl Db {
             fs.create(&dir.join(wal_filename(wal_number)))?,
             wal_number as u32,
         );
+
+        // Record the options for this session in a fresh OPTIONS file.
+        let options_num = vs.allocate_file_number();
+        let options_file = OptionsFile {
+            comparer_name: cmp.name().to_string(),
+            merger_name: opts.merger.as_ref().map(|m| m.name().to_string()),
+            format_major_version,
+        };
+        {
+            let mut of = fs.create(&dir.join(filenames::options(options_num)))?;
+            of.write_all(options_file.encode().as_bytes())?;
+            of.sync_all()?;
+        }
+        fs.sync_dir(&dir)?;
 
         let state = State {
             vs,
@@ -270,7 +305,50 @@ impl Db {
             max_open_files: opts.max_open_files.max(1),
             fs,
             _lock: Some(lock),
+            format_major_version: Mutex::new(format_major_version),
         })
+    }
+
+    /// The store's current on-disk format major version.
+    pub fn format_major_version(&self) -> FormatMajorVersion {
+        *self.format_major_version.lock().unwrap()
+    }
+
+    /// Ratchets the on-disk format major version up to `target`, writing a new OPTIONS
+    /// file. Ratcheting is monotonic: a `target` at or below the current version is a
+    /// no-op, and one newer than this implementation supports is rejected.
+    pub fn ratchet_format_major_version(&self, target: FormatMajorVersion) -> Result<()> {
+        if target > FormatMajorVersion::NEWEST {
+            return Err(Error::InvalidState(format!(
+                "db: format_major_version {} exceeds the newest supported ({})",
+                target.as_u32(),
+                FormatMajorVersion::NEWEST.as_u32()
+            )));
+        }
+        let mut cur = self.format_major_version.lock().unwrap();
+        if target <= *cur {
+            return Ok(());
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.read_only {
+            return Err(Error::InvalidState("db: opened read-only".into()));
+        }
+        let options_num = state.vs.allocate_file_number();
+        let of = OptionsFile {
+            comparer_name: self.cmp.name().to_string(),
+            merger_name: self.merger.as_ref().map(|m| m.name().to_string()),
+            format_major_version: target,
+        };
+        {
+            let mut f = self
+                .fs
+                .create(&self.dir.join(filenames::options(options_num)))?;
+            f.write_all(of.encode().as_bytes())?;
+            f.sync_all()?;
+        }
+        self.fs.sync_dir(&self.dir)?;
+        *cur = target;
+        Ok(())
     }
 
     /// Opens the database in `dir` read-only.

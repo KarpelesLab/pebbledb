@@ -29,6 +29,25 @@ fn parse_manifest_num(name: &str) -> Option<u64> {
     name.strip_prefix("MANIFEST-")?.parse().ok()
 }
 
+/// The filename of the OPTIONS file with the given file number.
+pub fn options(file_num: u64) -> String {
+    format!("OPTIONS-{file_num:06}")
+}
+
+/// The highest-numbered `OPTIONS-*` filename in a directory listing, if any.
+pub fn current_options(names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| {
+            n.strip_prefix("OPTIONS-")?
+                .parse::<u64>()
+                .ok()
+                .map(|num| (num, n.clone()))
+        })
+        .max_by_key(|(num, _)| *num)
+        .map(|(_, n)| n)
+}
+
 /// Parses a `marker.<name>.<iter>.<value>` filename into `(name, iter, value)`.
 fn parse_marker(name: &str) -> Option<(&str, u64, &str)> {
     let rest = name.strip_prefix("marker.")?;

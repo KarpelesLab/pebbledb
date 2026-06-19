@@ -62,5 +62,8 @@ pub mod xxhash;
 pub use base::comparer::{Comparer, DefaultComparer};
 pub use base::merge::{ConcatMerger, Merger};
 pub use batch::Batch;
-pub use db::{Db, DbIterator, EventListener, IterOptions, Metrics, Options, Snapshot};
+pub use db::{
+    Db, DbIterator, EventListener, FormatMajorVersion, IterOptions, Metrics, Options, OptionsFile,
+    Snapshot,
+};
 pub use error::{Error, Result};
