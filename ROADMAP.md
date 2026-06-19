@@ -72,7 +72,7 @@ refined as they are reached.
   records, column families, table-marked-for-compaction, blob-file edits;
   `BulkVersionEdit` accumulation; complete `FileMetadata` (virtual, synthetic
   prefix/suffix, range-key bounds, blob references).
-- [ ] **Phase 18 — Merge operator.** A pluggable `Merger` and full MERGE resolution in
+- [x] **Phase 18 — Merge operator.** A pluggable `Merger` and full MERGE resolution in
   `Get`, iteration, and compaction.
 - [x] **Phase 19 — Snapshots & sequence semantics.** Registered snapshots that hold back
   compaction (retain versions an open snapshot needs), correct SINGLEDEL semantics, and

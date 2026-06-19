@@ -8,6 +8,7 @@
 
 pub mod comparer;
 pub mod internal_key;
+pub mod merge;
 pub mod range_del;
 pub mod range_key;
 pub mod varint;
@@ -17,4 +18,5 @@ pub use internal_key::{
     InternalKey, InternalKeyKind, SEQNUM_BATCH_BIT, SEQNUM_MAX, SEQNUM_START, SEQNUM_ZERO, SeqNum,
     make_trailer, trailer_kind, trailer_seqnum,
 };
+pub use merge::{ConcatMerger, Merger};
 pub use range_del::RangeTombstone;

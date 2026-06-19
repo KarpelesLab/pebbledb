@@ -60,6 +60,9 @@ pub struct Options {
     pub wal_sync: bool,
     /// Optional listener notified of flush and compaction events.
     pub event_listener: Option<Arc<dyn EventListener>>,
+    /// Optional merge operator. Required to read keys written with `merge`; without it,
+    /// a merge resolves to its newest operand.
+    pub merger: Option<Arc<dyn crate::base::merge::Merger>>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -80,6 +83,7 @@ impl Default for Options {
             read_only: false,
             wal_sync: true,
             event_listener: None,
+            merger: None,
         }
     }
 }
@@ -112,6 +116,8 @@ pub struct Db {
     snapshots: Mutex<Vec<SeqNum>>,
     /// Optional event listener.
     listener: Option<Arc<dyn EventListener>>,
+    /// Optional merge operator.
+    merger: Option<Arc<dyn crate::base::merge::Merger>>,
 }
 
 impl Db {
@@ -175,6 +181,7 @@ impl Db {
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
                 listener: opts.event_listener.clone(),
+                merger: opts.merger.clone(),
             });
         }
 
@@ -217,6 +224,7 @@ impl Db {
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
             listener: opts.event_listener.clone(),
+            merger: opts.merger.clone(),
         })
     }
 
@@ -243,6 +251,14 @@ impl Db {
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         let mut b = Batch::new();
         b.delete(key);
+        self.apply(b)
+    }
+
+    /// Records a merge operand for `key`, combined with prior values by the configured
+    /// merge operator at read time.
+    pub fn merge(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut b = Batch::new();
+        b.merge(key, value);
         self.apply(b)
     }
 
@@ -440,9 +456,41 @@ impl Db {
             )
         };
 
-        let mut max_rts = 0u64;
         let cmp = self.cmp.as_ref();
+        let mut max_rts = 0u64;
+        // Merge operands gathered newest-first until a terminator (Set/Delete/range
+        // tombstone) is reached.
+        let mut operands: Vec<Vec<u8>> = Vec::new();
+        let mut base: Option<Vec<u8>> = None;
 
+        // Resolves a source's versions into the running merge state; returns true if a
+        // terminator was reached (no need to consult older sources).
+        let mut resolve_versions =
+            |versions: Vec<(SeqNum, InternalKeyKind, Vec<u8>)>, max_rts: u64| -> Option<bool> {
+                for (seq, kind, value) in versions {
+                    if seq <= max_rts {
+                        base = None;
+                        return Some(true); // shadowed by a range tombstone: acts as delete
+                    }
+                    match kind {
+                        InternalKeyKind::Merge => operands.push(value),
+                        InternalKeyKind::Set | InternalKeyKind::SetWithDelete => {
+                            base = Some(value);
+                            return Some(true);
+                        }
+                        InternalKeyKind::Delete
+                        | InternalKeyKind::SingleDelete
+                        | InternalKeyKind::DeleteSized => {
+                            base = None;
+                            return Some(true);
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            };
+
+        let mut terminated = false;
         // Mutable memtable.
         max_rts = max_rts.max(max_covering_seqnum(
             &mem.range_tombstones(),
@@ -450,37 +498,52 @@ impl Db {
             key,
             snapshot,
         ));
-        if let Some((seq, kind, value)) = mem.lookup(key, snapshot) {
-            return Ok(resolve(seq, kind, value, max_rts));
+        if resolve_versions(mem.lookup_versions(key, snapshot), max_rts).is_some() {
+            terminated = true;
         }
         // Immutable memtables, newest first.
-        for m in imm.iter().rev() {
-            max_rts = max_rts.max(max_covering_seqnum(
-                &m.range_tombstones(),
-                cmp,
-                key,
-                snapshot,
-            ));
-            if let Some((seq, kind, value)) = m.lookup(key, snapshot) {
-                return Ok(resolve(seq, kind, value, max_rts));
-            }
-        }
-        // Sstables: L0 newest-first, then L1..L6.
-        for level in 0..NUM_LEVELS {
-            for f in version.overlapping(cmp, level, key) {
-                let reader = self.open_reader(f.file_num)?;
+        if !terminated {
+            for m in imm.iter().rev() {
                 max_rts = max_rts.max(max_covering_seqnum(
-                    reader.range_tombstones(),
+                    &m.range_tombstones(),
                     cmp,
                     key,
                     snapshot,
                 ));
-                if let Some((seq, kind, value)) = reader.lookup(key, snapshot)? {
-                    return Ok(resolve(seq, kind, value, max_rts));
+                if resolve_versions(m.lookup_versions(key, snapshot), max_rts).is_some() {
+                    terminated = true;
+                    break;
                 }
             }
         }
-        Ok(None)
+        // Sstables: L0 newest-first, then L1..L6.
+        if !terminated {
+            'levels: for level in 0..NUM_LEVELS {
+                for f in version.overlapping(cmp, level, key) {
+                    let reader = self.open_reader(f.file_num)?;
+                    max_rts = max_rts.max(max_covering_seqnum(
+                        reader.range_tombstones(),
+                        cmp,
+                        key,
+                        snapshot,
+                    ));
+                    if resolve_versions(reader.lookup_versions(key, snapshot)?, max_rts).is_some() {
+                        break 'levels;
+                    }
+                }
+            }
+        }
+
+        if operands.is_empty() {
+            // No merge operands: plain point semantics.
+            return Ok(base);
+        }
+        // Apply merge operands (chronological / oldest-first) over the base value.
+        operands.reverse();
+        match &self.merger {
+            Some(m) => Ok(Some(m.full_merge(key, base.as_deref(), &operands))),
+            None => Ok(operands.pop()), // no merger configured: newest operand
+        }
     }
 
     /// Returns a forward iterator over all keys at the latest sequence number.
@@ -514,7 +577,13 @@ impl Db {
                 sources.push(Box::new(reader.iter()?));
             }
         }
-        DbIterator::new(sources, snapshot, self.cmp.clone(), tombstones)
+        DbIterator::new(
+            sources,
+            snapshot,
+            self.cmp.clone(),
+            tombstones,
+            self.merger.clone(),
+        )
     }
 
     /// Opens (or returns a cached) reader for the sstable with the given file number.
@@ -621,21 +690,6 @@ pub struct Metrics {
     pub flush_count: u64,
     /// Number of compactions performed this session.
     pub compaction_count: u64,
-}
-
-/// Resolves a point entry against the maximum covering range-tombstone sequence number:
-/// the entry is visible only if it is newer than every covering tombstone and is not
-/// itself a point tombstone.
-fn resolve(seq: SeqNum, kind: InternalKeyKind, value: Vec<u8>, max_rts: u64) -> Option<Vec<u8>> {
-    if seq <= max_rts {
-        return None; // shadowed by a range tombstone
-    }
-    match kind {
-        InternalKeyKind::Delete | InternalKeyKind::SingleDelete | InternalKeyKind::DeleteSized => {
-            None
-        }
-        _ => Some(value),
-    }
 }
 
 /// The filename of the WAL with the given number.
@@ -1181,6 +1235,45 @@ mod tests {
             counter.compactions.load(Ordering::Relaxed)
         );
         assert!(m.level_bytes.iter().sum::<u64>() > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_operator_resolves_across_levels() {
+        use crate::base::merge::ConcatMerger;
+        let dir = temp_dir();
+        let opts = Options {
+            mem_table_size: 16 * 1024,
+            merger: Some(Arc::new(ConcatMerger)),
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts.clone()).unwrap();
+
+        // Base value then several merge operands.
+        db.set(b"k", b"A").unwrap();
+        db.merge(b"k", b"B").unwrap();
+        db.merge(b"k", b"C").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"ABC".to_vec()));
+
+        // A key with only merges (no base).
+        db.merge(b"only", b"x").unwrap();
+        db.merge(b"only", b"y").unwrap();
+        assert_eq!(db.get(b"only").unwrap(), Some(b"xy".to_vec()));
+
+        // Iteration resolves merges too.
+        let got = collect(&db);
+        assert!(got.contains(&("k".to_string(), "ABC".to_string())));
+        assert!(got.contains(&("only".to_string(), "xy".to_string())));
+
+        // Force flushes + compaction with more operands, then reopen.
+        for i in 0..3000u32 {
+            db.set(format!("f{i:06}").as_bytes(), b"v").unwrap();
+        }
+        db.merge(b"k", b"D").unwrap();
+        db.flush().unwrap();
+        drop(db);
+        let db = Db::open(&dir, opts).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"ABCD".to_vec()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -145,6 +145,10 @@ impl Db {
         let mut builder: Option<OutputBuilder> = None;
         let mut prev_user: Option<Vec<u8>> = None;
         let mut prev_stripe = usize::MAX;
+        // Whether a terminator (Set or a point deletion) has already been written for the
+        // current (user key, stripe). Once one is, older versions in the same stripe are
+        // shadowed and dropped. Merge operands are *not* terminators, so they accumulate.
+        let mut terminated = false;
 
         while merge.valid() {
             let ikey = merge.key().to_vec();
@@ -154,20 +158,29 @@ impl Db {
             let ukey = encoded_user_key(&ikey);
             let seq = encoded_trailer(&ikey) >> 8;
             let stripe = snapshot_stripe(&snapshots, seq);
+            let kind = trailer_kind(encoded_trailer(&ikey));
             let same_user = prev_user
                 .as_deref()
                 .is_some_and(|p| self.cmp.compare(p, ukey) == std::cmp::Ordering::Equal);
-            if same_user && stripe == prev_stripe {
-                continue; // a shadowed version within the same snapshot stripe
+            if !(same_user && stripe == prev_stripe) {
+                terminated = false; // entered a new (user key, stripe)
+            }
+            if terminated {
+                continue; // shadowed by a terminator already written for this stripe
             }
             prev_user = Some(ukey.to_vec());
             prev_stripe = stripe;
 
-            let kind = trailer_kind(encoded_trailer(&ikey));
             // Tombstones may be elided only at the bottom level and only in the top
-            // stripe (no open snapshot can observe them).
+            // stripe (no open snapshot can observe them); doing so also shadows older
+            // versions in this stripe.
             if drop_tombstones && is_tombstone(kind) && stripe == 0 {
+                terminated = true;
                 continue;
+            }
+            // A Set or a (retained) point deletion terminates the stripe; merges do not.
+            if !matches!(kind, InternalKeyKind::Merge) {
+                terminated = true;
             }
 
             if builder.is_none() {

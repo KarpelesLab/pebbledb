@@ -153,6 +153,8 @@ pub struct DbIterator {
     started: bool,
     /// All range tombstones visible at the snapshot, across every source.
     range_tombstones: Vec<RangeTombstone>,
+    /// Optional merge operator used to resolve merge operands.
+    merger: Option<Arc<dyn crate::base::merge::Merger>>,
 }
 
 impl DbIterator {
@@ -161,12 +163,14 @@ impl DbIterator {
         snapshot: SeqNum,
         cmp: Arc<dyn Comparer>,
         range_tombstones: Vec<RangeTombstone>,
+        merger: Option<Arc<dyn crate::base::merge::Merger>>,
     ) -> Result<DbIterator> {
         let merge = MergingIter::new(sources, cmp.clone())?;
         Ok(DbIterator {
             merge,
             snapshot,
             cmp,
+            merger,
             range_tombstones,
             cur_key: Vec::new(),
             cur_value: Vec::new(),
@@ -216,27 +220,7 @@ impl DbIterator {
     fn advance_to_next_user_key(&mut self) -> Result<()> {
         while self.merge.valid() {
             let ukey = encoded_user_key(self.merge.key()).to_vec();
-            let mut chosen: Option<(SeqNum, InternalKeyKind, Vec<u8>)> = None;
-
-            // Versions of the same user key arrive newest-first (trailer descending).
-            while self.merge.valid()
-                && self.cmp.compare(encoded_user_key(self.merge.key()), &ukey)
-                    == std::cmp::Ordering::Equal
-            {
-                if chosen.is_none() {
-                    let trailer = encoded_trailer(self.merge.key());
-                    if trailer_seqnum(trailer) <= self.snapshot {
-                        chosen = Some((
-                            trailer_seqnum(trailer),
-                            trailer_kind(trailer),
-                            self.merge.value().to_vec(),
-                        ));
-                    }
-                }
-                self.merge.advance()?;
-            }
-
-            // A covering range tombstone newer than the chosen point version deletes it.
+            // A range tombstone covering the key terminates merges/values at its seqnum.
             let max_rts = max_covering_seqnum(
                 &self.range_tombstones,
                 self.cmp.as_ref(),
@@ -244,21 +228,58 @@ impl DbIterator {
                 self.snapshot,
             );
 
-            match chosen {
-                Some((seq, _, _)) if seq <= max_rts => continue, // deleted by a range tombstone
-                Some((_, kind, value)) => match kind {
-                    InternalKeyKind::Delete
-                    | InternalKeyKind::SingleDelete
-                    | InternalKeyKind::DeleteSized => continue, // tombstone: skip this key
-                    _ => {
-                        self.cur_key = ukey;
-                        self.cur_value = value;
-                        self.valid = true;
-                        return Ok(());
+            // Gather merge operands (newest first) until a terminator: a Set (base
+            // value), a deletion, or a covering range tombstone.
+            let mut operands: Vec<Vec<u8>> = Vec::new();
+            let mut base: Option<Vec<u8>> = None;
+            let mut decided = false;
+
+            while self.merge.valid()
+                && self.cmp.compare(encoded_user_key(self.merge.key()), &ukey)
+                    == std::cmp::Ordering::Equal
+            {
+                if !decided {
+                    let trailer = encoded_trailer(self.merge.key());
+                    let seq = trailer_seqnum(trailer);
+                    if seq <= self.snapshot {
+                        if seq <= max_rts {
+                            decided = true; // deleted by a range tombstone
+                        } else {
+                            match trailer_kind(trailer) {
+                                InternalKeyKind::Merge => {
+                                    operands.push(self.merge.value().to_vec())
+                                }
+                                InternalKeyKind::Set | InternalKeyKind::SetWithDelete => {
+                                    base = Some(self.merge.value().to_vec());
+                                    decided = true;
+                                }
+                                InternalKeyKind::Delete
+                                | InternalKeyKind::SingleDelete
+                                | InternalKeyKind::DeleteSized => decided = true,
+                                _ => {}
+                            }
+                        }
                     }
-                },
-                None => continue, // no version visible at this snapshot
+                }
+                self.merge.advance()?;
             }
+
+            let value = if operands.is_empty() {
+                match base {
+                    Some(v) => v,
+                    None => continue, // deleted or no visible version
+                }
+            } else {
+                operands.reverse(); // chronological (oldest first)
+                match &self.merger {
+                    Some(m) => m.full_merge(&ukey, base.as_deref(), &operands),
+                    None => operands.pop().unwrap(), // no merger: newest operand
+                }
+            };
+            self.cur_key = ukey;
+            self.cur_value = value;
+            self.valid = true;
+            return Ok(());
         }
         self.valid = false;
         Ok(())

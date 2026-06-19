@@ -468,6 +468,26 @@ impl MemTable {
         Ok(())
     }
 
+    /// Returns every version of `user_key` visible at `snapshot`, newest first. Used to
+    /// resolve merge operands.
+    pub fn lookup_versions(
+        &self,
+        user_key: &[u8],
+        snapshot: SeqNum,
+    ) -> Vec<(SeqNum, InternalKeyKind, Vec<u8>)> {
+        let trailer = (snapshot << 8) | 0xff;
+        let mut it = self.skl.iter();
+        it.seek_ge(user_key, trailer);
+        let mut out = Vec::new();
+        while it.valid()
+            && self.skl.cmp.compare(it.user_key(), user_key) == std::cmp::Ordering::Equal
+        {
+            out.push((it.trailer() >> 8, it.kind(), it.value().to_vec()));
+            it.next();
+        }
+        out
+    }
+
     /// Returns a copy of the memtable's range tombstones.
     pub fn range_tombstones(&self) -> Vec<RangeTombstone> {
         self.range_dels.lock().unwrap().clone()

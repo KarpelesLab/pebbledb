@@ -487,6 +487,61 @@ impl Reader {
         Ok(Some((trailer >> 8, kind, self.resolve_value(it.value())?)))
     }
 
+    /// Returns every version of `user_key` visible at `snapshot`, newest first, used to
+    /// resolve merge operands. (Bounded to the data block containing the key; keys with
+    /// versions spanning a block boundary are handled by continuing into the next block.)
+    pub fn lookup_versions(
+        &self,
+        user_key: &[u8],
+        snapshot: SeqNum,
+    ) -> Result<Vec<(SeqNum, InternalKeyKind, Vec<u8>)>> {
+        let mut out = Vec::new();
+        if let Some(filter) = &self.filter
+            && !filter::may_contain(filter, user_key)
+        {
+            return Ok(out);
+        }
+        let mut lookup = user_key.to_vec();
+        lookup.extend_from_slice(&(((snapshot << 8) | 0xff).to_le_bytes()));
+
+        // Walk forward across data blocks while the user key matches.
+        let handles = self.data_block_handles()?;
+        // Find the first data block that may contain the key, then iterate from there.
+        let start = match self.seek_data_handle(&lookup)? {
+            Some(h) => handles.iter().position(|x| *x == h).unwrap_or(0),
+            None => return Ok(out),
+        };
+        let mut first = true;
+        for &handle in &handles[start..] {
+            let data = self.read_data_block(handle)?;
+            let mut it = BlockIter::new(data)?;
+            if first {
+                it.seek_ge(&lookup, self.cmp.as_ref());
+                first = false;
+            } else {
+                it.first();
+            }
+            while it.valid() {
+                match self.cmp.compare(encoded_user_key(it.key()), user_key) {
+                    std::cmp::Ordering::Less => {
+                        it.next();
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => return Ok(out),
+                    std::cmp::Ordering::Equal => {}
+                }
+                let trailer = crate::base::internal_key::encoded_trailer(it.key());
+                out.push((
+                    trailer >> 8,
+                    trailer_kind(trailer),
+                    self.resolve_value(it.value())?,
+                ));
+                it.next();
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns an iterator over every entry in the table, in internal-key order.
     ///
     /// The iterator holds a shared reference to the reader, so it can outlive the
