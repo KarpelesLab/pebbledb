@@ -15,6 +15,29 @@
 //! This crate is under active, bottom-up development; see the `ROADMAP.md` file in the
 //! repository for the current status. The public API is not yet stable.
 //!
+//! ## Example
+//!
+//! ```
+//! use pebbledb::{Db, Options};
+//!
+//! # let dir = std::env::temp_dir().join("pebbledb-doc-example");
+//! # let _ = std::fs::remove_dir_all(&dir);
+//! let db = Db::open(&dir, Options::default())?;
+//! db.set(b"hello", b"world")?;
+//! assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
+//!
+//! // A snapshot reads a consistent view even as later writes land.
+//! let snap = db.snapshot();
+//! db.set(b"hello", b"again")?;
+//! assert_eq!(snap.get(b"hello")?, Some(b"world".to_vec()));
+//! assert_eq!(db.get(b"hello")?, Some(b"again".to_vec()));
+//!
+//! db.delete(b"hello")?;
+//! assert_eq!(db.get(b"hello")?, None);
+//! # std::fs::remove_dir_all(&dir).ok();
+//! # Ok::<(), pebbledb::Error>(())
+//! ```
+//!
 //! ## Attribution
 //!
 //! This is a derivative work of Pebble (and, transitively, LevelDB-Go / RocksDB /
@@ -33,4 +56,7 @@ pub mod memtable;
 pub mod record;
 pub mod sstable;
 
+pub use base::comparer::{Comparer, DefaultComparer};
+pub use batch::Batch;
+pub use db::{Db, DbIterator, Metrics, Options, Snapshot};
 pub use error::{Error, Result};

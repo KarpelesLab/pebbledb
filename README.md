@@ -4,9 +4,37 @@ A Rust port of [CockroachDB's Pebble](https://github.com/cockroachdb/pebble) —
 LSM (log-structured merge-tree) key-value storage engine in the LevelDB / RocksDB
 lineage.
 
-> **Status: early development.** The crate is being built bottom-up, layer by layer.
-> See [`ROADMAP.md`](ROADMAP.md) for what is implemented and what is planned. The
-> public API is **not** yet stable.
+> **Status: functional, pre-1.0.** All roadmap phases are implemented: the engine
+> opens/creates a store, supports `set`/`delete`/batch writes through a write-ahead log,
+> flushes memtables to sstables, performs leveled compaction, reads via point lookups and
+> snapshot-consistent iterators, and recovers on reopen. The on-disk formats (sstable,
+> record log, MANIFEST) are reproduced for binary compatibility. Several advanced areas
+> are intentionally scoped out for now — two-level sstable indexes, value blocks
+> (Pebblev3+), the columnar format (Pebblev5+), xxHash checksums, range keys, virtual
+> sstables, background/concurrent compaction, and `fsync`-level durability. See
+> [`ROADMAP.md`](ROADMAP.md) for details. The public API is **not** yet stable.
+
+## Usage
+
+```rust
+use pebbledb::{Db, Options};
+
+let db = Db::open("/path/to/db", Options::default())?;
+db.set(b"hello", b"world")?;
+assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
+
+let snap = db.snapshot();              // consistent read view
+db.set(b"hello", b"again")?;
+assert_eq!(snap.get(b"hello")?, Some(b"world".to_vec()));
+
+let mut it = db.iter()?;               // ordered forward iteration
+it.first()?;
+while it.valid() {
+    println!("{:?} => {:?}", it.key(), it.value());
+    it.next()?;
+}
+# Ok::<(), pebbledb::Error>(())
+```
 
 ## Goals
 

@@ -39,9 +39,26 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
   flush of a memtable to an L0 sstable, and crash recovery from the WAL.
 - [x] **Phase 10 — Compaction.** Compaction picker, L0→Lbase and leveled compaction,
   obsolete-file deletion, basic read/write-amplification accounting.
-- [ ] **Phase 11 — Hardening.** Block and table caches, the full `Options` surface,
-  metrics, a concurrency review, fuzzing, bidirectional interop tests against Go Pebble,
-  and documentation.
+- [x] **Phase 11 — Hardening.** Top-level re-exports and a doctested crate example,
+  `Snapshot` for consistent reads, `Metrics`/`level_file_counts`, a `LOCK` file, an
+  end-to-end integration test suite, and README/API docs. (A lazy table-reader cache is
+  in place; a block cache, true OS file locking, fuzzing, and bidirectional Go-Pebble
+  interop fixtures remain future work — the latter needs the Go tooling we agreed to
+  discuss before adding.)
+
+## Known limitations / future work
+
+Intentionally out of scope for the current pass, tracked for later:
+
+- sstable two-level indexes, value blocks (Pebblev3+), the columnar format (Pebblev5+),
+  and xxHash block checksums (CRC32C is fully supported).
+- Range keys / range deletions in the read/write/compaction paths; `NewFile5` and
+  virtual/backing tables in the MANIFEST.
+- Background and concurrent compaction (it currently runs inline after a flush) and a
+  smarter compaction picker.
+- `fsync`-level durability for the WAL and MANIFEST (writes are currently buffered).
+- A block cache, true OS-level directory locking, fuzzing, and bidirectional interop
+  tests against Go Pebble using checked-in fixtures.
 
 ## Format references
 

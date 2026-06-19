@@ -144,7 +144,10 @@ impl Db {
             });
         }
 
-        // Read-write: rotate in a fresh MANIFEST and WAL for this session.
+        // Read-write: create the LOCK file Pebble expects (advisory only for now; true
+        // OS-level locking to prevent concurrent opens is future work), then rotate in a
+        // fresh MANIFEST and WAL for this session.
+        let _ = File::create(dir.join("LOCK"));
         let manifest_num = vs.allocate_file_number();
         let wal_number = vs.allocate_file_number();
         vs.log_number = wal_number;
@@ -202,6 +205,11 @@ impl Db {
         let mut b = Batch::new();
         b.delete(key);
         self.apply(b)
+    }
+
+    /// Atomically applies all operations in `batch`. Alias for [`Db::apply`].
+    pub fn write(&self, batch: Batch) -> Result<()> {
+        self.apply(batch)
     }
 
     /// Atomically applies all operations in `batch`.
@@ -380,6 +388,62 @@ impl Db {
         let state = self.state.lock().unwrap();
         std::array::from_fn(|i| state.vs.current.levels[i].len())
     }
+
+    /// Returns a point-in-time [`Metrics`] snapshot of the LSM tree.
+    pub fn metrics(&self) -> Metrics {
+        let state = self.state.lock().unwrap();
+        let level_files = std::array::from_fn(|i| state.vs.current.levels[i].len());
+        let level_bytes =
+            std::array::from_fn(|i| state.vs.current.levels[i].iter().map(|f| f.size).sum());
+        Metrics {
+            level_files,
+            level_bytes,
+            last_sequence: state.vs.last_sequence,
+        }
+    }
+
+    /// Captures a read snapshot at the current sequence number. Reads through the
+    /// returned [`Snapshot`] see a consistent view even as later writes are applied.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        Snapshot {
+            db: self,
+            seqnum: self.last_sequence(),
+        }
+    }
+}
+
+/// A consistent read view of the database at a fixed sequence number.
+pub struct Snapshot<'a> {
+    db: &'a Db,
+    seqnum: SeqNum,
+}
+
+impl Snapshot<'_> {
+    /// The sequence number this snapshot reads at.
+    pub fn sequence_number(&self) -> SeqNum {
+        self.seqnum
+    }
+
+    /// Looks up `key` as of the snapshot.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db.get_at(key, self.seqnum)
+    }
+
+    /// Returns a forward iterator over the snapshot's view.
+    pub fn iter(&self) -> Result<DbIterator> {
+        self.db.iter_at(self.seqnum)
+    }
+}
+
+/// A point-in-time summary of the LSM tree's shape.
+#[derive(Clone, Debug)]
+pub struct Metrics {
+    /// Number of sstables at each level (`[0]` is L0).
+    pub level_files: [usize; NUM_LEVELS],
+    /// Total sstable bytes at each level.
+    pub level_bytes: [u64; NUM_LEVELS],
+    /// The largest sequence number assigned so far.
+    pub last_sequence: SeqNum,
 }
 
 /// Maps a `(kind, value)` lookup result to a user-visible value, treating tombstones as
