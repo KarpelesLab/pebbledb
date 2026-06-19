@@ -55,6 +55,7 @@ pub mod manifest;
 pub mod memtable;
 pub mod record;
 pub mod sstable;
+pub mod xxhash;
 
 pub use base::comparer::{Comparer, DefaultComparer};
 pub use batch::Batch;

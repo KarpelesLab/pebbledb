@@ -281,8 +281,14 @@ fn write_block(
     let checksum = match opts.checksum {
         ChecksumType::Crc32c => mask(Crc32c::new().update(&body).update(&[type_byte]).finish()),
         ChecksumType::None => 0,
-        ChecksumType::XxHash | ChecksumType::XxHash64 => {
-            return Err(Error::Unsupported("sstable: xxhash block checksum"));
+        ChecksumType::XxHash64 => {
+            let mut h = crate::xxhash::XxHash64::new();
+            h.update(&body);
+            h.update(&[type_byte]);
+            h.finish() as u32
+        }
+        ChecksumType::XxHash => {
+            return Err(Error::Unsupported("sstable: xxhash32 block checksum"));
         }
     };
     w.write_all(&checksum.to_le_bytes())?;
@@ -465,6 +471,37 @@ mod tests {
     #[test]
     fn roundtrip_rocksdb_format() {
         roundtrip_with(CompressionType::Snappy, 512, TableFormat::RocksDBv2);
+    }
+
+    #[test]
+    fn roundtrip_xxhash64_checksum() {
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
+            .map(|i| {
+                (
+                    ikey(
+                        format!("k{i:04}").as_bytes(),
+                        i as u64 + 1,
+                        InternalKeyKind::Set,
+                    ),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let opts = WriterOptions {
+            block_size: 256,
+            checksum: ChecksumType::XxHash64,
+            ..Default::default()
+        };
+        let file = build(&entries, opts);
+        let reader = Arc::new(Reader::open(file, cmp).unwrap());
+        assert_eq!(reader.checksum_type(), ChecksumType::XxHash64);
+        for i in 0..200u32 {
+            assert_eq!(
+                reader.get(format!("k{i:04}").as_bytes(), 10_000).unwrap(),
+                Some((InternalKeyKind::Set, format!("v{i}").into_bytes()))
+            );
+        }
     }
 
     #[test]

@@ -149,8 +149,16 @@ pub fn read_block(file: &[u8], handle: BlockHandle, checksum: ChecksumType) -> R
                 return Err(Error::corruption("sstable: block checksum mismatch"));
             }
         }
-        ChecksumType::XxHash | ChecksumType::XxHash64 => {
-            return Err(Error::Unsupported("sstable: xxhash block checksum"));
+        ChecksumType::XxHash64 => {
+            let mut h = crate::xxhash::XxHash64::new();
+            h.update(raw);
+            h.update(&[type_byte]);
+            if h.finish() as u32 != stored {
+                return Err(Error::corruption("sstable: block checksum mismatch"));
+            }
+        }
+        ChecksumType::XxHash => {
+            return Err(Error::Unsupported("sstable: xxhash32 block checksum"));
         }
     }
 
