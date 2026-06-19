@@ -35,7 +35,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started.
 - [x] **Phase 8 — DB read path.** Open an existing Pebble DB read-only; merging iterator
   across memtables and levels with range-tombstone / range-key handling; `Get`;
   snapshots. Interop: read a Go-written DB.
-- [ ] **Phase 9 — DB write path.** WAL append with group commit, memtable rotation,
+- [x] **Phase 9 — DB write path.** WAL append with group commit, memtable rotation,
   flush of a memtable to an L0 sstable, and crash recovery from the WAL.
 - [ ] **Phase 10 — Compaction.** Compaction picker, L0→Lbase and leveled compaction,
   obsolete-file deletion, basic read/write-amplification accounting.

@@ -480,6 +480,67 @@ impl MemTable {
     pub fn iter(&self) -> SklIterator<'_> {
         self.skl.iter()
     }
+
+    /// Returns a forward iterator that owns a shared reference to the memtable, so it can
+    /// be stored alongside sstable iterators in a merging iterator. It yields *encoded*
+    /// internal keys (user key followed by the little-endian trailer).
+    pub fn scan(self: &Arc<Self>) -> OwnedMemIter {
+        let nd = self.skl.head;
+        OwnedMemIter {
+            mem: Arc::clone(self),
+            nd,
+            key_buf: Vec::new(),
+        }
+    }
+}
+
+/// A forward iterator over a [`MemTable`] that owns an `Arc` to it and produces encoded
+/// internal keys.
+pub struct OwnedMemIter {
+    mem: Arc<MemTable>,
+    nd: u32,
+    key_buf: Vec<u8>,
+}
+
+impl OwnedMemIter {
+    fn rebuild_key(&mut self) {
+        if self.valid() {
+            let arena = &self.mem.skl.arena;
+            self.key_buf.clear();
+            self.key_buf.extend_from_slice(key_bytes(arena, self.nd));
+            self.key_buf
+                .extend_from_slice(&node_trailer(arena, self.nd).to_le_bytes());
+        }
+    }
+
+    /// Positions at the first entry.
+    pub fn first(&mut self) {
+        self.nd = next_off(&self.mem.skl.arena, self.mem.skl.head, 0);
+        self.rebuild_key();
+    }
+
+    /// Whether the iterator is at a valid entry.
+    pub fn valid(&self) -> bool {
+        self.nd != self.mem.skl.head && self.nd != self.mem.skl.tail
+    }
+
+    /// The current encoded internal key.
+    pub fn key(&self) -> &[u8] {
+        &self.key_buf
+    }
+
+    /// The current value.
+    pub fn value(&self) -> &[u8] {
+        value_bytes(&self.mem.skl.arena, self.nd)
+    }
+
+    /// Advances to the next entry.
+    pub fn next(&mut self) {
+        if self.nd != self.mem.skl.tail {
+            self.nd = next_off(&self.mem.skl.arena, self.nd, 0);
+        }
+        self.rebuild_key();
+    }
 }
 
 #[cfg(test)]

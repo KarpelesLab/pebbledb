@@ -20,18 +20,67 @@ use crate::base::internal_key::{
     InternalKeyKind, SeqNum, compare_encoded, encoded_trailer, encoded_user_key, trailer_kind,
     trailer_seqnum,
 };
+use crate::memtable::OwnedMemIter;
 use crate::sstable::TableIter;
 
-/// Interleaves several table iterators, exposing the globally smallest internal key.
+/// A forward iterator over a sorted stream of encoded internal keys. Implemented by both
+/// sstable and memtable iterators so a [`MergingIter`] can interleave them.
+pub(crate) trait InternalIter {
+    fn first(&mut self) -> Result<()>;
+    fn valid(&self) -> bool;
+    fn key(&self) -> &[u8];
+    fn value(&self) -> &[u8];
+    fn advance(&mut self) -> Result<()>;
+}
+
+impl InternalIter for TableIter {
+    fn first(&mut self) -> Result<()> {
+        TableIter::first(self).map(|_| ())
+    }
+    fn valid(&self) -> bool {
+        TableIter::valid(self)
+    }
+    fn key(&self) -> &[u8] {
+        TableIter::key(self)
+    }
+    fn value(&self) -> &[u8] {
+        TableIter::value(self)
+    }
+    fn advance(&mut self) -> Result<()> {
+        TableIter::next(self).map(|_| ())
+    }
+}
+
+impl InternalIter for OwnedMemIter {
+    fn first(&mut self) -> Result<()> {
+        OwnedMemIter::first(self);
+        Ok(())
+    }
+    fn valid(&self) -> bool {
+        OwnedMemIter::valid(self)
+    }
+    fn key(&self) -> &[u8] {
+        OwnedMemIter::key(self)
+    }
+    fn value(&self) -> &[u8] {
+        OwnedMemIter::value(self)
+    }
+    fn advance(&mut self) -> Result<()> {
+        OwnedMemIter::next(self);
+        Ok(())
+    }
+}
+
+/// Interleaves several internal iterators, exposing the globally smallest internal key.
 struct MergingIter {
-    sources: Vec<TableIter>,
+    sources: Vec<Box<dyn InternalIter>>,
     cmp: Arc<dyn Comparer>,
     /// Index of the source holding the current smallest key, if any.
     cur: Option<usize>,
 }
 
 impl MergingIter {
-    fn new(mut sources: Vec<TableIter>, cmp: Arc<dyn Comparer>) -> Result<MergingIter> {
+    fn new(mut sources: Vec<Box<dyn InternalIter>>, cmp: Arc<dyn Comparer>) -> Result<MergingIter> {
         for s in &mut sources {
             s.first()?;
         }
@@ -80,7 +129,7 @@ impl MergingIter {
     /// Advances past the current smallest key.
     fn advance(&mut self) -> Result<()> {
         let i = self.cur.expect("valid");
-        self.sources[i].next()?;
+        self.sources[i].advance()?;
         self.refresh_min();
         Ok(())
     }
@@ -99,7 +148,7 @@ pub struct DbIterator {
 
 impl DbIterator {
     pub(crate) fn new(
-        sources: Vec<TableIter>,
+        sources: Vec<Box<dyn InternalIter>>,
         snapshot: SeqNum,
         cmp: Arc<dyn Comparer>,
     ) -> Result<DbIterator> {
