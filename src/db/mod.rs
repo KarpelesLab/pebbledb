@@ -1212,6 +1212,33 @@ pub struct Metrics {
     pub block_cache_misses: u64,
 }
 
+/// Creates an iterator over a set of sstables **without** ingesting them into a database,
+/// merging their entries into one sorted view (Pebble's `NewExternalIter`). The files are
+/// read through `opts.fs` with `opts.comparer`; `merge` keys resolve via `opts.merger`.
+///
+/// The newest version of each user key wins (files later in `paths` are treated as newer),
+/// and each file's range tombstones are applied. Useful for reading or validating
+/// externally-produced sstables before deciding whether to ingest them.
+pub fn new_external_iter(opts: &Options, paths: &[impl AsRef<Path>]) -> Result<DbIterator> {
+    let cmp = opts.comparer.clone();
+    let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
+    let mut tombstones = Vec::new();
+    for path in paths {
+        let bytes = opts.fs.read(path.as_ref())?;
+        let reader = Arc::new(Reader::open(bytes, cmp.clone())?);
+        tombstones.extend_from_slice(reader.range_tombstones());
+        sources.push(Box::new(reader.iter()?));
+    }
+    DbIterator::with_options(
+        sources,
+        SeqNum::MAX,
+        cmp,
+        tombstones,
+        opts.merger.clone(),
+        IterOptions::default(),
+    )
+}
+
 /// Maps a key to a fraction in `[0, 1]` using its leading bytes as a big-endian fixed
 /// point, for coarse range-overlap estimation.
 fn key_fraction(k: &[u8]) -> f64 {

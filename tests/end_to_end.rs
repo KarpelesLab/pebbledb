@@ -873,6 +873,56 @@ fn indexed_batch_merges_over_committed_value() {
 }
 
 #[test]
+fn external_iter_merges_sstables_without_ingesting() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::new_external_iter;
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("external-iter");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cmp = Arc::new(pebbledb::DefaultComparer);
+
+    // Two sstables with interleaved and overlapping keys; the second (later in the list)
+    // is treated as newer, so its value for "b" wins.
+    let make = |path: &std::path::Path, kvs: &[(&str, &str)], seq: u64| {
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = Writer::new(f, cmp.clone(), WriterOptions::default());
+        for (k, v) in kvs {
+            let ik = InternalKey::new(k.as_bytes().to_vec(), seq, InternalKeyKind::Set).encode();
+            w.add(&ik, v.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    };
+    let f1 = dir.join("a.sst");
+    let f2 = dir.join("b.sst");
+    make(&f1, &[("a", "1"), ("b", "old"), ("d", "4")], 10);
+    make(&f2, &[("b", "new"), ("c", "3")], 20);
+
+    let opts = Options::default();
+    let mut it = new_external_iter(&opts, &[f1, f2]).unwrap();
+    it.first().unwrap();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push((
+            String::from_utf8_lossy(it.key()).into_owned(),
+            String::from_utf8_lossy(it.value()).into_owned(),
+        ));
+        it.next().unwrap();
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("a".into(), "1".into()),
+            ("b".into(), "new".into()), // newer file wins
+            ("c".into(), "3".into()),
+            ("d".into(), "4".into()),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

@@ -64,6 +64,6 @@ pub use base::merge::{ConcatMerger, Merger};
 pub use batch::Batch;
 pub use db::{
     ArchiveCleaner, Cleaner, Db, DbIterator, DeleteCleaner, EventListener, FormatMajorVersion,
-    IndexedBatch, IterOptions, Logger, Metrics, Options, OptionsFile, Snapshot,
+    IndexedBatch, IterOptions, Logger, Metrics, Options, OptionsFile, Snapshot, new_external_iter,
 };
 pub use error::{Error, Result};
