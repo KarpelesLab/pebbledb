@@ -25,6 +25,7 @@
 //! the columnar format (Pebblev5+), and xxHash checksums are not yet supported.
 
 pub mod block;
+pub mod filter;
 pub mod properties;
 pub mod writer;
 
@@ -155,17 +156,20 @@ fn parse_footer(file: &[u8]) -> Result<Footer> {
     Err(Error::corruption("sstable: bad magic number"))
 }
 
-/// Reads the metaindex, locates the properties block, and decodes it. Returns the
-/// default (empty) properties if the table has no properties block.
-fn read_properties(file: &[u8], footer: &Footer) -> Result<Properties> {
+/// Reads the metaindex and returns the decoded properties and the table's bloom filter
+/// block (if any), looking up the `rocksdb.properties` and `fullfilter.*` entries.
+fn read_metaindex(file: &[u8], footer: &Footer) -> Result<(Properties, Option<Arc<[u8]>>)> {
     let metaindex = read_block(file, footer.metaindex, footer.checksum)?;
     let mut it = BlockIter::new(metaindex)?;
     it.first();
     let mut props_handle = None;
+    let mut filter_handle = None;
     while it.valid() {
-        if it.key() == properties::META_PROPERTIES_NAME.as_bytes() {
+        let key = it.key();
+        if key == properties::META_PROPERTIES_NAME.as_bytes() {
             props_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
-            break;
+        } else if key.starts_with(b"fullfilter.") {
+            filter_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         }
         it.next();
     }
@@ -180,7 +184,12 @@ fn read_properties(file: &[u8], footer: &Footer) -> Result<Properties> {
             pit.next();
         }
     }
-    Ok(props)
+
+    let filter = match filter_handle {
+        Some(handle) => Some(read_block(file, handle, footer.checksum)?),
+        None => None,
+    };
+    Ok((props, filter))
 }
 
 /// A reader over an in-memory sstable.
@@ -192,6 +201,8 @@ pub struct Reader {
     index: Arc<[u8]>,
     /// The table's properties, parsed from the metaindex (default if absent).
     props: Properties,
+    /// The table's bloom filter block, if present.
+    filter: Option<Arc<[u8]>>,
 }
 
 impl Reader {
@@ -204,7 +215,7 @@ impl Reader {
                 "sstable: value blocks (Pebblev3+) not yet supported",
             ));
         }
-        let props = read_properties(&file, &footer)?;
+        let (props, filter) = read_metaindex(&file, &footer)?;
         let index = read_block(&file, footer.index, footer.checksum)?;
         Ok(Reader {
             file,
@@ -212,6 +223,7 @@ impl Reader {
             footer,
             index,
             props,
+            filter,
         })
     }
 
@@ -250,6 +262,13 @@ impl Reader {
         user_key: &[u8],
         snapshot: SeqNum,
     ) -> Result<Option<(InternalKeyKind, Vec<u8>)>> {
+        // The bloom filter can rule the key out without touching any data block.
+        if let Some(filter) = &self.filter
+            && !filter::may_contain(filter, user_key)
+        {
+            return Ok(None);
+        }
+
         // The lookup internal key sorts just before any real entry at `snapshot`.
         let mut lookup = user_key.to_vec();
         lookup.extend_from_slice(&(((snapshot << 8) | 0xff).to_le_bytes()));

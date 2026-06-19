@@ -59,6 +59,8 @@ pub struct WriterOptions {
     pub checksum: ChecksumType,
     /// The table format to emit (default `Pebble(2)`).
     pub table_format: TableFormat,
+    /// Bloom filter bits-per-key, or `None` to omit the filter (default `Some(10)`).
+    pub filter_policy: Option<u32>,
 }
 
 impl Default for WriterOptions {
@@ -69,6 +71,7 @@ impl Default for WriterOptions {
             compression: CompressionType::Snappy,
             checksum: ChecksumType::Crc32c,
             table_format: TableFormat::Pebble(2),
+            filter_policy: Some(10),
         }
     }
 }
@@ -171,6 +174,7 @@ pub struct Writer<W: Write> {
     raw_value_size: u64,
     data_size: u64,
     num_data_blocks: u64,
+    filter: Option<super::filter::FilterWriter>,
     finished: bool,
 }
 
@@ -178,6 +182,7 @@ impl<W: Write> Writer<W> {
     /// Creates a writer over `w` using `opts` and the user-key comparer `cmp`.
     pub fn new(w: W, cmp: Arc<dyn Comparer>, opts: WriterOptions) -> Writer<W> {
         let ri = opts.block_restart_interval;
+        let filter = opts.filter_policy.map(super::filter::FilterWriter::new);
         Writer {
             w,
             opts,
@@ -193,6 +198,7 @@ impl<W: Write> Writer<W> {
             raw_value_size: 0,
             data_size: 0,
             num_data_blocks: 0,
+            filter,
             finished: false,
         }
     }
@@ -228,6 +234,9 @@ impl<W: Write> Writer<W> {
             self.num_range_deletions += 1;
             self.num_deletions += 1;
         }
+        if let Some(fw) = self.filter.as_mut() {
+            fw.add_key(crate::base::internal_key::encoded_user_key(internal_key));
+        }
 
         if self.data_block.size_estimate() >= self.opts.block_size {
             self.flush_data_block()?;
@@ -244,7 +253,13 @@ impl<W: Write> Writer<W> {
         }
         let handle = {
             let raw = self.data_block.finish();
-            write_block(&mut self.w, &mut self.offset, raw, &self.opts)?
+            write_block(
+                &mut self.w,
+                &mut self.offset,
+                raw,
+                self.opts.compression,
+                self.opts.checksum,
+            )?
         };
         self.data_block.reset();
         self.data_size += handle.length;
@@ -264,13 +279,39 @@ impl<W: Write> Writer<W> {
     pub fn finish(mut self) -> Result<W> {
         self.flush_data_block()?;
 
-        // Index block (single-level).
+        // Filter block (uncompressed), if a filter policy is configured and any keys
+        // were added. Recorded in the metaindex under "fullfilter.<policy name>".
+        let mut meta_entries: Vec<(String, BlockHandle)> = Vec::new();
+        let mut filter_size = 0u64;
+        let mut filter_policy_name = String::new();
+        if let Some(fw) = self.filter.as_ref()
+            && let Some(filter_bytes) = fw.finish()
+        {
+            filter_policy_name = fw.policy_name();
+            filter_size = filter_bytes.len() as u64;
+            let handle = write_block(
+                &mut self.w,
+                &mut self.offset,
+                &filter_bytes,
+                CompressionType::None,
+                self.opts.checksum,
+            )?;
+            meta_entries.push((super::filter::metaindex_key(&filter_policy_name), handle));
+        }
+
+        // Index block (single-level), compressed like data blocks.
         let index_handle = {
             let raw = self.index_block.finish();
-            write_block(&mut self.w, &mut self.offset, raw, &self.opts)?
+            write_block(
+                &mut self.w,
+                &mut self.offset,
+                raw,
+                self.opts.compression,
+                self.opts.checksum,
+            )?
         };
 
-        // Properties block, referenced from the metaindex.
+        // Properties block (uncompressed meta block), referenced from the metaindex.
         let props = Properties {
             num_entries: self.num_entries,
             raw_key_size: self.raw_key_size,
@@ -281,10 +322,12 @@ impl<W: Write> Writer<W> {
             data_size: self.data_size,
             index_size: index_handle.length,
             index_type: BINARY_SEARCH_INDEX,
+            filter_size,
             comparer_name: self.cmp.name().to_string(),
             merger_name: "nullptr".to_string(),
             property_collectors: "[]".to_string(),
             compression_name: compression_name(self.opts.compression).to_string(),
+            filter_policy: filter_policy_name,
             ..Default::default()
         };
         let props_handle = {
@@ -293,16 +336,32 @@ impl<W: Write> Writer<W> {
             for (name, value) in props.encode() {
                 pb.add(name.as_bytes(), &value);
             }
-            write_block(&mut self.w, &mut self.offset, pb.finish(), &self.opts)?
+            write_block(
+                &mut self.w,
+                &mut self.offset,
+                pb.finish(),
+                CompressionType::None,
+                self.opts.checksum,
+            )?
         };
+        meta_entries.push((META_PROPERTIES_NAME.to_string(), props_handle));
 
-        // Metaindex block: meta-block name -> handle, sorted by name.
+        // Metaindex block (uncompressed): meta-block name -> handle, sorted by name.
+        meta_entries.sort_by(|a, b| a.0.cmp(&b.0));
         let metaindex_handle = {
             let mut mi = BlockBuilder::new(1);
-            let mut handle_enc = Vec::new();
-            props_handle.encode_to(&mut handle_enc);
-            mi.add(META_PROPERTIES_NAME.as_bytes(), &handle_enc);
-            write_block(&mut self.w, &mut self.offset, mi.finish(), &self.opts)?
+            for (name, handle) in &meta_entries {
+                let mut handle_enc = Vec::new();
+                handle.encode_to(&mut handle_enc);
+                mi.add(name.as_bytes(), &handle_enc);
+            }
+            write_block(
+                &mut self.w,
+                &mut self.offset,
+                mi.finish(),
+                CompressionType::None,
+                self.opts.checksum,
+            )?
         };
 
         let footer = encode_footer(
@@ -329,15 +388,17 @@ impl<W: Write> Writer<W> {
     }
 }
 
-/// Compresses `raw`, appends the trailer (compression byte + checksum), writes the whole
-/// block to `w`, advances `*offset`, and returns the block's handle.
+/// Compresses `raw` with `compression`, appends the trailer (compression byte +
+/// `checksum`), writes the whole block to `w`, advances `*offset`, and returns the
+/// block's handle.
 fn write_block(
     w: &mut impl Write,
     offset: &mut u64,
     raw: &[u8],
-    opts: &WriterOptions,
+    compression: CompressionType,
+    checksum: ChecksumType,
 ) -> Result<BlockHandle> {
-    let (type_byte, body) = compress(raw, opts.compression)?;
+    let (type_byte, body) = compress(raw, compression)?;
 
     let handle = BlockHandle {
         offset: *offset,
@@ -346,7 +407,7 @@ fn write_block(
     w.write_all(&body)?;
     w.write_all(&[type_byte])?;
 
-    let checksum = match opts.checksum {
+    let sum = match checksum {
         ChecksumType::Crc32c => mask(Crc32c::new().update(&body).update(&[type_byte]).finish()),
         ChecksumType::None => 0,
         ChecksumType::XxHash64 => {
@@ -359,7 +420,7 @@ fn write_block(
             return Err(Error::Unsupported("sstable: xxhash32 block checksum"));
         }
     };
-    w.write_all(&checksum.to_le_bytes())?;
+    w.write_all(&sum.to_le_bytes())?;
 
     *offset += body.len() as u64 + TRAILER_LEN as u64;
     Ok(handle)
@@ -596,6 +657,58 @@ mod tests {
         assert_eq!(p.compression_name, "Snappy");
         assert!(p.index_size > 0);
         assert!(p.raw_value_size >= 4); // "v1" + "v3"
+    }
+
+    #[test]
+    fn bloom_filter_written_and_used() {
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..500u32)
+            .map(|i| {
+                (
+                    ikey(
+                        format!("present{i:04}").as_bytes(),
+                        i as u64 + 1,
+                        InternalKeyKind::Set,
+                    ),
+                    b"v".to_vec(),
+                )
+            })
+            .collect();
+        let file = build(
+            &entries,
+            WriterOptions {
+                block_size: 256,
+                ..Default::default()
+            },
+        );
+        let reader = Reader::open(file, cmp).unwrap();
+        assert_eq!(
+            reader.properties().filter_policy,
+            "rocksdb.BuiltinBloomFilter"
+        );
+        assert!(reader.properties().filter_size > 0);
+        // Present keys are found; absent keys are (almost always) rejected.
+        assert_eq!(
+            reader.get(b"present0250", 10_000).unwrap(),
+            Some((InternalKeyKind::Set, b"v".to_vec()))
+        );
+        assert_eq!(reader.get(b"absent9999", 10_000).unwrap(), None);
+
+        // With the filter disabled the table is still correct.
+        let nofilter = build(
+            &entries,
+            WriterOptions {
+                block_size: 256,
+                filter_policy: None,
+                ..Default::default()
+            },
+        );
+        let reader2 = Reader::open(nofilter, Arc::new(DefaultComparer)).unwrap();
+        assert!(reader2.properties().filter_policy.is_empty());
+        assert_eq!(
+            reader2.get(b"present0001", 10_000).unwrap(),
+            Some((InternalKeyKind::Set, b"v".to_vec()))
+        );
     }
 
     #[test]
