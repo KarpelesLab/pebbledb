@@ -87,8 +87,13 @@ refined as they are reached.
 - [ ] **Phase 21 — Concurrency & commit pipeline.** Group commit, a background flush
   worker, concurrent background compactions, non-blocking memtable rotation, and
   read/write concurrency under load.
-- [ ] **Phase 22 — vfs abstraction.** An `FS` trait with `DiskFS` and `MemFS`, atomic
-  markers and directory syncing through the vfs, and true OS-level directory locking.
+- [x] **Phase 22 — vfs abstraction.** An `Fs` trait (`vfs` module) with `DiskFs` and
+  `MemFs`, threaded through the whole engine: open/recovery, flush, compaction, MANIFEST,
+  WAL, table reads, atomic markers, and directory syncing all go through it. True
+  OS-level directory locking (`flock` on Unix via a zero-dependency `extern "C"`
+  declaration, an exclusive lock file elsewhere), released on `Db` drop. Verified by a
+  full open/flush/compact/reopen lifecycle running entirely on `MemFs` and a
+  concurrent-open lock test.
 - [x] **Phase 23 — Caches.** A sharded, byte-bounded LRU block cache (`cache::BlockCache`,
   keyed by `(file_num, block_offset)`) wired through the sstable reader's data- and
   value-block reads; a bounded table cache of open readers (`Options::max_open_files`,

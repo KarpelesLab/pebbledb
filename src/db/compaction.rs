@@ -19,7 +19,6 @@
 //! every open-snapshot stripe, so versions an open snapshot can observe are retained;
 //! tombstones are elided only at the bottom level and only above all snapshots.
 
-use std::fs::File;
 use std::sync::Arc;
 
 use crate::Result;
@@ -28,6 +27,7 @@ use crate::base::range_del::RangeTombstone;
 use crate::base::range_key::RangeKeyEntry;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEdit};
 use crate::sstable::{Writer, WriterOptions};
+use crate::vfs::{Fs, WritableFile};
 
 use super::merging_iter::{InternalIter, MergingIter};
 use super::{Db, State, filenames};
@@ -252,7 +252,7 @@ impl Db {
         // Remove the obsolete input files from the cache and disk.
         for (_, file_num) in &edit.deleted_files {
             self.cache.lock().unwrap().remove(file_num);
-            let _ = std::fs::remove_file(self.dir.join(filenames::table(*file_num)));
+            let _ = self.fs.remove(&self.dir.join(filenames::table(*file_num)));
         }
         Ok(())
     }
@@ -288,8 +288,9 @@ impl Db {
 struct OutputBuilder {
     file_num: u64,
     path: std::path::PathBuf,
-    writer: Writer<File>,
+    writer: Writer<Box<dyn WritableFile>>,
     cmp_dyn: Arc<dyn crate::base::comparer::Comparer>,
+    fs: Arc<dyn Fs>,
     smallest: Option<Vec<u8>>,
     largest: Option<Vec<u8>>,
     smallest_seq: u64,
@@ -300,7 +301,7 @@ impl OutputBuilder {
     fn new(db: &Db, file_num: u64) -> Result<OutputBuilder> {
         let path = db.dir.join(filenames::table(file_num));
         let writer = Writer::new(
-            File::create(&path)?,
+            db.fs.create(&path)?,
             db.cmp.clone(),
             WriterOptions::default(),
         );
@@ -309,6 +310,7 @@ impl OutputBuilder {
             path,
             writer,
             cmp_dyn: db.cmp.clone(),
+            fs: db.fs.clone(),
             smallest: None,
             largest: None,
             smallest_seq: u64::MAX,
@@ -370,8 +372,9 @@ impl OutputBuilder {
     }
 
     fn finish(self) -> Result<FileMetadata> {
-        self.writer.finish()?;
-        let size = std::fs::metadata(&self.path)?.len();
+        let mut file = self.writer.finish()?;
+        file.sync_all()?;
+        let size = self.fs.size(&self.path)?;
         Ok(FileMetadata {
             file_num: self.file_num,
             size,

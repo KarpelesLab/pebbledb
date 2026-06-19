@@ -29,7 +29,6 @@ use merging_iter::InternalIter;
 pub use merging_iter::{DbIterator, IterOptions};
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -42,6 +41,7 @@ use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, VersionEdit, Versi
 use crate::memtable::MemTable;
 use crate::record;
 use crate::sstable::{Reader, Writer, WriterOptions};
+use crate::vfs::{DirLock, DiskFs, Fs, WritableFile};
 use crate::{Error, Result};
 
 /// Options for opening a database.
@@ -69,6 +69,9 @@ pub struct Options {
     /// Maximum number of sstable readers kept open (default 1000). The least-recently
     /// used reader is evicted when the limit is exceeded.
     pub max_open_files: usize,
+    /// The filesystem the database performs all of its I/O through (default [`DiskFs`]).
+    /// Use [`crate::vfs::MemFs`] for fully in-memory operation.
+    pub fs: Arc<dyn Fs>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -92,6 +95,7 @@ impl Default for Options {
             merger: None,
             block_cache_size: 8 << 20,
             max_open_files: 1000,
+            fs: Arc::new(DiskFs),
         }
     }
 }
@@ -101,9 +105,9 @@ struct State {
     vs: VersionSet,
     mem: Arc<MemTable>,
     imm: Vec<Arc<MemTable>>,
-    wal: Option<record::Writer<File>>,
+    wal: Option<record::Writer<Box<dyn WritableFile>>>,
     wal_number: u64,
-    manifest: Option<record::Writer<File>>,
+    manifest: Option<record::Writer<Box<dyn WritableFile>>>,
     read_only: bool,
     /// Number of memtable flushes performed this session.
     flush_count: u64,
@@ -130,13 +134,18 @@ pub struct Db {
     block_cache: Option<Arc<crate::cache::BlockCache>>,
     /// Maximum number of cached open readers.
     max_open_files: usize,
+    /// The filesystem all I/O goes through.
+    fs: Arc<dyn Fs>,
+    /// The held exclusive directory lock (released on drop). `None` when read-only.
+    _lock: Option<Box<dyn DirLock>>,
 }
 
 impl Db {
     /// Opens the database in `dir`, creating it if `opts.create_if_missing` and absent.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let dir = dir.as_ref().to_path_buf();
-        let exists = dir.exists();
+        let fs = opts.fs.clone();
+        let exists = fs.exists(&dir);
         if !exists {
             if opts.read_only || !opts.create_if_missing {
                 return Err(Error::InvalidState(format!(
@@ -144,23 +153,21 @@ impl Db {
                     dir.display()
                 )));
             }
-            std::fs::create_dir_all(&dir)?;
+            fs.create_dir_all(&dir)?;
         }
 
-        let names: Vec<String> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
+        let mut names: Vec<String> = fs.list(&dir)?;
+        names.sort();
 
         let cmp = opts.comparer.clone();
         let mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
 
         let mut vs = match filenames::current_manifest(&names) {
             Some(manifest_name) => {
-                let bytes = std::fs::read(dir.join(&manifest_name))?;
+                let bytes = fs.read(&dir.join(&manifest_name))?;
                 let vs = VersionSet::load(&bytes, cmp.clone())?;
                 // Recover every WAL present (each record is a batch).
-                recover_wals(&dir, &names, &mem, vs)?
+                recover_wals(fs.as_ref(), &dir, &names, &mem, vs)?
             }
             None => {
                 if !opts.create_if_missing {
@@ -202,25 +209,32 @@ impl Db {
                     None
                 },
                 max_open_files: opts.max_open_files.max(1),
+                fs,
+                _lock: None,
             });
         }
 
-        // Read-write: create the LOCK file Pebble expects (advisory only for now; true
-        // OS-level locking to prevent concurrent opens is future work), then rotate in a
-        // fresh MANIFEST and WAL for this session.
-        let _ = File::create(dir.join("LOCK"));
+        // Read-write: take the exclusive directory lock to prevent concurrent opens, then
+        // rotate in a fresh MANIFEST and WAL for this session.
+        let lock = fs.lock(&dir.join("LOCK"))?;
         let manifest_num = vs.allocate_file_number();
         let wal_number = vs.allocate_file_number();
         vs.log_number = wal_number;
 
         let mut manifest =
-            record::Writer::new(File::create(dir.join(filenames::manifest(manifest_num)))?);
+            record::Writer::new(fs.create(&dir.join(filenames::manifest(manifest_num)))?);
         manifest.write_record(&vs.snapshot_edit().encode())?;
         manifest.sync_all()?;
-        update_marker(&dir, &names, &filenames::manifest(manifest_num))?;
+        update_marker(
+            fs.as_ref(),
+            &dir,
+            &names,
+            &filenames::manifest(manifest_num),
+        )?;
+        fs.sync_dir(&dir)?;
 
         let wal = record::Writer::with_log_num(
-            File::create(dir.join(wal_filename(wal_number)))?,
+            fs.create(&dir.join(wal_filename(wal_number)))?,
             wal_number as u32,
         );
 
@@ -253,6 +267,8 @@ impl Db {
                 None
             },
             max_open_files: opts.max_open_files.max(1),
+            fs,
+            _lock: Some(lock),
         })
     }
 
@@ -417,12 +433,13 @@ impl Db {
         }
         let mem = Arc::clone(&state.mem);
         let file_num = state.vs.allocate_file_number();
-        let meta = write_memtable_to_sstable(&self.dir, &self.cmp, file_num, &mem)?;
+        let meta =
+            write_memtable_to_sstable(self.fs.as_ref(), &self.dir, &self.cmp, file_num, &mem)?;
         let flushed_bytes = meta.size;
 
         let new_wal = state.vs.allocate_file_number();
         let wal = record::Writer::with_log_num(
-            File::create(self.dir.join(wal_filename(new_wal)))?,
+            self.fs.create(&self.dir.join(wal_filename(new_wal)))?,
             new_wal as u32,
         );
         let old_wal = state.wal_number;
@@ -451,7 +468,7 @@ impl Db {
         // Remove logs that predate the new WAL; their data is now in the sstable.
         for num in [old_wal] {
             if num != 0 && num != new_wal {
-                let _ = std::fs::remove_file(self.dir.join(wal_filename(num)));
+                let _ = self.fs.remove(&self.dir.join(wal_filename(num)));
             }
         }
 
@@ -631,7 +648,7 @@ impl Db {
         if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
             return Ok(Arc::clone(r));
         }
-        let bytes = std::fs::read(self.dir.join(filenames::table(file_num)))?;
+        let bytes = self.fs.read(&self.dir.join(filenames::table(file_num)))?;
         let reader = Arc::new(Reader::open_with_cache(
             bytes,
             self.cmp.clone(),
@@ -767,6 +784,7 @@ fn wal_filename(num: u64) -> String {
 /// Replays every `*.log` file present (in increasing number order) into `mem`, returning
 /// the version set with `last_sequence` advanced past the recovered batches.
 fn recover_wals(
+    fs: &dyn Fs,
     dir: &Path,
     names: &[String],
     mem: &Arc<MemTable>,
@@ -784,7 +802,7 @@ fn recover_wals(
 
     let mut last_seq = vs.last_sequence;
     for (num, name) in logs {
-        let bytes = std::fs::read(dir.join(name))?;
+        let bytes = fs.read(&dir.join(name))?;
         let mut reader = record::Reader::new(std::io::Cursor::new(bytes), num as u32);
         while let Some(rec) = reader.read_record()? {
             let batch = Batch::from_bytes(rec)?;
@@ -802,13 +820,14 @@ fn recover_wals(
 /// Writes every entry of `mem` (in internal-key order) to `<dir>/<file_num>.sst`, and
 /// returns the file's metadata.
 fn write_memtable_to_sstable(
+    fs: &dyn Fs,
     dir: &Path,
     cmp: &Arc<dyn Comparer>,
     file_num: u64,
     mem: &Arc<MemTable>,
 ) -> Result<FileMetadata> {
     let path = dir.join(filenames::table(file_num));
-    let file = File::create(&path)?;
+    let file = fs.create(&path)?;
     let mut w = Writer::new(file, cmp.clone(), WriterOptions::default());
 
     let mut it = mem.iter();
@@ -888,11 +907,12 @@ fn write_memtable_to_sstable(
         largest_seq = largest_seq.max(rk.seqnum);
     }
 
-    w.finish()?;
+    let mut file = w.finish()?;
+    file.sync_all()?;
 
     Ok(FileMetadata {
         file_num,
-        size: std::fs::metadata(&path)?.len(),
+        size: fs.size(&path)?,
         smallest: smallest.unwrap_or_default(),
         largest,
         smallest_seqnum: smallest_seq.min(largest_seq),
@@ -902,7 +922,7 @@ fn write_memtable_to_sstable(
 
 /// Writes a new `manifest` marker pointing at `value`, with an `iter` one greater than
 /// any existing marker, and removes superseded marker files.
-fn update_marker(dir: &Path, names: &[String], value: &str) -> Result<()> {
+fn update_marker(fs: &dyn Fs, dir: &Path, names: &[String], value: &str) -> Result<()> {
     let mut max_iter = 0u64;
     let mut old: Vec<&String> = Vec::new();
     for n in names {
@@ -916,9 +936,9 @@ fn update_marker(dir: &Path, names: &[String], value: &str) -> Result<()> {
         }
     }
     let new_name = format!("marker.manifest.{:06}.{}", max_iter + 1, value);
-    std::fs::write(dir.join(&new_name), b"")?;
+    fs.create(&dir.join(&new_name))?.sync_all()?;
     for n in old {
-        let _ = std::fs::remove_file(dir.join(n));
+        let _ = fs.remove(&dir.join(n));
     }
     Ok(())
 }

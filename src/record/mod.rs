@@ -439,7 +439,7 @@ impl<W: Write> Writer<W> {
     }
 }
 
-impl Writer<std::fs::File> {
+impl<W: crate::vfs::WritableFile> Writer<W> {
     /// Flushes buffered data and fsyncs the underlying file, making all records written
     /// so far durable. Used by the WAL and MANIFEST when synchronous commits are enabled.
     pub fn sync_all(&mut self) -> Result<()> {

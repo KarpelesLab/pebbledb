@@ -8,6 +8,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::sync::Arc;
+
+use pebbledb::vfs::MemFs;
 use pebbledb::{Batch, Db, IterOptions, Options};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -251,6 +254,59 @@ fn prefix_iteration() {
         it.next().unwrap();
     }
     assert_eq!(keys, ["aa1", "aa2"]); // stops at the prefix boundary
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn runs_fully_in_memory_on_memfs() {
+    // The whole open/flush/compact/reopen lifecycle on an in-memory filesystem, never
+    // touching disk. Cloning the MemFs shares the underlying tree, so a reopen sees the
+    // same files.
+    let fs = Arc::new(MemFs::new());
+    let dir = "/db";
+    let opts = || Options {
+        fs: fs.clone(),
+        mem_table_size: 16 * 1024,
+        ..Default::default()
+    };
+    {
+        let db = Db::open(dir, opts()).unwrap();
+        for i in 0..1000u32 {
+            db.set(format!("k{i:05}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        db.delete(b"k00042").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"k00000").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(db.get(b"k00042").unwrap(), None);
+    }
+    // Reopen against the same in-memory tree; data survives the WAL/MANIFEST round-trip.
+    {
+        let db = Db::open(dir, opts()).unwrap();
+        assert_eq!(db.get(b"k00000").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(db.get(b"k00999").unwrap(), Some(b"v999".to_vec()));
+        assert_eq!(db.get(b"k00042").unwrap(), None);
+        let all = collect(&db);
+        assert_eq!(all.len(), 999);
+    }
+}
+
+#[test]
+fn directory_lock_blocks_second_open() {
+    let dir = temp_dir("lock");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"k", b"v").unwrap();
+    // A second read-write open of the same directory must fail while the first holds the
+    // exclusive lock.
+    assert!(
+        Db::open(&dir, Options::default()).is_err(),
+        "second open should be blocked by the directory lock"
+    );
+    drop(db);
+    // Once the first handle is dropped, the lock is released and reopening succeeds.
+    let db2 = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db2.get(b"k").unwrap(), Some(b"v".to_vec()));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
