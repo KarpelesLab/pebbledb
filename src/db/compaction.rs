@@ -58,6 +58,72 @@ fn level_budget(level: usize) -> u64 {
 }
 
 impl Db {
+    /// Manually compacts every level overlapping the user-key range `[start, end)` down
+    /// toward the bottom level. `None` bounds mean unbounded. Flushes the memtable first
+    /// so its data participates. Useful to reclaim space after a large range delete.
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.read_only {
+            return Err(crate::Error::InvalidState("db: opened read-only".into()));
+        }
+        self.flush_locked(&mut state)?;
+
+        // Walk levels from the top, pushing any file overlapping the range one level down,
+        // until the data has reached the bottom level. The loop is bounded by the work
+        // actually available (each pass strictly reduces the files above the bottom that
+        // overlap the range, or stops).
+        for _ in 0..MAX_COMPACTIONS_PER_CALL {
+            let mut did_work = false;
+            for level in 0..NUM_LEVELS - 1 {
+                let inputs: Vec<_> = self
+                    .range_overlap(&state.vs.current, level, start, end)
+                    .collect();
+                if inputs.is_empty() {
+                    continue;
+                }
+                let (min, max) = match key_range(self.cmp.as_ref(), &inputs) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let overlap =
+                    overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
+                let c = Compaction {
+                    level,
+                    output_level: level + 1,
+                    inputs,
+                    overlap,
+                };
+                self.run_compaction(&mut state, c)?;
+                did_work = true;
+            }
+            if !did_work {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Files at `level` whose user-key range intersects the (optionally unbounded)
+    /// `[start, end)` range.
+    fn range_overlap<'a>(
+        &'a self,
+        version: &'a Version,
+        level: usize,
+        start: Option<&'a [u8]>,
+        end: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = Arc<FileMetadata>> + 'a {
+        version.levels[level].iter().filter_map(move |f| {
+            let s = encoded_user_key(&f.smallest);
+            let l = encoded_user_key(&f.largest);
+            // [s, l] intersects [start, end): l >= start and s < end.
+            let after_start =
+                start.is_none_or(|st| self.cmp.compare(l, st) != std::cmp::Ordering::Less);
+            let before_end =
+                end.is_none_or(|en| self.cmp.compare(s, en) == std::cmp::Ordering::Less);
+            (after_start && before_end).then(|| f.clone())
+        })
+    }
+
     /// Picks and runs compactions until none are needed (or a safety cap is hit).
     pub(super) fn maybe_compact(&self, state: &mut State) -> Result<()> {
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
@@ -69,37 +135,56 @@ impl Db {
         Ok(())
     }
 
-    /// Chooses the next compaction, if any level needs one.
-    fn pick_compaction(&self, version: &Version) -> Option<Compaction> {
-        // L0: trigger on file count.
-        if version.levels[0].len() >= L0_COMPACTION_THRESHOLD {
-            let inputs = version.levels[0].clone();
-            let (min, max) = key_range(self.cmp.as_ref(), &inputs)?;
-            let overlap = overlapping(self.cmp.as_ref(), version, 1, &min, &max);
-            return Some(Compaction {
-                level: 0,
-                output_level: 1,
-                inputs,
-                overlap,
-            });
-        }
-        // L1..L(max-1): trigger on total size.
-        for level in 1..NUM_LEVELS - 1 {
+    /// The compaction score of a level: how far over its trigger it is. A level with the
+    /// highest score above 1.0 is the most in need of compaction. L0 is scored by file
+    /// count; L1+ by total size against the level's byte budget.
+    fn level_score(version: &Version, level: usize) -> f64 {
+        if level == 0 {
+            version.levels[0].len() as f64 / L0_COMPACTION_THRESHOLD as f64
+        } else {
             let total: u64 = version.levels[level].iter().map(|f| f.size).sum();
-            if total > level_budget(level) && !version.levels[level].is_empty() {
-                let file = version.levels[level][0].clone();
-                let min = encoded_user_key(&file.smallest).to_vec();
-                let max = encoded_user_key(&file.largest).to_vec();
-                let overlap = overlapping(self.cmp.as_ref(), version, level + 1, &min, &max);
-                return Some(Compaction {
-                    level,
-                    output_level: level + 1,
-                    inputs: vec![file],
-                    overlap,
-                });
+            total as f64 / level_budget(level) as f64
+        }
+    }
+
+    /// Chooses the next compaction, if any level needs one. Levels are scored and the
+    /// highest-scoring level above its trigger is compacted first (Pebble's score-based
+    /// picker), rather than always preferring L0.
+    fn pick_compaction(&self, version: &Version) -> Option<Compaction> {
+        // Find the most-overloaded level (score >= 1.0).
+        let mut best_level = None;
+        let mut best_score = 1.0;
+        for level in 0..NUM_LEVELS - 1 {
+            if version.levels[level].is_empty() {
+                continue;
+            }
+            let score = Self::level_score(version, level);
+            if score >= best_score {
+                best_score = score;
+                best_level = Some(level);
             }
         }
-        None
+        let level = best_level?;
+        self.build_compaction(version, level)
+    }
+
+    /// Builds the compaction descriptor for `level` -> `level+1`: all of L0 (which may
+    /// overlap internally) or the first file of an L1+ level, plus the overlapping files
+    /// of the output level.
+    fn build_compaction(&self, version: &Version, level: usize) -> Option<Compaction> {
+        let inputs = if level == 0 {
+            version.levels[0].clone()
+        } else {
+            vec![version.levels[level].first()?.clone()]
+        };
+        let (min, max) = key_range(self.cmp.as_ref(), &inputs)?;
+        let overlap = overlapping(self.cmp.as_ref(), version, level + 1, &min, &max);
+        Some(Compaction {
+            level,
+            output_level: level + 1,
+            inputs,
+            overlap,
+        })
     }
 
     /// Executes a compaction: merges the inputs, writes outputs, and records the edit.

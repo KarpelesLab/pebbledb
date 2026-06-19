@@ -467,6 +467,44 @@ fn open_rejects_comparer_mismatch() {
 }
 
 #[test]
+fn manual_compact_range_drains_upper_levels() {
+    let dir = temp_dir("compact-range");
+    let opts = Options {
+        mem_table_size: 16 * 1024, // force multiple L0 files
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..2000u32 {
+        db.set(format!("k{i:05}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    db.compact_range(None, None).unwrap();
+
+    // After a full manual compaction L0 is empty and data has moved into deeper levels.
+    let m = db.metrics();
+    assert_eq!(
+        m.level_files[0], 0,
+        "L0 should be drained: {:?}",
+        m.level_files
+    );
+    let deeper: usize = m.level_files[1..].iter().sum();
+    assert!(deeper > 0, "data should live below L0: {:?}", m.level_files);
+
+    // All data is still correct.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(b"v0".to_vec()));
+    assert_eq!(db.get(b"k01999").unwrap(), Some(b"v1999".to_vec()));
+    assert_eq!(collect(&db).len(), 2000);
+
+    // A bounded range compaction is a no-op for correctness too.
+    db.compact_range(Some(b"k00100"), Some(b"k00200")).unwrap();
+    assert_eq!(db.get(b"k00150").unwrap(), Some(b"v150".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

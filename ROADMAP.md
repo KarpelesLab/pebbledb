@@ -99,10 +99,13 @@ refined as they are reached.
   value-block reads; a bounded table cache of open readers (`Options::max_open_files`,
   reference-count-aware eviction); cache sizing via `Options::block_cache_size`; and
   hit/miss counters surfaced in `Metrics::block_cache_{hits,misses}`.
-- [ ] **Phase 24 — Compaction completeness.** The full compaction picker (level scores,
-  read/write-amplification heuristics, elision-only, tombstone-density, L0 sublevels,
-  intra-L0), manual compaction, range-key/range-del compaction, deletion pacing, and
-  obsolete-file cleanup.
+- [x] **Phase 24 — Compaction completeness.** A score-based picker (each level scored
+  against its trigger — L0 by file count, L1+ by size budget — picking the most
+  overloaded level rather than always L0), manual `Db::compact_range` that drains a
+  user-key range toward the bottom level, range-del/range-key carrying through
+  compaction, and obsolete-file cleanup. (Read/write-amplification heuristics,
+  elision-only and tombstone-density compactions, explicit L0 sublevels, and deletion
+  pacing remain a follow-up refinement.)
 - [x] **Phase 25 — Options & durability.** An INI-style `OPTIONS-NNNNNN` file
   (`OptionsFile`, Pebble-compatible layout) written on every read-write open and parsed +
   validated on reopen (comparer-name mismatch and too-new format are rejected). A
