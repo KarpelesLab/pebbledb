@@ -667,6 +667,16 @@ impl DbInner {
         self.apply(b)
     }
 
+    /// Removes every key in `[start, end)` and physically reclaims the space, by writing a
+    /// range deletion over the span and then compacting it toward the bottom level so the
+    /// covered data is dropped rather than just hidden. A simplified form of Pebble's
+    /// `Excise` (which also rewrites partially-overlapping boundary files as virtual
+    /// sstables; here the compaction rewrites them).
+    pub fn excise(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.delete_range(start, end)?;
+        self.compact_range(Some(start), Some(end))
+    }
+
     /// Sets a range key over `[start, end)` at `suffix` to `value`.
     pub fn range_key_set(
         &self,

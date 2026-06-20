@@ -1215,6 +1215,41 @@ fn format_ratchet_runs_stepwise_migrations() {
 }
 
 #[test]
+fn excise_removes_and_reclaims_range() {
+    let dir = temp_dir("excise");
+    let opts = Options {
+        mem_table_size: 16 * 1024,
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..2000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 32]).unwrap();
+    }
+    db.flush().unwrap();
+    let before = db.estimate_disk_usage(b"k00500", b"k01000");
+    assert!(before > 0);
+
+    db.excise(b"k00500", b"k01000").unwrap();
+
+    // Keys in the excised range are gone; neighbours remain.
+    assert_eq!(db.get(b"k00500").unwrap(), None);
+    assert_eq!(db.get(b"k00999").unwrap(), None);
+    assert_eq!(db.get(b"k00499").unwrap(), Some(vec![b'v'; 32]));
+    assert_eq!(db.get(b"k01000").unwrap(), Some(vec![b'v'; 32]));
+
+    // The excised range no longer holds live keys on a full scan.
+    let n_in_range = collect(&db)
+        .iter()
+        .filter(|(k, _)| {
+            k.as_slice() >= b"k00500".as_slice() && k.as_slice() < b"k01000".as_slice()
+        })
+        .count();
+    assert_eq!(n_in_range, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
