@@ -1276,6 +1276,48 @@ fn table_stats_aggregate_deletions() {
 }
 
 #[test]
+fn ingest_and_excise_replaces_a_range() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("ingest-excise");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // Pre-existing data across the range to be replaced.
+    for k in ["b", "d", "f", "h"] {
+        db.set(k.as_bytes(), b"old").unwrap();
+    }
+    db.flush().unwrap();
+
+    // An external sstable holding the replacement keys (seqnum 0; ingestion restamps).
+    let ext = dir.join("repl.sst");
+    {
+        let f = std::fs::File::create(&ext).unwrap();
+        let mut w = Writer::new(f, db.comparer().clone(), WriterOptions::default());
+        for k in ["c", "e"] {
+            let ik = InternalKey::new(k.as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
+            w.add(&ik, b"new").unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    // Atomically excise [c, g) and ingest the replacement.
+    db.ingest_and_excise(&[&ext], b"c", b"g").unwrap();
+
+    assert_eq!(db.get(b"b").unwrap(), Some(b"old".to_vec())); // outside excise
+    assert_eq!(db.get(b"d").unwrap(), None); // excised, not replaced
+    assert_eq!(db.get(b"f").unwrap(), None); // excised, not replaced
+    assert_eq!(db.get(b"h").unwrap(), Some(b"old".to_vec())); // outside excise
+    assert_eq!(db.get(b"c").unwrap(), Some(b"new".to_vec())); // ingested
+    assert_eq!(db.get(b"e").unwrap(), Some(b"new".to_vec())); // ingested
+
+    // The full-compaction convenience runs and preserves data.
+    db.compact().unwrap();
+    assert_eq!(db.get(b"c").unwrap(), Some(b"new".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

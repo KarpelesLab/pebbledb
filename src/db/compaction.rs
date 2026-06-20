@@ -58,6 +58,12 @@ fn level_budget(level: usize) -> u64 {
 }
 
 impl DbInner {
+    /// Compacts the entire key space toward the bottom level (Pebble's `Compact` over the
+    /// full range). Equivalent to `compact_range(None, None)`.
+    pub fn compact(&self) -> Result<()> {
+        self.compact_range(None, None)
+    }
+
     /// Manually compacts every level overlapping the user-key range `[start, end)` down
     /// toward the bottom level. `None` bounds mean unbounded. Flushes the memtable first
     /// so its data participates. Useful to reclaim space after a large range delete.

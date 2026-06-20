@@ -101,7 +101,25 @@ impl DbInner {
         }
         // The ingested files may have piled onto L0; keep the LSM in shape.
         self.maybe_compact(&mut state)?;
+        drop(state);
+        if let Some(l) = &self.listener {
+            l.on_ingest_end(paths.len());
+        }
         Ok(())
+    }
+
+    /// Atomically replaces the data in `[start, end)` with the contents of the external
+    /// sstables at `paths`: the range is excised (range-deleted) first, then the files are
+    /// ingested at a newer sequence number so the ingested data wins (Pebble's
+    /// `IngestAndExcise`).
+    pub fn ingest_and_excise(
+        &self,
+        paths: &[impl AsRef<Path>],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<()> {
+        self.delete_range(start, end)?;
+        self.ingest(paths)
     }
 
     /// Reads the external sstable at `src`, rewrites its point keys, range tombstones, and
