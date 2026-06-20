@@ -123,13 +123,20 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   invalidating it — remains, pending virtual sstables.)
 
 ### Value separation & blob files
-- **Value separation** is done for the **in-table value-block** form: with
+- **Value separation** is done in **both** forms. (a) **In-table value blocks**: with
   `Options::value_block_threshold` set, flush and compaction store large values out-of-line in
-  the table's value blocks (Pebble v3 format), transparently re-separated through compaction
-  and read back via the value-prefix path. The remaining, distinct form is separate **blob
-  files** (cross-table value storage): the blob-file *writer*, **blob-file rewrite** during
-  compaction, **ingest-with-blobs**, and blob-file references carried through the MANIFEST —
-  a new on-disk format whose byte-parity needs the Go interop CI.
+  the table's value blocks (Pebble v3), transparently re-separated through compaction and read
+  back via the value-prefix path. (b) **Separate blob files**: with
+  `Options::blob_value_threshold` set, flush writes the largest values to a sibling `<num>.blob`
+  file (the `sstable::blob` module's writer/reader); the sstable stores a `KIND_BLOB`
+  value-prefix + handle, reads resolve it through a `BlobResolver` against the blob file, and
+  compaction resolves blob references back in place (so input blob files become obsolete with
+  their sstables and are deleted; `checkpoint` copies blob files too).
+  Remaining for full upstream parity (the **cross-sstable sharing** optimization): independent
+  blob file numbers with MANIFEST blob references and refcounting, so a compaction can rewrite
+  an sstable's keys while *preserving* its blob references (avoiding the value rewrite) — plus
+  blob-file rewrite/GC and ingest-with-blobs. Byte-parity of the blob format is a Go-interop-CI
+  item.
 
 ### Ingestion & maintenance
 - **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of

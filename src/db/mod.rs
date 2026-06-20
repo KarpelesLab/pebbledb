@@ -38,6 +38,7 @@ pub use merging_iter::{DbIterator, IterKeyType, IterOptions};
 pub use options_file::{FormatMajorVersion, OptionsFile};
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -159,6 +160,13 @@ pub struct Options {
     /// inline in data blocks (Pebble's value blocks). `None` (default) keeps all values inline.
     /// Enabling it writes tables in a value-block-capable format (Pebble v3).
     pub value_block_threshold: Option<usize>,
+    /// Enables **blob files** for flush: point values at least this many bytes are stored in a
+    /// separate `.blob` file alongside the sstable rather than inline or in value blocks
+    /// (Pebble's blob files; takes precedence over [`value_block_threshold`](Self::value_block_threshold)).
+    /// `None` (default) disables blob separation. Compaction resolves blob-referenced values
+    /// back in place, so a compacted table holds no blob references and the input blob files
+    /// become obsolete with their sstables. Enabling it writes tables in Pebble v3 format.
+    pub blob_value_threshold: Option<usize>,
     /// Per-level output sstable size targets (Pebble's per-level `TargetFileSize`). Index `i`
     /// overrides [`target_file_size`](Options::target_file_size) for compactions whose output
     /// is level `i`; levels beyond the vector fall back to `target_file_size`. Empty (default)
@@ -291,6 +299,7 @@ impl Default for Options {
             target_byte_deletion_rate: 0,
             disk_slow_threshold: None,
             value_block_threshold: None,
+            blob_value_threshold: None,
             level_target_file_sizes: Vec::new(),
             max_concurrent_compactions: 1,
         }
@@ -371,6 +380,38 @@ struct State {
     obsolete: Vec<(u64, Arc<crate::manifest::FileMetadata>)>,
 }
 
+/// Opens and caches blob files (an sstable's separately-stored large values) and resolves
+/// blob handles for the engine's sstable readers. A blob file shares its sstable's file
+/// number (named `<num>.blob`), so a handle plus the referencing table's number locate a value.
+struct BlobStore {
+    fs: Arc<dyn Fs>,
+    dir: PathBuf,
+    cache: Mutex<HashMap<u64, Arc<crate::sstable::blob::BlobFileReader>>>,
+}
+
+impl BlobStore {
+    fn reader(&self, file_num: u64) -> Result<Arc<crate::sstable::blob::BlobFileReader>> {
+        if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
+            return Ok(Arc::clone(r));
+        }
+        let bytes = self.fs.read(&self.dir.join(filenames::blob(file_num)))?;
+        let r = Arc::new(crate::sstable::blob::BlobFileReader::open(bytes)?);
+        self.cache.lock().unwrap().insert(file_num, Arc::clone(&r));
+        Ok(r)
+    }
+
+    /// Drops a blob file's cached reader (called when its sstable is deleted).
+    fn evict(&self, file_num: u64) {
+        self.cache.lock().unwrap().remove(&file_num);
+    }
+}
+
+impl crate::sstable::BlobResolver for BlobStore {
+    fn resolve(&self, file_num: u64, handle: crate::sstable::blob::BlobHandle) -> Result<Vec<u8>> {
+        self.reader(file_num)?.get(handle)
+    }
+}
+
 /// The shared inner state of a [`Db`], held behind an `Arc` so the background flush worker
 /// can operate on it concurrently with foreground reads and writes.
 pub struct DbInner {
@@ -425,6 +466,10 @@ pub struct DbInner {
     max_concurrent_compactions: usize,
     /// Minimum value size for out-of-line value-block storage; `None` keeps values inline.
     value_block_threshold: Option<usize>,
+    /// Minimum value size for separate-blob-file storage at flush; `None` disables it.
+    blob_value_threshold: Option<usize>,
+    /// Opens and caches blob files, resolving blob-referenced values for sstable readers.
+    blob_store: Arc<BlobStore>,
     /// Per-level output-sstable size targets; falls back to `target_file_size` past its end.
     level_target_file_sizes: Vec<u64>,
     /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
@@ -500,6 +545,13 @@ impl DbInner {
         for file_num in ready {
             self.cache.lock().unwrap().remove(&file_num);
             self.clean_file(&self.dir.join(filenames::table(file_num)));
+            // Drop the table's sibling blob file, if it separated any values, and evict it
+            // from the blob cache.
+            let blob_path = self.dir.join(filenames::blob(file_num));
+            if self.fs.exists(&blob_path) {
+                self.blob_store.evict(file_num);
+                self.clean_file(&blob_path);
+            }
             if let Some(l) = &self.listener {
                 l.on_table_deleted(file_num);
             }
@@ -747,10 +799,16 @@ impl DbInner {
                 compacting: std::collections::HashSet::new(),
                 obsolete: Vec::new(),
             };
+            let blob_store = Arc::new(BlobStore {
+                fs: Arc::clone(&fs),
+                dir: dir.clone(),
+                cache: Mutex::new(HashMap::new()),
+            });
             return Ok(DbInner {
                 dir,
                 cmp,
                 wal_dirs,
+                blob_store,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
                 wal_recycle_limit: opts.wal_recycle_limit,
@@ -781,6 +839,7 @@ impl DbInner {
                 l1_max_bytes: opts.l1_max_bytes.max(1),
                 max_concurrent_compactions: opts.max_concurrent_compactions.max(1),
                 value_block_threshold: opts.value_block_threshold,
+                blob_value_threshold: opts.blob_value_threshold,
                 level_target_file_sizes: opts.level_target_file_sizes.clone(),
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
                 delete_queue: Mutex::new(DeleteQueue::default()),
@@ -827,6 +886,7 @@ impl DbInner {
                 &opts.block_property_collectors,
                 opts.target_file_size,
                 opts.value_block_threshold,
+                opts.blob_value_threshold,
             )?;
             let edit = VersionEdit {
                 next_file_number: Some(vs.next_file_number),
@@ -885,10 +945,16 @@ impl DbInner {
             compacting: std::collections::HashSet::new(),
             obsolete: Vec::new(),
         };
+        let blob_store = Arc::new(BlobStore {
+            fs: Arc::clone(&fs),
+            dir: dir.clone(),
+            cache: Mutex::new(HashMap::new()),
+        });
         Ok(DbInner {
             dir,
             cmp,
             wal_dirs,
+            blob_store,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
             wal_recycle_limit: opts.wal_recycle_limit,
@@ -919,6 +985,7 @@ impl DbInner {
             l1_max_bytes: opts.l1_max_bytes.max(1),
             max_concurrent_compactions: opts.max_concurrent_compactions.max(1),
             value_block_threshold: opts.value_block_threshold,
+            blob_value_threshold: opts.blob_value_threshold,
             level_target_file_sizes: opts.level_target_file_sizes.clone(),
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
             delete_queue: Mutex::new(DeleteQueue::default()),
@@ -1431,6 +1498,7 @@ impl DbInner {
             &self.block_property_collectors,
             self.target_file_size,
             self.value_block_threshold,
+            self.blob_value_threshold,
         )?;
         let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
         let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
@@ -1874,12 +1942,12 @@ impl DbInner {
             return Ok(Arc::clone(r));
         }
         let bytes = self.fs.read(&self.dir.join(filenames::table(file_num)))?;
-        let reader = Arc::new(Reader::open_with_cache(
-            bytes,
-            self.cmp.clone(),
-            file_num,
-            self.block_cache.clone(),
-        )?);
+        let reader = Arc::new(
+            Reader::open_with_cache(bytes, self.cmp.clone(), file_num, self.block_cache.clone())?
+                .with_blob_resolver(
+                    Arc::clone(&self.blob_store) as Arc<dyn crate::sstable::BlobResolver>
+                ),
+        );
         let mut cache = self.cache.lock().unwrap();
         // Bound the number of open readers. Once at capacity, drop entries that are not
         // referenced elsewhere before inserting the new reader.
@@ -2547,13 +2615,28 @@ fn l0_sublevel_count(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> usize {
 
 /// Builds the sstable [`WriterOptions`] the engine uses, enabling value-block separation in a
 /// value-block-capable format when `value_block_threshold` is set.
-fn engine_writer_options(value_block_threshold: Option<usize>) -> WriterOptions {
+fn engine_writer_options(
+    value_block_threshold: Option<usize>,
+    blob_value_threshold: Option<usize>,
+) -> WriterOptions {
     let mut o = WriterOptions::default();
-    if let Some(t) = value_block_threshold {
+    if value_block_threshold.is_some() || blob_value_threshold.is_some() {
         o.table_format = crate::sstable::TableFormat::Pebble(3);
-        o.value_block_threshold = Some(t);
+        o.value_block_threshold = value_block_threshold;
+        o.blob_value_threshold = blob_value_threshold;
     }
     o
+}
+
+/// Writes the blob file holding sstable `file_num`'s out-of-line values, if any were
+/// separated. A no-op when `bytes` is `None`.
+fn write_blob_file(fs: &dyn Fs, dir: &Path, file_num: u64, bytes: Option<&[u8]>) -> Result<()> {
+    if let Some(b) = bytes {
+        let mut bf = fs.create(&dir.join(filenames::blob(file_num)))?;
+        bf.write_all(b)?;
+        bf.sync_all()?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2566,6 +2649,7 @@ fn write_memtable_to_sstables(
     collectors: &[BlockPropertyCollectorFactory],
     target_file_size: u64,
     value_block_threshold: Option<usize>,
+    blob_value_threshold: Option<usize>,
 ) -> Result<Vec<FileMetadata>> {
     let has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
     let mut outputs: Vec<FileMetadata> = Vec::new();
@@ -2581,7 +2665,7 @@ fn write_memtable_to_sstables(
         let mut w = Writer::new(
             fs.create(&path)?,
             cmp.clone(),
-            engine_writer_options(value_block_threshold),
+            engine_writer_options(value_block_threshold, blob_value_threshold),
         );
         for factory in collectors {
             w.add_block_property_collector(factory());
@@ -2623,8 +2707,10 @@ fn write_memtable_to_sstables(
             && it.user_key() != written_user.as_slice()
             && w.estimated_size() >= target_file_size
         {
+            let blob_bytes = w.take_blob_file()?;
             let mut f = w.finish()?;
             f.sync_all()?;
+            write_blob_file(fs, dir, file_num, blob_bytes.as_deref())?;
             outputs.push(FileMetadata {
                 file_num,
                 size: fs.size(&path)?,
@@ -2696,8 +2782,10 @@ fn write_memtable_to_sstables(
         largest_seq = largest_seq.max(rk.seqnum);
     }
 
+    let blob_bytes = w.take_blob_file()?;
     let mut file = w.finish()?;
     file.sync_all()?;
+    write_blob_file(fs, dir, file_num, blob_bytes.as_deref())?;
 
     outputs.push(FileMetadata {
         file_num,

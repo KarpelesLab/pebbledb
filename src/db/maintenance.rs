@@ -89,13 +89,23 @@ impl DbInner {
             });
         }
 
-        // Copy each retained sstable verbatim.
+        // Copy each retained sstable verbatim, along with its sibling blob file (the
+        // out-of-line large values) when present — without it the copy's blob references
+        // would be unresolvable.
         for nf in &edit.new_files {
             let name = filenames::table(nf.meta.file_num);
             let bytes = self.fs.read(&self.dir.join(&name))?;
             let mut w = self.fs.create(&dest.join(&name))?;
             w.write_all(&bytes)?;
             w.sync_all()?;
+
+            let blob_name = filenames::blob(nf.meta.file_num);
+            if self.fs.exists(&self.dir.join(&blob_name)) {
+                let blob_bytes = self.fs.read(&self.dir.join(&blob_name))?;
+                let mut bw = self.fs.create(&dest.join(&blob_name))?;
+                bw.write_all(&blob_bytes)?;
+                bw.sync_all()?;
+            }
         }
 
         // Write a fresh MANIFEST holding just the snapshot edit, and point a marker at it.

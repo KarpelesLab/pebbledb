@@ -867,7 +867,11 @@ impl OutputBuilder {
         let mut writer = Writer::new(
             db.fs.create(&path)?,
             db.cmp.clone(),
-            super::engine_writer_options(db.value_block_threshold),
+            // Compaction resolves blob-referenced values on read and re-stores them in place /
+            // in value blocks, so a compacted table carries no blob references (its inputs'
+            // blob files become obsolete with their sstables). Blob separation itself happens
+            // at flush time.
+            super::engine_writer_options(db.value_block_threshold, None),
         );
         for factory in &db.block_property_collectors {
             writer.add_block_property_collector(factory());

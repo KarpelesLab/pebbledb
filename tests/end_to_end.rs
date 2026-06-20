@@ -1515,6 +1515,79 @@ fn value_separation_round_trips_large_values() {
 }
 
 #[test]
+fn blob_files_separate_large_values_and_read_back() {
+    let dir = temp_dir("blob-files");
+    let big = |i: u32| vec![(b'A' as u32 + i % 26) as u8; 400];
+    let small = |i: u32| format!("s{i}").into_bytes();
+
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 64 * 1024,
+            // Values >= 64 bytes go to a separate .blob file (rather than value blocks).
+            blob_value_threshold: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for i in 0..150u32 {
+        let v = if i % 2 == 0 { big(i) } else { small(i) };
+        db.set(format!("k{i:04}").as_bytes(), &v).unwrap();
+    }
+    db.flush().unwrap();
+
+    // The flush produced at least one blob file holding the large values.
+    let blob_count = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
+        .count();
+    assert!(blob_count >= 1, "flush should have written a blob file");
+
+    // Every value reads back correctly, resolving blob references for the large ones.
+    let check_all = |db: &Db| {
+        for i in 0..150u32 {
+            let want = if i % 2 == 0 { big(i) } else { small(i) };
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap(),
+                Some(want),
+                "value mismatch at {i}"
+            );
+        }
+        // Iteration resolves blobs too.
+        let mut it = db.iter().unwrap();
+        it.first().unwrap();
+        let mut n = 0;
+        while it.valid() {
+            n += 1;
+            it.next().unwrap();
+        }
+        assert_eq!(n, 150);
+    };
+    check_all(&db);
+
+    // Reopen: blob references resolve against the on-disk blob files after recovery.
+    drop(db);
+    let db = Db::open(
+        &dir,
+        Options {
+            blob_value_threshold: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    check_all(&db);
+
+    // Compaction resolves blob-referenced values and re-stores them, so the blob files written
+    // at flush become obsolete and are removed — and every value still reads correctly.
+    db.compact_range(None, None).unwrap();
+    check_all(&db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn disk_slow_events_are_routed_to_the_listener() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

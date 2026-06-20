@@ -17,6 +17,12 @@ pub fn table(file_num: u64) -> String {
     format!("{file_num:06}.sst")
 }
 
+/// The filename of the blob file written alongside the sstable with the given file number
+/// (its out-of-line large values). Present only when that sstable separated values to a blob.
+pub fn blob(file_num: u64) -> String {
+    format!("{file_num:06}.blob")
+}
+
 /// The filename of the MANIFEST with the given file number.
 // Used by the write path (Phase 9) and by tests; keep it available.
 #[allow(dead_code)]

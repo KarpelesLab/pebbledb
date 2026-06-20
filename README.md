@@ -15,8 +15,8 @@ lineage.
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
 > The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
-> provider into the engine, separate blob files, virtual sstables, and columnar key-schema
-> byte-parity — most of it gated on the Go interop CI) is catalogued in
+> provider into the engine, cross-sstable blob-file *sharing*, virtual sstables, and columnar
+> key-schema byte-parity — most of it gated on the Go interop CI) is catalogued in
 > [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
 
 ## Capabilities
@@ -40,8 +40,9 @@ lineage.
   **concurrent compaction scheduler** (`Options::max_concurrent_compactions`) with paced
   obsolete-file deletion — plus write stalls, a sharded block cache, and `EstimateDiskUsage`.
 - **Storage formats**: row-format sstables (every supported table-format version, two-level
-  indexes, bloom filters, **value separation** into value blocks via
-  `Options::value_block_threshold`, range-del/range-key blocks, **table- and per-block**
+  indexes, bloom filters, **value separation** into in-table value blocks
+  (`Options::value_block_threshold`) or **separate blob files**
+  (`Options::blob_value_threshold`), range-del/range-key blocks, **table- and per-block**
   property collectors/filters via `Options::block_property_collectors`) and the columnar
   (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
 - **Operations**: `checkpoint` (with flush/span-restriction options), external sstable

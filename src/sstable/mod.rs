@@ -297,6 +297,20 @@ pub struct Reader {
     file_num: u64,
     /// Optional shared block cache for decompressed blocks.
     block_cache: Option<Arc<crate::cache::BlockCache>>,
+    /// Optional resolver for blob-referenced values (values stored in a separate blob file).
+    /// Set by the engine when it opens a reader; absent for standalone reads, where a
+    /// blob-referenced value cannot be fetched.
+    blob_resolver: Option<Arc<dyn BlobResolver>>,
+}
+
+/// Resolves a blob-referenced value: given the sstable's file number and the
+/// [`BlobHandle`](blob::BlobHandle) stored in place of the value, returns the value bytes from
+/// the associated blob file. The
+/// engine implements this (opening and caching blob files); standalone sstable reads have no
+/// resolver and reject blob references.
+pub trait BlobResolver: Send + Sync {
+    /// Resolves `handle` against the blob file belonging to sstable `file_num`.
+    fn resolve(&self, file_num: u64, handle: blob::BlobHandle) -> Result<Vec<u8>>;
 }
 
 impl Reader {
@@ -337,8 +351,16 @@ impl Reader {
             range_keys: meta.range_keys,
             two_level,
             file_num,
+            blob_resolver: None,
             block_cache,
         })
+    }
+
+    /// Attaches a blob resolver so this reader can fetch blob-referenced values from the
+    /// table's associated blob file. Call before sharing the reader.
+    pub fn with_blob_resolver(mut self, resolver: Arc<dyn BlobResolver>) -> Reader {
+        self.blob_resolver = Some(resolver);
+        self
     }
 
     /// The table's range tombstones.
@@ -432,7 +454,16 @@ impl Reader {
                 }
                 Ok(block[start..end].to_vec())
             }
-            _ => Err(Error::Unsupported("sstable: blob-referenced value")),
+            k if k == blob::KIND_BLOB => {
+                let h = blob::decode_handle(&stored[1..])?;
+                match &self.blob_resolver {
+                    Some(r) => r.resolve(self.file_num, h),
+                    None => Err(Error::Unsupported(
+                        "sstable: blob-referenced value (no blob resolver)",
+                    )),
+                }
+            }
+            _ => Err(Error::corruption("sstable: unknown value-prefix kind")),
         }
     }
 

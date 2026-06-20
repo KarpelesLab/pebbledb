@@ -70,6 +70,11 @@ pub struct WriterOptions {
     /// For value-prefixing formats (Pebble v3+), values at least this large are stored
     /// out-of-line in value blocks. `None` keeps every value in place (default `None`).
     pub value_block_threshold: Option<usize>,
+    /// For value-prefixing formats (Pebble v3+), values at least this large are stored in a
+    /// separate **blob file** (taking precedence over `value_block_threshold`). The blob
+    /// bytes are produced alongside the table and retrieved via
+    /// [`Writer::take_blob_file`]. `None` disables blob separation (default `None`).
+    pub blob_value_threshold: Option<usize>,
 }
 
 impl Default for WriterOptions {
@@ -83,6 +88,7 @@ impl Default for WriterOptions {
             filter_policy: Some(10),
             index_block_size: 256 << 10,
             value_block_threshold: None,
+            blob_value_threshold: None,
         }
     }
 }
@@ -212,6 +218,11 @@ pub struct Writer<W: Write> {
     prefix_values: bool,
     /// Values at least this large go out-of-line to value blocks.
     value_threshold: Option<usize>,
+    /// Values at least this large go out-of-line to a separate blob file (takes precedence
+    /// over `value_threshold`).
+    blob_threshold: Option<usize>,
+    /// Accumulates the table's blob file when blob separation is enabled.
+    blob_writer: Option<super::blob::BlobFileWriter>,
     /// The current (open) value block's contents.
     vblk_buf: Vec<u8>,
     /// On-disk handles of completed value blocks, indexed by block number.
@@ -230,6 +241,13 @@ impl<W: Write> Writer<W> {
         let filter = opts.filter_policy.map(super::filter::FilterWriter::new);
         let prefix_values = matches!(opts.table_format, TableFormat::Pebble(v) if v >= 3);
         let value_threshold = opts.value_block_threshold;
+        let blob_threshold = if prefix_values {
+            opts.blob_value_threshold
+        } else {
+            None
+        };
+        let blob_writer = blob_threshold
+            .map(|_| super::blob::BlobFileWriter::new(opts.compression, opts.checksum));
         Writer {
             w,
             opts,
@@ -257,6 +275,8 @@ impl<W: Write> Writer<W> {
             filter,
             prefix_values,
             value_threshold,
+            blob_threshold,
+            blob_writer,
             vblk_buf: Vec::new(),
             value_block_handles: Vec::new(),
             vblk_num: 0,
@@ -275,13 +295,38 @@ impl<W: Write> Writer<W> {
         self.block_property_collectors.push(c);
     }
 
+    /// Takes the table's blob file bytes, if blob separation produced any. The blob writer is
+    /// independent of the table sink, so call this around [`finish`](Self::finish); returns
+    /// `None` when blob separation is disabled or no value crossed the threshold.
+    pub fn take_blob_file(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.blob_writer.take() {
+            Some(bw) if !bw.is_empty() => Ok(Some(bw.finish()?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Encodes a point value for storage in a data block. For value-prefixing formats
     /// this prepends the value-prefix byte and may move large values to a value block,
     /// returning the encoded value handle instead.
     fn encode_point_value(&mut self, value: &[u8]) -> Result<Vec<u8>> {
-        use super::valblk;
+        use super::{blob, valblk};
         if !self.prefix_values {
             return Ok(value.to_vec());
+        }
+        // The largest values go out-of-line to a separate blob file (takes precedence over
+        // in-table value blocks).
+        if let Some(thresh) = self.blob_threshold
+            && value.len() >= thresh
+            && !value.is_empty()
+        {
+            let handle = self
+                .blob_writer
+                .as_mut()
+                .expect("blob writer present when blob_threshold is set")
+                .add(value)?;
+            let mut enc = vec![blob::KIND_BLOB << 6];
+            enc.extend_from_slice(&blob::encode_handle(handle));
+            return Ok(enc);
         }
         // Large values go out-of-line to a value block.
         if let Some(thresh) = self.value_threshold
