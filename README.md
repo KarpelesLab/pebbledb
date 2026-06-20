@@ -23,20 +23,24 @@ lineage.
 
 - **Writes**: `set` / `delete` / `single_delete` / `merge` / `delete_range`, range keys,
   atomic `Batch`es, and **indexed batches** (read-your-own-writes via `Db::indexed_batch`).
-- **Reads**: point `get`, snapshots, a **bidirectional** iterator
-  (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with `IterOptions` bounds, `set_bounds`,
-  `seek_prefix_ge`, range-key surfacing + coalescing, **range-key masking**, and
-  **block-property filters** that skip non-matching sstables; `new_external_iter` reads
-  sstables without ingesting them, and `scan_internal` exposes the raw internal keyspace.
+- **Reads**: point `get`, snapshots (incl. an **EventuallyFileOnlySnapshot** scoped to key
+  spans), a **bidirectional** iterator (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with
+  `IterOptions` bounds, `set_bounds`, `seek_prefix_ge`, range-key surfacing + coalescing,
+  **range-key masking**, **block-property filters** that skip non-matching sstables, and
+  `only_durable` (read only flushed data); `new_external_iter` reads sstables without
+  ingesting them, and `scan_internal` exposes the raw internal keyspace.
 - **Engine**: WAL with multi-directory failover, a background flush/compaction worker,
-  score-based + manual `compact_range`, write stalls, a sharded block cache, and
-  `EstimateDiskUsage`.
+  **flush splitting**, and a full leveled compaction suite — score-based + manual
+  `compact_range`, **multilevel**, **move**, **delete-only**, **elision-only**,
+  **tombstone-density**, and **read-triggered** compactions — plus write stalls, a sharded
+  block cache, and `EstimateDiskUsage`.
 - **Storage formats**: row-format sstables (every supported table-format version, two-level
   indexes, bloom filters, value blocks, range-del/range-key blocks, block-property
   collectors run over flush/compaction output via `Options::block_property_collectors`) and
   the columnar (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
-- **Operations**: `checkpoint`, external sstable `ingest`, `Options` + `OPTIONS` file with a
-  **comparer/merger name→impl registry**, step-wise `FormatMajorVersion` migrations,
+- **Operations**: `checkpoint` (with flush/span-restriction options), external sstable
+  `ingest`, `Options` + `OPTIONS` file with a **comparer/merger name→impl registry**,
+  tunable level budgets (`l1_max_bytes`), step-wise `FormatMajorVersion` migrations,
   `Metrics`, an `lsm_view`, an `EventListener` (flush/compaction, table, WAL/MANIFEST
   create-delete, format upgrade, write-stall, background-error), a `Logger`, and a `Cleaner`
   (delete or archive obsolete files).
