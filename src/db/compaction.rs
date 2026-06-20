@@ -190,6 +190,9 @@ impl DbInner {
 
     /// Executes a compaction: merges the inputs, writes outputs, and records the edit.
     fn run_compaction(&self, state: &mut State, c: Compaction) -> Result<()> {
+        if let Some(l) = &self.listener {
+            l.on_compaction_begin(c.output_level, c.inputs.len() + c.overlap.len());
+        }
         // Build a merging iterator over every input file and collect their range
         // tombstones, which must be carried to the output (otherwise the deletions
         // would be lost).

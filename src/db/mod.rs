@@ -100,8 +100,12 @@ pub struct Options {
 /// A listener notified of background-style events (flushes and compactions). All methods
 /// have default no-op implementations, so implementors override only what they need.
 pub trait EventListener: Send + Sync {
+    /// Called when a memtable flush begins.
+    fn on_flush_begin(&self) {}
     /// Called after a memtable is flushed to an L0 sstable.
     fn on_flush_end(&self, _file_num: u64, _bytes: u64) {}
+    /// Called when a compaction begins (with its output level and input-file count).
+    fn on_compaction_begin(&self, _output_level: usize, _input_files: usize) {}
     /// Called after a compaction completes.
     fn on_compaction_end(&self, _output_level: usize, _input_files: usize, _output_files: usize) {}
     /// Called when an sstable is created (by flush, compaction, or ingestion).
@@ -832,6 +836,9 @@ impl DbInner {
             let file_num = state.vs.allocate_file_number();
             (mem, file_num)
         };
+        if let Some(l) = &self.listener {
+            l.on_flush_begin();
+        }
 
         // Write the sstable without holding the state lock.
         let meta =
@@ -1204,6 +1211,8 @@ impl DbInner {
             Some(c) => (c.hits(), c.misses()),
             None => (0, 0),
         };
+        let total_sstables = level_files.iter().sum();
+        let total_sstable_bytes = level_bytes.iter().sum();
         Metrics {
             level_files,
             level_bytes,
@@ -1212,6 +1221,11 @@ impl DbInner {
             compaction_count: state.compaction_count,
             block_cache_hits,
             block_cache_misses,
+            total_sstables,
+            total_sstable_bytes,
+            imm_count: state.imm.len(),
+            mem_table_bytes: u64::from(state.mem.size()),
+            open_snapshots: self.snapshots.lock().unwrap().len(),
         }
     }
 
@@ -1295,6 +1309,16 @@ pub struct Metrics {
     pub block_cache_hits: u64,
     /// Number of block-cache misses so far (0 if caching is disabled).
     pub block_cache_misses: u64,
+    /// Total number of live sstables across all levels.
+    pub total_sstables: usize,
+    /// Total bytes of live sstables across all levels.
+    pub total_sstable_bytes: u64,
+    /// Number of immutable memtables awaiting flush.
+    pub imm_count: usize,
+    /// Current mutable-memtable size in bytes.
+    pub mem_table_bytes: u64,
+    /// Number of currently-open snapshots.
+    pub open_snapshots: usize,
 }
 
 /// Creates an iterator over a set of sstables **without** ingesting them into a database,

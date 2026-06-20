@@ -1089,6 +1089,57 @@ fn iterator_coalesces_range_keys() {
 }
 
 #[test]
+fn metrics_fields_and_begin_events() {
+    use pebbledb::EventListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Counter {
+        flush_begin: AtomicUsize,
+        compaction_begin: AtomicUsize,
+    }
+    impl EventListener for Counter {
+        fn on_flush_begin(&self) {
+            self.flush_begin.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_compaction_begin(&self, _lvl: usize, _inputs: usize) {
+            self.compaction_begin.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = temp_dir("metrics");
+    let counter = Arc::new(Counter::default());
+    let opts = Options {
+        mem_table_size: 16 * 1024,
+        event_listener: Some(counter.clone()),
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..3000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 50]).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    let m = db.metrics();
+    assert!(m.total_sstables > 0);
+    assert_eq!(
+        m.total_sstables,
+        m.level_files.iter().sum::<usize>(),
+        "total must equal the per-level sum"
+    );
+    assert!(m.total_sstable_bytes > 0);
+    assert_eq!(m.open_snapshots, 0);
+    let _snap = db.snapshot();
+    assert_eq!(db.metrics().open_snapshots, 1);
+
+    assert!(counter.flush_begin.load(Ordering::SeqCst) >= 1);
+    assert!(counter.compaction_begin.load(Ordering::SeqCst) >= 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
