@@ -22,19 +22,24 @@ lineage.
 
 - **Writes**: `set` / `delete` / `single_delete` / `merge` / `delete_range`, range keys,
   atomic `Batch`es, and **indexed batches** (read-your-own-writes via `Db::indexed_batch`).
-- **Reads**: point `get`, snapshots, and a **bidirectional** iterator
-  (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with `IterOptions` bounds and
-  `seek_prefix_ge`; `new_external_iter` reads sstables without ingesting them.
+- **Reads**: point `get`, snapshots, a **bidirectional** iterator
+  (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with `IterOptions` bounds, `set_bounds`,
+  `seek_prefix_ge`, and range-key surfacing + coalescing; `new_external_iter` reads sstables
+  without ingesting them, and `scan_internal` exposes the raw internal keyspace.
 - **Engine**: WAL with multi-directory failover, a background flush/compaction worker,
-  score-based + manual `compact_range`, a sharded block cache, and an `EstimateDiskUsage`.
+  score-based + manual `compact_range`, write stalls, a sharded block cache, and
+  `EstimateDiskUsage`.
 - **Storage formats**: row-format sstables (every supported table-format version, two-level
-  indexes, bloom filters, value blocks, range-del/range-key blocks) and the columnar
-  (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
+  indexes, bloom filters, value blocks, range-del/range-key blocks, block-property
+  collectors/filters) and the columnar (v5–v8) block codecs; CRC32C / xxHash64 checksums;
+  Snappy / Zstd compression.
 - **Operations**: `checkpoint`, external sstable `ingest`, `Options` + `OPTIONS` file,
-  `FormatMajorVersion` ratcheting, `Metrics`, an `EventListener`, a `Logger`, and a
-  `Cleaner` (delete or archive obsolete files).
-- **Filesystem**: `Fs` trait with `DiskFs` and a fully in-memory `MemFs`.
-- **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `db scan`).
+  step-wise `FormatMajorVersion` migrations, `Metrics`, an `lsm_view`, an `EventListener`,
+  a `Logger`, and a `Cleaner` (delete or archive obsolete files).
+- **Filesystem & objects**: an `Fs` trait with `DiskFs`, in-memory `MemFs`, and a
+  disk-health-checking wrapper; an `objstorage` provider for local + shared/remote objects.
+- **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `scan` /
+  `lsm`).
 
 ## Usage
 

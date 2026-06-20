@@ -51,20 +51,24 @@ itself**; see "CockroachDB boundary" for where we stop. Each group is a committe
 an exclusion.
 
 _Done so far: indexed batches (read-your-own-writes), `single_delete` / `delete_sized` /
-`log_data`, `new_external_iter`, the table-level block-property collector/filter mechanism,
-the disk-health-checking vfs, range-key surfacing during iteration, `EstimateDiskUsage`, a
-`Logger`, and the `Cleaner` (delete/archive)._
+`log_data`, `new_external_iter`, `ScanInternal`, iterator `set_bounds`, range-key surfacing
+**and `RANGEKEYSET`/`UNSET`/`DEL` coalescing** during iteration, the table-level
+block-property collector/filter mechanism, the disk-health-checking vfs, the `objstorage`
+provider (local + shared/remote), `EstimateDiskUsage`, richer `Metrics`, the LSM view (+
+`db lsm` CLI), flush/compaction **begin** + table/ingest `EventListener` events, **write
+stalls** with stall events, step-wise **format-major-version migrations**, a `Logger`, and
+the `Cleaner` (delete/archive)._
 
 ### Batches & the write API
 - For indexed batches: a lazy batch iterator merged into `DbIterator` (today `get`/`scan`
   provide read-your-own-writes), batch reuse/reset, and large batches handled as flushables.
 
 ### Iterators
-- **Full `IterOptions`**: key-type selection (point / range / both), **range-key masking**
-  and `RANGEKEYSET`/`UNSET`/`DEL` coalescing (raw covering range keys are already surfaced),
-  table filters, **block-property filters wired into iteration**, `OnlyReadGuaranteedDurable`.
-- `SetBounds`, `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
-- **`ScanInternal`** (raw internal-key scan used by replication / disaggregated storage).
+- Remaining **`IterOptions`**: key-type selection (point / range / both), **range-key
+  masking**, table filters, **block-property filters wired into iteration**,
+  `OnlyReadGuaranteedDurable`. (`SetBounds`, range-key surfacing + coalescing, and
+  `ScanInternal` are done.)
+- `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
 - Bloom-skip during `seek_prefix_ge`.
 
 ### Block properties
@@ -99,10 +103,10 @@ the disk-health-checking vfs, range-key surfacing during iteration, `EstimateDis
   exist.)
 
 ### Remote / disaggregated storage
-- The **`objstorage` provider** abstraction (local provider + the `remote.Storage`
-  interface, shared/external sstables, the shared-object cache). Concrete cloud backends
-  (S3/GCS/Azure) are application-provided; we implement the Pebble interface and a
-  local/in-memory backend.
+- Wire the engine's sstable reads/writes onto the **`objstorage` provider** so shared
+  (remote) tables participate in the LSM. (The provider abstraction — local + the
+  `remote.Storage` interface with an in-memory backend — is implemented; concrete cloud
+  backends like S3/GCS/Azure are application code.)
 
 ### WAL
 - The full `pebble/wal` failover **manager** (have: multi-directory write-failover +
@@ -113,17 +117,16 @@ the disk-health-checking vfs, range-key surfacing during iteration, `EstimateDis
   locking + sync, and the disk-health-checking FS emitting `DiskSlow`.)
 
 ### Options, format & migrations
-- Full **`Options`** surface incl. per-level options; a **comparer/merger name→impl
-  registry**; **format-major-version migrations** (the on-disk upgrade step for each FMV,
-  not just the recorded version); complete `OPTIONS` round-trip.
+- Full **`Options`** surface incl. per-level options and a **comparer/merger name→impl
+  registry**. (Step-wise **format-major-version migrations** and the `OPTIONS` round-trip
+  are done; per-version migrations are currently no-ops awaiting versions that need them.)
 
 ### Observability & file management
-- Remaining **`EventListener`** events (compaction/flush begin, manifest/WAL create-delete,
-  table stats/validated, **write-stall** begin-end, disk-slow, background-error). (Have:
-  flush/compaction end, table created/deleted, ingest end.)
-- Complete **`Metrics`** and an **LSM view** debugging surface. (Have: core `Metrics`, a
-  `Logger`, and the `Cleaner` delete/archive interface.)
-- **Write stalls** (memtable/L0 stall thresholds and pacing).
+- Remaining **`EventListener`** events (manifest/WAL create-delete, table stats/validated,
+  disk-slow, background-error). (Have: flush/compaction begin+end, table created/deleted,
+  ingest end, write-stall begin+end.)
+- Further **`Metrics`** breadth (per-op latencies, amplification). (Have: core `Metrics`,
+  the LSM view, a `Logger`, the `Cleaner`, and memtable-count write stalls.)
 
 ### Columnar (key schema)
 - Wire `colblk.DefaultKeySchema` (the schema a general Pebble KV store uses) into the
@@ -131,7 +134,8 @@ the disk-health-checking vfs, range-key surfacing during iteration, `EstimateDis
 - Consistency checking (`level_checker`) over columnar tables.
 
 ### Tooling & testing
-- Full `pebble` **CLI** (`db`, `sstable`, `manifest`, `wal`, `bench`, `find`, `lsm`).
+- Remaining `pebble` **CLI** subcommands (`bench`, `find`). (Have: `sstable`/`wal`/
+  `manifest` dump, `db get`/`scan`/`lsm`.)
 - Port Pebble's **data-driven test corpus** and a **metamorphic** harness; add a
   **libFuzzer** target. (A seeded model test provides randomized coverage today.)
 
