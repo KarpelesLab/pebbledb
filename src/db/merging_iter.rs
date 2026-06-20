@@ -289,6 +289,13 @@ pub struct IterOptions {
     pub lower_bound: Option<Vec<u8>>,
     /// Exclusive upper bound on user keys; keys at or above it are not produced.
     pub upper_bound: Option<Vec<u8>>,
+    /// Enables range-key masking (Pebble's `RangeKeyMasking.Suffix`). When set, point keys
+    /// covered by a range key whose suffix is `>= ` this value are hidden if the point's own
+    /// suffix sorts after that range key's suffix — the MVCC "a range deletion at timestamp T
+    /// hides older point versions" behavior. Suffixes are extracted with the comparer's
+    /// [`split`](crate::base::comparer::Comparer::split); with the default (suffix-less)
+    /// comparer no point ever has a suffix, so masking never fires.
+    pub range_key_masking_suffix: Option<Vec<u8>>,
 }
 
 /// A bidirectional iterator over a database's user keys at a fixed snapshot.
@@ -313,6 +320,9 @@ pub struct DbIterator {
     merger: Option<Arc<dyn crate::base::merge::Merger>>,
     lower_bound: Option<Vec<u8>>,
     upper_bound: Option<Vec<u8>>,
+    /// When set, point keys masked by a covering range key (see
+    /// [`IterOptions::range_key_masking_suffix`]) are hidden.
+    mask_suffix: Option<Vec<u8>>,
     /// When set, iteration is restricted to keys having this prefix.
     prefix: Option<Vec<u8>>,
 }
@@ -341,6 +351,7 @@ impl DbIterator {
             dir: Dir::Forward,
             lower_bound: opts.lower_bound,
             upper_bound: opts.upper_bound,
+            mask_suffix: opts.range_key_masking_suffix,
             prefix: None,
         })
     }
@@ -353,11 +364,15 @@ impl DbIterator {
         if !self.valid {
             return Vec::new();
         }
+        self.covering_range_keys(&self.cur_key)
+    }
+
+    /// The range-key entries covering `ukey` and visible at the snapshot, in source order.
+    fn covering_range_keys(&self, ukey: &[u8]) -> Vec<crate::base::range_key::RangeKeyEntry> {
         self.range_keys
             .iter()
             .filter(|e| {
-                e.seqnum <= self.snapshot
-                    && e.covers(self.cmp.as_ref(), &self.cur_key).unwrap_or(false)
+                e.seqnum <= self.snapshot && e.covers(self.cmp.as_ref(), ukey).unwrap_or(false)
             })
             .cloned()
             .collect()
@@ -369,12 +384,24 @@ impl DbIterator {
     /// suffix and a `RANGEKEYDEL` removes everything older. (Pebble's range-key
     /// coalescing, on top of the raw entries from [`DbIterator::range_keys`].)
     pub fn coalesced_range_keys(&self) -> Vec<crate::base::range_key::SuffixValue> {
+        if !self.valid {
+            return Vec::new();
+        }
+        self.coalesce(self.covering_range_keys(&self.cur_key))
+    }
+
+    /// Coalesces a set of covering range-key entries into the effective `(suffix, value)`
+    /// pairs in force, newest entry winning. Shared by [`coalesced_range_keys`](Self::coalesced_range_keys)
+    /// and range-key masking.
+    fn coalesce(
+        &self,
+        mut covering: Vec<crate::base::range_key::RangeKeyEntry>,
+    ) -> Vec<crate::base::range_key::SuffixValue> {
         use crate::base::internal_key::InternalKeyKind;
         use crate::base::range_key::{decode_end, decode_set_suffix_values, decode_unset_suffixes};
         use std::collections::BTreeMap;
 
         // Covering entries, newest sequence number first.
-        let mut covering = self.range_keys();
         covering.sort_by_key(|e| std::cmp::Reverse(e.seqnum));
 
         let mut decided: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
@@ -452,6 +479,37 @@ impl DbIterator {
         self.upper_bound
             .as_deref()
             .is_some_and(|ub| self.cmp.compare(ukey, ub) != std::cmp::Ordering::Less)
+    }
+
+    /// Whether `ukey` is hidden by range-key masking. Mirrors Pebble's `rangeKeyMasking`:
+    /// the active mask suffix is the *smallest* covering range-key suffix that is itself
+    /// `>=` the configured masking suffix; a point is masked when its own suffix sorts
+    /// strictly after that active suffix. Points without a suffix are never masked.
+    fn masked(&self, ukey: &[u8]) -> bool {
+        use std::cmp::Ordering;
+        let Some(mask) = self.mask_suffix.as_deref() else {
+            return false;
+        };
+        let point_suffix = &ukey[self.cmp.split(ukey)..];
+        if point_suffix.is_empty() {
+            return false;
+        }
+        // Active mask suffix = smallest covering SET suffix that is >= the masking suffix.
+        let mut active: Option<Vec<u8>> = None;
+        for sv in self.coalesce(self.covering_range_keys(ukey)) {
+            if sv.suffix.is_empty() || self.cmp.compare(&sv.suffix, mask) == Ordering::Less {
+                continue;
+            }
+            if active
+                .as_deref()
+                .is_none_or(|a| self.cmp.compare(&sv.suffix, a) == Ordering::Less)
+            {
+                active = Some(sv.suffix);
+            }
+        }
+        active
+            .as_deref()
+            .is_some_and(|a| self.cmp.compare(a, point_suffix) == Ordering::Less)
     }
 
     /// The largest internal-key trailer (smallest sort) for a user key.
@@ -646,6 +704,9 @@ impl DbIterator {
             if self.below_lower(&ukey) {
                 continue;
             }
+            if self.masked(&ukey) {
+                continue;
+            }
             if let Some(value) = self.resolve(&ukey, &versions) {
                 self.cur_key = ukey;
                 self.cur_value = value;
@@ -685,6 +746,9 @@ impl DbIterator {
             }
             versions.reverse();
             if self.at_or_above_upper(&ukey) {
+                continue;
+            }
+            if self.masked(&ukey) {
                 continue;
             }
             if let Some(value) = self.resolve(&ukey, &versions) {

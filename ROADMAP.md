@@ -52,7 +52,8 @@ an exclusion.
 
 _Done so far: indexed batches (read-your-own-writes), `single_delete` / `delete_sized` /
 `log_data`, `new_external_iter`, `ScanInternal`, iterator `set_bounds`, range-key surfacing
-**and `RANGEKEYSET`/`UNSET`/`DEL` coalescing** during iteration, the table-level
+**and `RANGEKEYSET`/`UNSET`/`DEL` coalescing** during iteration **plus range-key masking**
+(`IterOptions::range_key_masking_suffix`), the table-level
 block-property collector/filter mechanism, the disk-health-checking vfs, the `objstorage`
 provider (local + shared/remote), `EstimateDiskUsage`, `Db::table_stats`, richer `Metrics`,
 the LSM view (+ `db lsm` and `find` CLI), flush/compaction **begin** + table/ingest

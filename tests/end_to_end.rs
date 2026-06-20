@@ -217,6 +217,7 @@ fn seek_and_bounds() {
         .iter_with_options(IterOptions {
             lower_bound: Some(b"k010".to_vec()),
             upper_bound: Some(b"k020".to_vec()),
+            ..Default::default()
         })
         .unwrap();
     bit.first().unwrap();
@@ -462,6 +463,119 @@ fn open_rejects_comparer_mismatch() {
         },
     );
     assert!(err.is_err(), "open with mismatched comparer should fail");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_key_masking_hides_older_point_versions() {
+    use pebbledb::{Comparer, DefaultComparer};
+    use std::cmp::Ordering;
+
+    // An MVCC-ish comparer: a user key is `prefix@suffix`; `split` returns the prefix length
+    // so the suffix (including the `@`) is `key[split..]`. Ordering stays bytewise, which is
+    // all the masking mechanism needs (it compares suffix byte slices via the comparer).
+    struct AtComparer(DefaultComparer);
+    impl Comparer for AtComparer {
+        fn name(&self) -> &str {
+            "test.AtComparator"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+            self.0.compare(a, b)
+        }
+        fn abbreviated_key(&self, key: &[u8]) -> u64 {
+            self.0.abbreviated_key(key)
+        }
+        fn split(&self, key: &[u8]) -> usize {
+            // Prefix length = index of the last '@' (suffix includes the '@'); whole key if none.
+            key.iter().rposition(|&b| b == b'@').unwrap_or(key.len())
+        }
+        fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]) {
+            self.0.separator(dst, a, b)
+        }
+        fn successor(&self, dst: &mut Vec<u8>, a: &[u8]) {
+            self.0.successor(dst, a)
+        }
+    }
+
+    let dir = temp_dir("rk-mask");
+    let db = Db::open(
+        &dir,
+        Options {
+            comparer: Arc::new(AtComparer(DefaultComparer)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Five point versions across three prefixes.
+    for k in [b"a@1".as_ref(), b"a@5", b"b@1", b"b@9", b"c@1"] {
+        db.set(k, b"v").unwrap();
+    }
+    // A masking range key over ["a","c") at suffix "@5".
+    db.range_key_set(b"a", b"c", b"@5", b"rk").unwrap();
+
+    let collect = |opts: IterOptions| -> Vec<Vec<u8>> {
+        let mut it = db.iter_with_options(opts).unwrap();
+        let mut out = Vec::new();
+        it.first().unwrap();
+        while it.valid() {
+            out.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        out
+    };
+
+    // Without masking, every point version is visible.
+    assert_eq!(
+        collect(IterOptions::default()),
+        vec![
+            b"a@1".to_vec(),
+            b"a@5".to_vec(),
+            b"b@1".to_vec(),
+            b"b@9".to_vec(),
+            b"c@1".to_vec()
+        ],
+    );
+
+    // With masking at "@1", the active mask suffix is "@5" (the only covering range-key
+    // suffix, and it is >= "@1"). Point keys covered by ["a","c") whose suffix sorts after
+    // "@5" are hidden: only "b@9". "c@1" is outside the range (end exclusive), so it survives.
+    assert_eq!(
+        collect(IterOptions {
+            range_key_masking_suffix: Some(b"@1".to_vec()),
+            ..Default::default()
+        }),
+        vec![
+            b"a@1".to_vec(),
+            b"a@5".to_vec(),
+            b"b@1".to_vec(),
+            b"c@1".to_vec()
+        ],
+    );
+
+    // Reverse iteration applies the same masking.
+    let mut rev = Vec::new();
+    let mut it = db
+        .iter_with_options(IterOptions {
+            range_key_masking_suffix: Some(b"@1".to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+    it.last().unwrap();
+    while it.valid() {
+        rev.push(it.key().to_vec());
+        it.prev().unwrap();
+    }
+    assert_eq!(
+        rev,
+        vec![
+            b"c@1".to_vec(),
+            b"b@1".to_vec(),
+            b"a@5".to_vec(),
+            b"a@1".to_vec()
+        ],
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1046,6 +1160,7 @@ fn iterator_set_bounds_reuses_iterator() {
         .iter_with_options(IterOptions {
             lower_bound: Some(b"k010".to_vec()),
             upper_bound: Some(b"k020".to_vec()),
+            ..Default::default()
         })
         .unwrap();
     let first = collect_range(&mut it);
@@ -1363,6 +1478,7 @@ fn snapshot_iter_with_bounds() {
         .iter_with_options(IterOptions {
             lower_bound: Some(b"k010".to_vec()),
             upper_bound: Some(b"k015".to_vec()),
+            ..Default::default()
         })
         .unwrap();
     it.first().unwrap();
