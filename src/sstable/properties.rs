@@ -77,6 +77,9 @@ pub struct Properties {
     pub compression_name: String,
     /// The property-collector names (`"[]"` when none).
     pub property_collectors: String,
+    /// Arbitrary user / block-property entries (collector outputs and any properties this
+    /// reader does not model), preserved verbatim for round-trip and filtering.
+    pub user_properties: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl Properties {
@@ -131,8 +134,37 @@ impl Properties {
             ));
         }
 
+        // User / block-property entries (e.g. block-property-collector outputs).
+        for (k, v) in &self.user_properties {
+            m.push((k.clone(), v.clone()));
+        }
+
         m.sort_by(|a, b| a.0.cmp(&b.0));
         m
+    }
+
+    /// The set of known (modelled) property names; any other entry is a user property.
+    fn is_known_property(name: &[u8]) -> bool {
+        const KNOWN: &[&str] = &[
+            NUM_ENTRIES,
+            RAW_KEY_SIZE,
+            RAW_VALUE_SIZE,
+            NUM_DELETIONS,
+            NUM_RANGE_DELETIONS,
+            NUM_DATA_BLOCKS,
+            DATA_SIZE,
+            INDEX_SIZE,
+            INDEX_TYPE,
+            TOP_LEVEL_INDEX_SIZE,
+            FILTER_SIZE,
+            NUM_MERGE_OPERANDS,
+            COMPARATOR,
+            MERGER,
+            FILTER_POLICY,
+            COMPRESSION,
+            PROPERTY_COLLECTORS,
+        ];
+        KNOWN.iter().any(|k| k.as_bytes() == name)
     }
 
     /// Decodes a property `(name, value)` entry into `self`.
@@ -157,7 +189,13 @@ impl Properties {
             n if n == FILTER_POLICY.as_bytes() => self.filter_policy = s(),
             n if n == COMPRESSION.as_bytes() => self.compression_name = s(),
             n if n == PROPERTY_COLLECTORS.as_bytes() => self.property_collectors = s(),
-            _ => {} // unknown / user property: ignored
+            _ => {
+                // Unknown / user property (e.g. a block-property-collector output): keep it.
+                if !Self::is_known_property(name) {
+                    self.user_properties
+                        .insert(String::from_utf8_lossy(name).into_owned(), value.to_vec());
+                }
+            }
         }
     }
 
@@ -209,6 +247,7 @@ mod tests {
             filter_policy: String::new(),
             compression_name: "Snappy".to_string(),
             property_collectors: "[]".to_string(),
+            user_properties: Default::default(),
         };
         let entries = props.encode();
         // Entries must be sorted by name.
@@ -224,9 +263,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_properties_are_ignored() {
+    fn unknown_properties_are_preserved_as_user_properties() {
         let mut p = Properties::default();
         p.decode_entry(b"some.user.property", b"whatever");
-        assert_eq!(p, Properties::default());
+        assert_eq!(
+            p.user_properties
+                .get("some.user.property")
+                .map(|v| v.as_slice()),
+            Some(&b"whatever"[..])
+        );
+        // They round-trip through encode/decode.
+        let mut d = Properties::default();
+        for (name, value) in &p.encode() {
+            d.decode_entry(name.as_bytes(), value);
+        }
+        assert_eq!(d.user_properties, p.user_properties);
     }
 }

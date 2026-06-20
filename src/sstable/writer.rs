@@ -218,6 +218,8 @@ pub struct Writer<W: Write> {
     value_block_handles: Vec<BlockHandle>,
     /// The current value block's number.
     vblk_num: u32,
+    /// Per-table block-property collectors, fed every point entry.
+    block_property_collectors: Vec<Box<dyn super::blockprop::BlockPropertyCollector>>,
     finished: bool,
 }
 
@@ -258,8 +260,19 @@ impl<W: Write> Writer<W> {
             vblk_buf: Vec::new(),
             value_block_handles: Vec::new(),
             vblk_num: 0,
+            block_property_collectors: Vec::new(),
             finished: false,
         }
+    }
+
+    /// Registers a [`BlockPropertyCollector`](super::blockprop::BlockPropertyCollector) fed
+    /// every point entry; its serialized output is stored in the table's properties block
+    /// and read back via [`super::Reader::block_property`].
+    pub fn add_block_property_collector(
+        &mut self,
+        c: Box<dyn super::blockprop::BlockPropertyCollector>,
+    ) {
+        self.block_property_collectors.push(c);
     }
 
     /// Encodes a point value for storage in a data block. For value-prefixing formats
@@ -422,6 +435,11 @@ impl<W: Write> Writer<W> {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
+
+        // Feed every point entry to the block-property collectors.
+        for c in &mut self.block_property_collectors {
+            c.add(internal_key, value);
+        }
 
         // For value-prefixing formats the stored value is the prefix-encoded value (and
         // large values may be moved to a value block).
@@ -617,7 +635,7 @@ impl<W: Write> Writer<W> {
         };
 
         // Properties block (uncompressed meta block), referenced from the metaindex.
-        let props = Properties {
+        let mut props = Properties {
             num_entries: self.num_entries,
             raw_key_size: self.raw_key_size,
             raw_value_size: self.raw_value_size,
@@ -636,6 +654,11 @@ impl<W: Write> Writer<W> {
             filter_policy: filter_policy_name,
             ..Default::default()
         };
+        // Finish the block-property collectors into the properties block.
+        for c in &mut self.block_property_collectors {
+            let key = format!("{}{}", super::blockprop::BLOCK_PROPERTY_PREFIX, c.name());
+            props.user_properties.insert(key, c.finish());
+        }
         let props_handle = {
             // Meta blocks use a restart interval of 1 (no prefix compression).
             let mut pb = BlockBuilder::new(1);

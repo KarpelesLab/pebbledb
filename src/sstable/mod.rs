@@ -28,6 +28,7 @@
 //! with Pebble's production columnar tables is validated by the interop CI.
 
 pub mod block;
+pub mod blockprop;
 pub mod colblk;
 pub mod columnar;
 pub mod filter;
@@ -352,6 +353,23 @@ impl Reader {
     /// The table's properties.
     pub fn properties(&self) -> &Properties {
         &self.props
+    }
+
+    /// The serialized value of the block property produced by the collector named `name`,
+    /// if the table carries one.
+    pub fn block_property(&self, name: &str) -> Option<&[u8]> {
+        let key = format!("{}{}", blockprop::BLOCK_PROPERTY_PREFIX, name);
+        self.props.user_properties.get(&key).map(|v| v.as_slice())
+    }
+
+    /// Whether this table may satisfy `filter`: `true` if the table carries no matching
+    /// property (cannot be excluded) or the filter's `intersects` returns `true`; `false`
+    /// only when the property is present and the filter rules the table out.
+    pub fn may_match_block_property(&self, filter: &dyn blockprop::BlockPropertyFilter) -> bool {
+        match self.block_property(filter.name()) {
+            Some(prop) => filter.intersects(prop),
+            None => true,
+        }
     }
 
     /// The table's format.
@@ -809,5 +827,84 @@ mod tests {
     fn bad_magic_is_rejected() {
         let buf = vec![0u8; 64];
         assert!(parse_footer(&buf).is_err());
+    }
+
+    #[test]
+    fn block_property_collector_and_filter() {
+        use crate::base::comparer::DefaultComparer;
+        use crate::base::internal_key::{InternalKey, InternalKeyKind, encoded_user_key};
+        use blockprop::{BlockPropertyCollector, BlockPropertyFilter};
+
+        // A collector recording the min and max user key (each as a length-prefixed slice).
+        struct MinMaxKey {
+            min: Option<Vec<u8>>,
+            max: Option<Vec<u8>>,
+        }
+        impl BlockPropertyCollector for MinMaxKey {
+            fn name(&self) -> &str {
+                "test.minmaxkey"
+            }
+            fn add(&mut self, ik: &[u8], _v: &[u8]) {
+                let k = encoded_user_key(ik).to_vec();
+                if self.min.as_ref().is_none_or(|m| &k < m) {
+                    self.min = Some(k.clone());
+                }
+                if self.max.as_ref().is_none_or(|m| &k > m) {
+                    self.max = Some(k);
+                }
+            }
+            fn finish(&mut self) -> Vec<u8> {
+                let mut out = Vec::new();
+                for s in [self.min.take().unwrap(), self.max.take().unwrap()] {
+                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&s);
+                }
+                out
+            }
+        }
+        // A filter: does [min, max] intersect the query range [lo, hi)?
+        struct RangeFilter {
+            lo: Vec<u8>,
+            hi: Vec<u8>,
+        }
+        impl BlockPropertyFilter for RangeFilter {
+            fn name(&self) -> &str {
+                "test.minmaxkey"
+            }
+            fn intersects(&self, prop: &[u8]) -> bool {
+                let rd = |off: usize| -> (Vec<u8>, usize) {
+                    let n = u32::from_le_bytes(prop[off..off + 4].try_into().unwrap()) as usize;
+                    (prop[off + 4..off + 4 + n].to_vec(), off + 4 + n)
+                };
+                let (min, o) = rd(0);
+                let (max, _) = rd(o);
+                min < self.hi && max >= self.lo
+            }
+        }
+
+        let cmp = std::sync::Arc::new(DefaultComparer);
+        let mut w = Writer::new(Vec::new(), cmp.clone(), WriterOptions::default());
+        w.add_block_property_collector(Box::new(MinMaxKey {
+            min: None,
+            max: None,
+        }));
+        for k in ["d", "h", "m", "q"] {
+            let ik = InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set).encode();
+            w.add(&ik, b"v").unwrap();
+        }
+        let bytes = w.finish().unwrap();
+        let reader = Arc::new(Reader::open(bytes, cmp).unwrap());
+
+        assert!(reader.block_property("test.minmaxkey").is_some());
+        // Query overlapping [d, q]: table must be read.
+        assert!(reader.may_match_block_property(&RangeFilter {
+            lo: b"a".to_vec(),
+            hi: b"f".to_vec(),
+        }));
+        // Query entirely after the table's max: table can be skipped.
+        assert!(!reader.may_match_block_property(&RangeFilter {
+            lo: b"x".to_vec(),
+            hi: b"z".to_vec(),
+        }));
     }
 }
