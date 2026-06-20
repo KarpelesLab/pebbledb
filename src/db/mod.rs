@@ -177,6 +177,10 @@ pub trait EventListener: Send + Sync {
     fn on_format_upgrade(&self, _version: u32) {}
     /// Called when a background flush or compaction fails, with a description of the error.
     fn on_background_error(&self, _error: &str) {}
+    /// Called after table statistics are (re)computed, with the number of tables examined.
+    fn on_table_stats_loaded(&self, _tables: usize) {}
+    /// Called after an sstable is validated, with its file number and whether it passed.
+    fn on_table_validated(&self, _file_num: u64, _ok: bool) {}
 }
 
 /// A sink for the database's informational and error log messages, mirroring Pebble's
@@ -1633,7 +1637,54 @@ impl DbInner {
             stats.num_deletions += p.num_deletions;
             stats.num_range_deletions += p.num_range_deletions;
         }
+        if let Some(l) = &self.listener {
+            l.on_table_stats_loaded(stats.tables);
+        }
         Ok(stats)
+    }
+
+    /// Validates every live sstable by reading it end to end (which verifies each data
+    /// block's checksum), firing [`EventListener::on_table_validated`] per file. Returns the
+    /// number of files that failed validation; `Ok(0)` means the LSM's sstables are intact.
+    pub fn validate_sstables(&self) -> Result<usize> {
+        let files: Vec<u64> = {
+            let state = self.state.lock().unwrap();
+            state
+                .vs
+                .current
+                .levels
+                .iter()
+                .flat_map(|lvl| lvl.iter().map(|f| f.file_num))
+                .collect()
+        };
+        let mut failures = 0;
+        for file_num in files {
+            let ok = self.validate_one_table(file_num);
+            if !ok {
+                failures += 1;
+            }
+            if let Some(l) = &self.listener {
+                l.on_table_validated(file_num, ok);
+            }
+        }
+        Ok(failures)
+    }
+
+    /// Reads `file_num`'s sstable from first to last entry; returns whether it did so without
+    /// error (a checksum failure or corruption returns `false`).
+    fn validate_one_table(&self, file_num: u64) -> bool {
+        let scan = || -> Result<()> {
+            let reader = self.open_reader(file_num)?;
+            let mut it = reader.iter()?;
+            it.first()?;
+            while it.valid() {
+                // Touching the value forces any out-of-line value to resolve too.
+                let _ = it.value();
+                it.next()?;
+            }
+            Ok(())
+        };
+        scan().is_ok()
     }
 
     /// Returns a human-readable description of the LSM tree's current shape: one section

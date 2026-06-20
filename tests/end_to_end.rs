@@ -1143,6 +1143,83 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn validate_sstables_and_stats_events() {
+    use pebbledb::EventListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Counter {
+        validated_ok: AtomicUsize,
+        stats_loaded: AtomicUsize,
+    }
+    impl EventListener for Counter {
+        fn on_table_validated(&self, _file_num: u64, ok: bool) {
+            if ok {
+                self.validated_ok.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn on_table_stats_loaded(&self, _tables: usize) {
+            self.stats_loaded.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = temp_dir("validate");
+    let counter = Arc::new(Counter::default());
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 16 * 1024,
+            event_listener: Some(counter.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..1000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 48]).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Every live sstable validates cleanly.
+    let failures = db.validate_sstables().unwrap();
+    assert_eq!(failures, 0, "all sstables should validate");
+    let m = db.metrics();
+    assert_eq!(
+        counter.validated_ok.load(Ordering::SeqCst),
+        m.total_sstables,
+        "one on_table_validated(ok) per live sstable"
+    );
+
+    // table_stats fires its loaded event.
+    let _ = db.table_stats().unwrap();
+    assert!(counter.stats_loaded.load(Ordering::SeqCst) >= 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_reset_reuses_the_batch() {
+    let dir = temp_dir("batch-reset");
+    let db = Db::open(&dir, Options::default()).unwrap();
+
+    let mut batch = Batch::new();
+    batch.set(b"a", b"1");
+    batch.set(b"b", b"2");
+    db.write(batch.clone()).unwrap();
+
+    // Reset clears the batch; reusing it after reset writes only the new ops.
+    batch.reset();
+    assert_eq!(batch.count(), 0);
+    batch.set(b"c", b"3");
+    db.write(batch).unwrap();
+
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn deletion_pacing_defers_obsolete_file_removal() {
     let dir = temp_dir("delete-pacing");
     let db = Db::open(

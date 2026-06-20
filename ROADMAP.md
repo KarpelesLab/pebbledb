@@ -65,7 +65,8 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 
 ### Batches & the write API
 - For indexed batches: a lazy batch iterator merged into `DbIterator` (today `get`/`scan`
-  provide read-your-own-writes), batch reuse/reset, and large batches handled as flushables.
+  provide read-your-own-writes) and large batches handled as flushables. (`Batch::reset`
+  for reuse is done.)
 
 ### Iterators
 - Remaining **`IterOptions`**: key-type selection (point / range / both). (`SetBounds`,
@@ -147,10 +148,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   open) is done.)
 
 ### Observability & file management
-- Remaining **`EventListener`** events (table stats loaded / validated, disk-slow routed
-  from the health-checking vfs). (Have: flush/compaction begin+end, table created/deleted,
-  ingest end, write-stall begin+end, WAL/MANIFEST create-delete, format upgrade,
-  background-error.)
+- Remaining **`EventListener`** events: disk-slow routed from the health-checking vfs into the
+  DB listener. (Have: flush/compaction begin+end, table created/deleted/**validated**, **table
+  stats loaded**, ingest end, write-stall begin+end, WAL/MANIFEST create-delete, format
+  upgrade, background-error; plus `Db::validate_sstables` to drive table validation.)
 - Further **`Metrics`** breadth (per-op latencies, amplification). (Have: core `Metrics`,
   the LSM view, a `Logger`, the `Cleaner`, and memtable-count write stalls.)
 

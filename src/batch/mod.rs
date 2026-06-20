@@ -94,6 +94,14 @@ impl Batch {
         }
     }
 
+    /// Clears the batch back to empty (zero sequence number and count) while retaining its
+    /// allocated capacity, so it can be reused for another set of operations without
+    /// reallocating. Mirrors Pebble's `Batch.Reset`.
+    pub fn reset(&mut self) {
+        self.repr.clear();
+        self.repr.resize(HEADER_LEN, 0);
+    }
+
     /// Wraps an existing wire representation, validating the header and that every
     /// operation decodes.
     pub fn from_bytes(repr: Vec<u8>) -> Result<Self> {
