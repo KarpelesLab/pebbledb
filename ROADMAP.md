@@ -154,8 +154,12 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   bounded to `[smallest, largest]` (point lookups, iteration, and compaction inputs), and a
   backing file is reclaimed by reference-based GC once no virtual references it. `Db::excise`,
   `Db::ingest_and_excise`, external sstable `ingest`, `Db::compact`, and `EstimateDiskUsage`
-  also exist.) Remaining: **download** (rewrite remote/external files to local) and flushable
-  ingests.
+  also exist. **Ingest** now flushes the active memtable as part of the operation — reserving
+  the ingest sequence numbers and rotating the memtable atomically under one lock — so an
+  ingested value correctly wins over an older, still-unflushed in-memory key (it had been
+  shadowed before). The flushable-ingest *optimization* that queues the sstables instead of
+  forcing the flush is a further refinement.) Remaining: **download** (rewrite remote/external
+  files to local).
 - (Done: **checkpoint options** — `CheckpointOptions` with a flush toggle and
   `RestrictToSpans`-style span restriction, via `Db::checkpoint_with_options`.)
 

@@ -381,6 +381,38 @@ fn ingest_external_sstable() {
 }
 
 #[test]
+fn ingest_wins_over_overlapping_unflushed_memtable_key() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("ingest-overlap");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // A key sits in the *active memtable* (never flushed) when we ingest a newer value for it.
+    db.set(b"k", b"memtable-old").unwrap();
+
+    let ext = dir.join("external.sst");
+    {
+        let f = std::fs::File::create(&ext).unwrap();
+        let cmp = std::sync::Arc::new(pebbledb::DefaultComparer);
+        let mut w = Writer::new(f, cmp, WriterOptions::default());
+        let ik = InternalKey::new(b"k".to_vec(), 0, InternalKeyKind::Set).encode();
+        w.add(&ik, b"ingested-new").unwrap();
+        w.finish().unwrap();
+    }
+    // Ingest without a manual flush: the ingested value is newer and must win, even though an
+    // older version of the key is still in the memtable.
+    db.ingest(&[&ext]).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"ingested-new".to_vec()));
+
+    // Survives reopen.
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"ingested-new".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ingest_with_blob_separation() {
     use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
     use pebbledb::sstable::{Writer, WriterOptions};

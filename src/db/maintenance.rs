@@ -130,32 +130,57 @@ impl DbInner {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock().unwrap();
-        if state.read_only {
-            return Err(crate::Error::InvalidState("db: opened read-only".into()));
-        }
+        // Reserve a sequence number per file and rotate the active memtable out, atomically
+        // under one lock. The ingested data therefore gets a higher sequence number than every
+        // existing in-memory key, and those keys are moved to the immutable queue to be
+        // flushed — so once flushed they sit in L0 *below* the ingest (which is read
+        // newest-first), and no stale in-memory key can shadow the ingested value. (A flushable
+        // ingest avoids the flush by queueing the sstables directly; this forced-flush form is
+        // the correctness baseline.) Writes that arrive after this point get even higher
+        // sequence numbers and stay in the new memtable, correctly newer than the ingest.
+        let plan: Vec<(std::path::PathBuf, u64, u64)> = {
+            let mut state = self.state.lock().unwrap();
+            if state.read_only {
+                return Err(crate::Error::InvalidState("db: opened read-only".into()));
+            }
+            let mut plan = Vec::new();
+            for path in paths {
+                let seqnum = state.vs.last_sequence + 1;
+                state.vs.last_sequence = seqnum;
+                let file_num = state.vs.allocate_file_number();
+                plan.push((path.as_ref().to_path_buf(), file_num, seqnum));
+            }
+            self.rotate_memtable(&mut state)?;
+            self.work_cv.notify_all();
+            plan
+        };
 
+        // Flush the rotated memtable (and any queued immutables) to L0 off the lock, so the
+        // ingest is ordered above all prior in-memory data.
+        while self.flush_one()? {}
+
+        // Rewrite the external files at their reserved sequence numbers (off the lock).
         let mut new_files = Vec::new();
-        for path in paths {
-            let seqnum = state.vs.last_sequence + 1;
-            state.vs.last_sequence = seqnum;
-            let file_num = state.vs.allocate_file_number();
-            let meta = self.rewrite_external(path.as_ref(), file_num, seqnum)?;
+        for (path, file_num, seqnum) in &plan {
+            let meta = self.rewrite_external(path, *file_num, *seqnum)?;
             new_files.push(NewFileEntry { level: 0, meta });
         }
 
-        let edit = VersionEdit {
-            next_file_number: Some(state.vs.next_file_number),
-            last_sequence: Some(state.vs.last_sequence),
-            new_files,
-            ..Default::default()
-        };
-        state.vs.apply(&edit)?;
-        if let Some(mw) = state.manifest.as_mut() {
-            mw.write_record(&edit.encode())?;
-            mw.sync_all()?;
+        // Add the ingested files to L0.
+        {
+            let mut state = self.state.lock().unwrap();
+            let edit = VersionEdit {
+                next_file_number: Some(state.vs.next_file_number),
+                last_sequence: Some(state.vs.last_sequence),
+                new_files,
+                ..Default::default()
+            };
+            state.vs.apply(&edit)?;
+            if let Some(mw) = state.manifest.as_mut() {
+                mw.write_record(&edit.encode())?;
+                mw.sync_all()?;
+            }
         }
-        drop(state);
         // The ingested files may have piled onto L0; keep the LSM in shape (off the lock).
         self.maybe_compact()?;
         if let Some(l) = &self.listener {
