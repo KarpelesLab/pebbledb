@@ -19,7 +19,7 @@ use crate::Result;
 use crate::base::internal_key::{InternalKey, InternalKeyKind, encoded_user_key, trailer_kind};
 use crate::manifest::{FileMetadata, NewFileEntry, VersionEdit};
 use crate::record;
-use crate::sstable::{Reader, Writer, WriterOptions};
+use crate::sstable::{Reader, Writer};
 use crate::vfs::WritableFile;
 
 use super::{DbInner, filenames, update_marker};
@@ -189,7 +189,9 @@ impl DbInner {
         let mut w = Writer::new(
             self.fs.create(&path)?,
             self.cmp.clone(),
-            WriterOptions::default(),
+            // Honor the engine's value separation when rewriting the ingested table, so large
+            // ingested values land in value blocks / a sibling blob file (ingest-with-blobs).
+            super::engine_writer_options(self.value_block_threshold, self.blob_value_threshold),
         );
 
         let mut smallest: Option<Vec<u8>> = None;
@@ -247,8 +249,15 @@ impl DbInner {
             }
         }
 
+        let blob_bytes = w.take_blob_file()?;
         let mut file = w.finish()?;
         file.sync_all()?;
+        // Write the rewritten table's sibling blob file, if any large values were separated.
+        if let Some(b) = &blob_bytes {
+            let mut bf = self.fs.create(&self.dir.join(filenames::blob(file_num)))?;
+            bf.write_all(b)?;
+            bf.sync_all()?;
+        }
 
         Ok(FileMetadata {
             file_num,

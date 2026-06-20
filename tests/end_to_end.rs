@@ -381,6 +381,68 @@ fn ingest_external_sstable() {
 }
 
 #[test]
+fn ingest_with_blob_separation() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("ingest-blob");
+    // The ingesting store separates large values into blob files.
+    let db = Db::open(
+        &dir,
+        Options {
+            blob_value_threshold: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // An external sstable carrying a large and a small value.
+    let ext = dir.join("external.sst");
+    let big = vec![b'Z'; 500];
+    {
+        let f = std::fs::File::create(&ext).unwrap();
+        let cmp = std::sync::Arc::new(pebbledb::DefaultComparer);
+        let mut w = Writer::new(f, cmp, WriterOptions::default());
+        let ik =
+            |k: &str| InternalKey::new(k.as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
+        w.add(&ik("big"), &big).unwrap();
+        w.add(&ik("small"), b"v").unwrap();
+        w.finish().unwrap();
+    }
+
+    db.ingest(&[&ext]).unwrap();
+
+    // The rewritten (ingested) table separated its large value into a blob file.
+    let blobs = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
+        .count();
+    assert!(
+        blobs >= 1,
+        "ingest should write a blob file for large values"
+    );
+
+    assert_eq!(db.get(b"big").unwrap(), Some(big.clone()));
+    assert_eq!(db.get(b"small").unwrap(), Some(b"v".to_vec()));
+
+    // Survives reopen (blob references resolve after recovery).
+    drop(db);
+    let db = Db::open(
+        &dir,
+        Options {
+            blob_value_threshold: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.get(b"big").unwrap(), Some(big));
+    assert_eq!(db.get(b"small").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn format_major_version_persists_and_ratchets() {
     use pebbledb::FormatMajorVersion;
 

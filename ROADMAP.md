@@ -136,11 +136,13 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   and **blob-file rewrite during compaction** keeps large values out of the sstable across
   compactions (each output writes its own blob file; inputs' blob files become obsolete with
   their sstables and are deleted; `checkpoint` copies blob files too).
+  Ingest also honors blob separation (**ingest-with-blobs**): an ingested table's large values
+  are separated into a blob file as it is rewritten.
   Remaining for full upstream parity (the **cross-sstable sharing** optimization): independent
   blob file numbers with MANIFEST blob references and refcounting, so a compaction can rewrite
   an sstable's keys while *preserving* references to an existing blob file (avoiding the value
-  rewrite entirely) — plus blob GC by reference and ingest-with-blobs. Byte-parity of the blob
-  format is a Go-interop-CI item.
+  rewrite entirely) — plus blob GC by reference. Byte-parity of the blob format is a
+  Go-interop-CI item.
 
 ### Ingestion & maintenance
 - **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of
