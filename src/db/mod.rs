@@ -127,6 +127,18 @@ pub trait EventListener: Send + Sync {
     fn on_table_deleted(&self, _file_num: u64) {}
     /// Called when external sstables are ingested.
     fn on_ingest_end(&self, _files: usize) {}
+    /// Called when a new write-ahead log file is created (at open and on memtable rotation).
+    fn on_wal_created(&self, _file_num: u64) {}
+    /// Called when an obsolete write-ahead log file is removed.
+    fn on_wal_deleted(&self, _file_num: u64) {}
+    /// Called when a new MANIFEST is created (at open and on MANIFEST rotation).
+    fn on_manifest_created(&self, _file_num: u64) {}
+    /// Called when an obsolete MANIFEST is removed.
+    fn on_manifest_deleted(&self, _file_num: u64) {}
+    /// Called after the format major version is upgraded a step, with the new version.
+    fn on_format_upgrade(&self, _version: u32) {}
+    /// Called when a background flush or compaction fails, with a description of the error.
+    fn on_background_error(&self, _error: &str) {}
 }
 
 /// A sink for the database's informational and error log messages, mirroring Pebble's
@@ -495,6 +507,10 @@ impl DbInner {
 
         let (wal_writer, wal_dir_idx) = create_wal(fs.as_ref(), &wal_dirs, 0, wal_number)?;
         let wal = wal_writer;
+        if let Some(l) = &opts.event_listener {
+            l.on_manifest_created(manifest_num);
+            l.on_wal_created(wal_number);
+        }
 
         // Record the options for this session in a fresh OPTIONS file.
         let options_num = vs.allocate_file_number();
@@ -605,6 +621,9 @@ impl DbInner {
                 "ratcheted format major version to {}",
                 next.as_u32()
             ));
+            if let Some(l) = &self.listener {
+                l.on_format_upgrade(next.as_u32());
+            }
         }
         Ok(())
     }
@@ -844,6 +863,9 @@ impl DbInner {
         } else {
             writer.flush()?;
         }
+        if let Some(l) = &self.listener {
+            l.on_wal_created(new_wal);
+        }
         state.wal = Some(writer);
         state.wal_number = new_wal;
         state.wal_dir_idx = dir_idx;
@@ -878,6 +900,9 @@ impl DbInner {
         let (wal, dir_idx) =
             create_wal(self.fs.as_ref(), &self.wal_dirs, state.wal_dir_idx, new_wal)?;
         state.wal_dir_idx = dir_idx;
+        if let Some(l) = &self.listener {
+            l.on_wal_created(new_wal);
+        }
         let old_mem = std::mem::replace(
             &mut state.mem,
             Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size)),
@@ -942,6 +967,9 @@ impl DbInner {
             for dir in &self.wal_dirs {
                 self.clean_file(&dir.join(wal_filename(popped_wal)));
             }
+            if let Some(l) = &self.listener {
+                l.on_wal_deleted(popped_wal);
+            }
         }
         // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
         self.maybe_compact(&mut state)?;
@@ -976,7 +1004,10 @@ impl DbInner {
             }
             // Flush outside the state lock guard; errors are surfaced via the next
             // foreground flush/open rather than panicking the worker.
-            if self.flush_one().is_err() {
+            if let Err(e) = self.flush_one() {
+                if let Some(l) = &self.listener {
+                    l.on_background_error(&e.to_string());
+                }
                 // Back off briefly so a persistent error doesn't spin the CPU.
                 std::thread::yield_now();
             }
@@ -2115,6 +2146,57 @@ mod tests {
             counter.compactions.load(Ordering::Relaxed)
         );
         assert!(m.level_bytes.iter().sum::<u64>() > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lifecycle_event_listener_fires() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        #[derive(Default)]
+        struct Counter {
+            wal_created: AtomicU64,
+            wal_deleted: AtomicU64,
+            manifest_created: AtomicU64,
+            format_upgrade: AtomicU64,
+        }
+        impl EventListener for Counter {
+            fn on_wal_created(&self, _n: u64) {
+                self.wal_created.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_wal_deleted(&self, _n: u64) {
+                self.wal_deleted.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_manifest_created(&self, _n: u64) {
+                self.manifest_created.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_format_upgrade(&self, _v: u32) {
+                self.format_upgrade.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Counter::default());
+        let dir = temp_dir();
+        let opts = Options {
+            // Start below the newest version so there is at least one upgrade step to take.
+            format_major_version: FormatMajorVersion::MOST_COMPATIBLE,
+            event_listener: Some(counter.clone()),
+            ..Default::default()
+        };
+        let db = Db::open(&dir, opts).unwrap();
+        // Open created the session MANIFEST and the first WAL.
+        assert_eq!(counter.manifest_created.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.wal_created.load(Ordering::Relaxed), 1);
+
+        // A flush rotates in a fresh WAL (created) and retires the old one (deleted).
+        db.set(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        assert!(counter.wal_created.load(Ordering::Relaxed) >= 2);
+        assert!(counter.wal_deleted.load(Ordering::Relaxed) >= 1);
+
+        // Ratcheting the format major version fires one upgrade event per step.
+        db.ratchet_format_major_version(FormatMajorVersion::NEWEST)
+            .unwrap();
+        assert!(counter.format_upgrade.load(Ordering::Relaxed) >= 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

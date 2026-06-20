@@ -56,8 +56,9 @@ _Done so far: indexed batches (read-your-own-writes), `single_delete` / `delete_
 (`IterOptions::range_key_masking_suffix`), the table-level
 block-property collector/filter mechanism, the disk-health-checking vfs, the `objstorage`
 provider (local + shared/remote), `EstimateDiskUsage`, `Db::table_stats`, richer `Metrics`,
-the LSM view (+ `db lsm` and `find` CLI), flush/compaction **begin** + table/ingest
-`EventListener` events, **write stalls** with stall events, step-wise
+the LSM view (+ `db lsm` and `find` CLI), flush/compaction **begin** + table/ingest +
+**WAL/MANIFEST create-delete + format-upgrade + background-error** `EventListener` events,
+**write stalls** with stall events, step-wise
 **format-major-version migrations**, `Db::excise` / `ingest_and_excise` / `compact`,
 configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`),
 `Snapshot::iter_with_options`, a `Logger`, and the `Cleaner` (delete/archive)._
