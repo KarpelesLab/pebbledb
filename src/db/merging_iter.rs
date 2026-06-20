@@ -296,6 +296,12 @@ pub struct IterOptions {
     /// [`split`](crate::base::comparer::Comparer::split); with the default (suffix-less)
     /// comparer no point ever has a suffix, so masking never fires.
     pub range_key_masking_suffix: Option<Vec<u8>>,
+    /// Table-level block-property filters (Pebble's `BlockPropertyFilters`). An sstable whose
+    /// recorded property is ruled out by *any* of these filters has its point keys skipped
+    /// during iteration; the table's range tombstones and range keys are still consulted, so
+    /// shadowing remains correct. Empty (default) disables filtering.
+    pub block_property_filters:
+        Vec<std::sync::Arc<dyn crate::sstable::blockprop::BlockPropertyFilter>>,
 }
 
 /// A bidirectional iterator over a database's user keys at a fixed snapshot.

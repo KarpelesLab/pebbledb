@@ -652,6 +652,114 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn block_property_filter_skips_nonmatching_sstables() {
+    use pebbledb::base::internal_key::encoded_user_key;
+    use pebbledb::sstable::blockprop::{BlockPropertyCollector, BlockPropertyFilter};
+
+    // A collector recording each table's [min, max] user key as two length-prefixed slices.
+    struct MinMaxKey {
+        min: Option<Vec<u8>>,
+        max: Option<Vec<u8>>,
+    }
+    impl BlockPropertyCollector for MinMaxKey {
+        fn name(&self) -> &str {
+            "test.minmaxkey"
+        }
+        fn add(&mut self, ik: &[u8], _v: &[u8]) {
+            let k = encoded_user_key(ik).to_vec();
+            if self.min.as_ref().is_none_or(|m| &k < m) {
+                self.min = Some(k.clone());
+            }
+            if self.max.as_ref().is_none_or(|m| &k > m) {
+                self.max = Some(k);
+            }
+        }
+        fn finish(&mut self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for s in [self.min.take().unwrap(), self.max.take().unwrap()] {
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(&s);
+            }
+            out
+        }
+    }
+    // A filter: does the table's [min, max] intersect the query range [lo, hi)?
+    struct RangeFilter {
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    }
+    impl BlockPropertyFilter for RangeFilter {
+        fn name(&self) -> &str {
+            "test.minmaxkey"
+        }
+        fn intersects(&self, prop: &[u8]) -> bool {
+            let rd = |off: usize| -> (Vec<u8>, usize) {
+                let n = u32::from_le_bytes(prop[off..off + 4].try_into().unwrap()) as usize;
+                (prop[off + 4..off + 4 + n].to_vec(), off + 4 + n)
+            };
+            let (min, o) = rd(0);
+            let (max, _) = rd(o);
+            min < self.hi && max >= self.lo
+        }
+    }
+
+    let dir = temp_dir("bpc-filter");
+    let db = Db::open(
+        &dir,
+        Options {
+            block_property_collectors: vec![Arc::new(|| {
+                Box::new(MinMaxKey {
+                    min: None,
+                    max: None,
+                })
+            })],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Two flushes produce two L0 sstables with disjoint key ranges.
+    for k in [b"d".as_ref(), b"h", b"m", b"q"] {
+        db.set(k, b"v").unwrap();
+    }
+    db.flush().unwrap();
+    for k in [b"t".as_ref(), b"w", b"z"] {
+        db.set(k, b"v").unwrap();
+    }
+    db.flush().unwrap();
+
+    let collect = |opts: IterOptions| -> Vec<Vec<u8>> {
+        let mut it = db.iter_with_options(opts).unwrap();
+        let mut out = Vec::new();
+        it.first().unwrap();
+        while it.valid() {
+            out.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        out
+    };
+
+    // No filter: all seven keys.
+    assert_eq!(collect(IterOptions::default()).len(), 7);
+
+    // Filter [a, r): intersects the first table (d..q) but not the second (t..z), so only the
+    // first table's point keys are produced.
+    let filtered = collect(IterOptions {
+        block_property_filters: vec![Arc::new(RangeFilter {
+            lo: b"a".to_vec(),
+            hi: b"r".to_vec(),
+        })],
+        ..Default::default()
+    });
+    assert_eq!(
+        filtered,
+        vec![b"d".to_vec(), b"h".to_vec(), b"m".to_vec(), b"q".to_vec()],
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn manual_compact_range_drains_upper_levels() {
     let dir = temp_dir("compact-range");
     let opts = Options {

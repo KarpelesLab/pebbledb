@@ -411,11 +411,14 @@ struct OutputBuilder {
 impl OutputBuilder {
     fn new(db: &DbInner, file_num: u64) -> Result<OutputBuilder> {
         let path = db.dir.join(filenames::table(file_num));
-        let writer = Writer::new(
+        let mut writer = Writer::new(
             db.fs.create(&path)?,
             db.cmp.clone(),
             WriterOptions::default(),
         );
+        for factory in &db.block_property_collectors {
+            writer.add_block_property_collector(factory());
+        }
         Ok(OutputBuilder {
             file_num,
             path,

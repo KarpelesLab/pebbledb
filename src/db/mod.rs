@@ -52,6 +52,11 @@ use crate::sstable::{Reader, Writer, WriterOptions};
 use crate::vfs::{DirLock, DiskFs, Fs, WritableFile};
 use crate::{Error, Result};
 
+/// A factory producing a fresh [`BlockPropertyCollector`](crate::sstable::blockprop::BlockPropertyCollector)
+/// for each sstable written. Used in [`Options::block_property_collectors`].
+pub type BlockPropertyCollectorFactory =
+    Arc<dyn Fn() -> Box<dyn crate::sstable::blockprop::BlockPropertyCollector> + Send + Sync>;
+
 /// Options for opening a database.
 #[derive(Clone)]
 pub struct Options {
@@ -81,6 +86,11 @@ pub struct Options {
     /// consulted when opening a store whose recorded merger name differs from
     /// [`merger`](Options::merger). Pebble's merger registry.
     pub mergers: Vec<Arc<dyn crate::base::merge::Merger>>,
+    /// Factories for the block-property collectors run over every sstable this store writes
+    /// (at flush and compaction). Each factory produces a fresh collector per output file;
+    /// the resulting properties are stored in the table and can be matched at read time with
+    /// [`IterOptions::block_property_filters`]. Pebble's `BlockPropertyCollectors`.
+    pub block_property_collectors: Vec<BlockPropertyCollectorFactory>,
     /// Size in bytes of the shared block cache for decompressed blocks (default 8 MiB).
     /// Zero disables block caching.
     pub block_cache_size: usize,
@@ -211,6 +221,7 @@ impl Default for Options {
             merger: None,
             comparers: Vec::new(),
             mergers: Vec::new(),
+            block_property_collectors: Vec::new(),
             block_cache_size: 8 << 20,
             max_open_files: 1000,
             fs: Arc::new(DiskFs),
@@ -290,6 +301,8 @@ pub struct DbInner {
     logger: Option<Arc<dyn Logger>>,
     /// How obsolete files are disposed of.
     cleaner: Arc<dyn Cleaner>,
+    /// Factories for block-property collectors run over every sstable written.
+    block_property_collectors: Vec<BlockPropertyCollectorFactory>,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -491,6 +504,7 @@ impl DbInner {
                 format_major_version: Mutex::new(format_major_version),
                 logger: opts.logger.clone(),
                 cleaner: opts.cleaner.clone(),
+                block_property_collectors: opts.block_property_collectors.clone(),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -522,7 +536,14 @@ impl DbInner {
         // the next open.
         if !mem.is_empty() {
             let file_num = vs.allocate_file_number();
-            let meta = write_memtable_to_sstable(fs.as_ref(), &dir, &cmp, file_num, &mem)?;
+            let meta = write_memtable_to_sstable(
+                fs.as_ref(),
+                &dir,
+                &cmp,
+                file_num,
+                &mem,
+                &opts.block_property_collectors,
+            )?;
             let edit = VersionEdit {
                 next_file_number: Some(vs.next_file_number),
                 last_sequence: Some(vs.last_sequence),
@@ -597,6 +618,7 @@ impl DbInner {
             format_major_version: Mutex::new(format_major_version),
             logger: opts.logger.clone(),
             cleaner: opts.cleaner.clone(),
+            block_property_collectors: opts.block_property_collectors.clone(),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
@@ -969,8 +991,14 @@ impl DbInner {
         }
 
         // Write the sstable without holding the state lock.
-        let meta =
-            write_memtable_to_sstable(self.fs.as_ref(), &self.dir, &self.cmp, file_num, &mem)?;
+        let meta = write_memtable_to_sstable(
+            self.fs.as_ref(),
+            &self.dir,
+            &self.cmp,
+            file_num,
+            &mem,
+            &self.block_property_collectors,
+        )?;
         let flushed_bytes = meta.size;
 
         let mut state = self.state.lock().unwrap();
@@ -1198,9 +1226,17 @@ impl DbInner {
         for level in version.levels.iter() {
             for f in level {
                 let reader = self.open_reader(f.file_num)?;
+                // Range tombstones and range keys must be consulted even when a block-property
+                // filter rules the table's point keys out: they can shadow keys elsewhere.
                 tombstones.extend_from_slice(reader.range_tombstones());
                 range_keys.extend_from_slice(reader.range_keys());
-                sources.push(Box::new(reader.iter()?));
+                let point_excluded = opts
+                    .block_property_filters
+                    .iter()
+                    .any(|filter| !reader.may_match_block_property(filter.as_ref()));
+                if !point_excluded {
+                    sources.push(Box::new(reader.iter()?));
+                }
             }
         }
         DbIterator::with_options(
@@ -1722,10 +1758,14 @@ fn write_memtable_to_sstable(
     cmp: &Arc<dyn Comparer>,
     file_num: u64,
     mem: &Arc<MemTable>,
+    collectors: &[BlockPropertyCollectorFactory],
 ) -> Result<FileMetadata> {
     let path = dir.join(filenames::table(file_num));
     let file = fs.create(&path)?;
     let mut w = Writer::new(file, cmp.clone(), WriterOptions::default());
+    for factory in collectors {
+        w.add_block_property_collector(factory());
+    }
 
     let mut it = mem.iter();
     it.first();

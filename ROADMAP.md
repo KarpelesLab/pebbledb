@@ -68,16 +68,19 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   provide read-your-own-writes), batch reuse/reset, and large batches handled as flushables.
 
 ### Iterators
-- Remaining **`IterOptions`**: key-type selection (point / range / both), table filters,
-  **block-property filters wired into iteration**, `OnlyReadGuaranteedDurable`. (`SetBounds`,
-  range-key surfacing + coalescing, **range-key masking**, and `ScanInternal` are done.)
+- Remaining **`IterOptions`**: key-type selection (point / range / both),
+  `OnlyReadGuaranteedDurable`. (`SetBounds`, range-key surfacing + coalescing, **range-key
+  masking**, **block-property filters wired into iteration** — table-level skipping via
+  `IterOptions::block_property_filters` — and `ScanInternal` are done.)
 - `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
 - Bloom-skip during `seek_prefix_ge`.
 
 ### Block properties
 - **Per-block** (vs per-table) properties stored in the index, and filter-driven block
-  skipping during iteration and compaction. (The table-level collector/filter mechanism is
-  done; the concrete MVCC-time collector is CockroachDB's.)
+  skipping during compaction. (The table-level collector/filter mechanism is done, including
+  collectors wired into the flush/compaction writers via `Options::block_property_collectors`
+  and table-level filter skipping during iteration; the concrete MVCC-time collector is
+  CockroachDB's.)
 
 ### Compaction
 - **Compaction scheduler**: multiple concurrent background compactions, prioritization.
