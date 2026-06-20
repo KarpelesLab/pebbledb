@@ -3089,6 +3089,61 @@ fn excise_removes_and_reclaims_range() {
 }
 
 #[test]
+fn shared_objstorage_round_trips_and_survives_reopen() {
+    use pebbledb::objstorage::{InMemoryRemote, RemoteStorage};
+
+    let dir = temp_dir("objstore-shared");
+    let remote: Arc<dyn RemoteStorage> = Arc::new(InMemoryRemote::new());
+    let opts = || Options {
+        remote_storage: Some(Arc::clone(&remote)),
+        create_on_shared: true,
+        mem_table_size: 16 * 1024,
+        ..Default::default()
+    };
+
+    let db = Db::open(&dir, opts()).unwrap();
+    for i in 0..400u32 {
+        db.set(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // The sstables live in the shared backend, not on the local filesystem.
+    let remote_ssts = remote
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.ends_with(".sst"))
+        .count();
+    assert!(remote_ssts >= 1, "expected sstables in the shared backend");
+    let local_ssts = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
+        .count();
+    assert_eq!(local_ssts, 0, "no sstables should remain on local disk");
+
+    let check = |db: &Db| {
+        for i in 0..400u32 {
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes()),
+                "key {i}"
+            );
+        }
+    };
+    check(&db);
+
+    // Reopen with the same shared backend: reads resolve from it.
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    check(&db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_consistency_passes_for_a_well_formed_lsm() {
     let dir = temp_dir("consistency");
     let db = Db::open(

@@ -104,6 +104,16 @@ pub struct Options {
     /// The filesystem the database performs all of its I/O through (default [`DiskFs`]).
     /// Use [`crate::vfs::MemFs`] for fully in-memory operation.
     pub fs: Arc<dyn Fs>,
+    /// Optional shared/remote object-storage backend (Pebble's disaggregated `objstorage`).
+    /// When set, sstables (and their blob files) can live in this backend instead of on `fs`;
+    /// reads transparently probe it. A concrete cloud backend is application code implementing
+    /// [`RemoteStorage`](crate::objstorage::RemoteStorage); `None` (default) keeps everything
+    /// local.
+    pub remote_storage: Option<Arc<dyn crate::objstorage::RemoteStorage>>,
+    /// When `true` and [`remote_storage`](Self::remote_storage) is set, sstables produced by
+    /// flush, compaction, and ingest are written to the shared backend rather than `fs`
+    /// (Pebble's `CreateOnShared`). Default `false`.
+    pub create_on_shared: bool,
     /// The on-disk format major version a newly created store is initialized to (default
     /// [`FormatMajorVersion::DEFAULT`]). Existing stores keep their recorded version.
     pub format_major_version: FormatMajorVersion,
@@ -287,6 +297,8 @@ impl Default for Options {
             block_cache_size: 8 << 20,
             max_open_files: 1000,
             fs: Arc::new(DiskFs),
+            remote_storage: None,
+            create_on_shared: false,
             format_major_version: FormatMajorVersion::DEFAULT,
             wal_dir: None,
             wal_failover_dir: None,
@@ -388,6 +400,8 @@ struct State {
 struct BlobStore {
     fs: Arc<dyn Fs>,
     dir: PathBuf,
+    /// Shared/remote backend; a blob file is read from here when present (for shared sstables).
+    remote: Option<Arc<dyn crate::objstorage::RemoteStorage>>,
     cache: Mutex<HashMap<u64, Arc<crate::sstable::blob::BlobFileReader>>>,
 }
 
@@ -396,7 +410,11 @@ impl BlobStore {
         if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
             return Ok(Arc::clone(r));
         }
-        let bytes = self.fs.read(&self.dir.join(filenames::blob(file_num)))?;
+        let name = filenames::blob(file_num);
+        let bytes = match &self.remote {
+            Some(remote) if remote.exists(&name) => remote.get(&name)?,
+            _ => self.fs.read(&self.dir.join(&name))?,
+        };
         let r = Arc::new(crate::sstable::blob::BlobFileReader::open(bytes)?);
         self.cache.lock().unwrap().insert(file_num, Arc::clone(&r));
         Ok(r)
@@ -445,6 +463,10 @@ pub struct DbInner {
     max_open_files: usize,
     /// The filesystem all I/O goes through.
     fs: Arc<dyn Fs>,
+    /// Optional shared/remote object-storage backend for sstables and blob files.
+    remote: Option<Arc<dyn crate::objstorage::RemoteStorage>>,
+    /// Whether newly written sstables/blob files go to the shared backend (`create_on_shared`).
+    create_on_shared: bool,
     /// WAL directories, primary first then failover targets. The active WAL is created in
     /// the first that accepts it; recovery scans them all.
     wal_dirs: Vec<PathBuf>,
@@ -581,20 +603,33 @@ impl DbInner {
             }
         }
         // Delete physical sstables no live or in-flight file still references (a backing file
-        // shared by virtual sstables survives until the last referrer is gone).
+        // shared by virtual sstables survives until the last referrer is gone). Shared tables
+        // are removed from the remote backend; local ones from the filesystem.
         for phys in candidate_tables {
             if !live_tables.contains(&phys) {
                 self.cache.lock().unwrap().remove(&phys);
-                self.clean_file(&self.dir.join(filenames::table(phys)));
+                let name = filenames::table(phys);
+                if let Some(remote) = &self.remote
+                    && remote.exists(&name)
+                {
+                    let _ = remote.delete(&name);
+                } else {
+                    self.clean_file(&self.dir.join(&name));
+                }
             }
         }
         // Delete blob files the removed sstables referenced that no live file still needs.
         for blob in candidate_blobs {
             if !live_blobs.contains(&blob) {
-                let blob_path = self.dir.join(filenames::blob(blob));
-                if self.fs.exists(&blob_path) {
+                let name = filenames::blob(blob);
+                if let Some(remote) = &self.remote
+                    && remote.exists(&name)
+                {
                     self.blob_store.evict(blob);
-                    self.clean_file(&blob_path);
+                    let _ = remote.delete(&name);
+                } else if self.fs.exists(&self.dir.join(&name)) {
+                    self.blob_store.evict(blob);
+                    self.clean_file(&self.dir.join(&name));
                 }
             }
         }
@@ -823,13 +858,24 @@ impl DbInner {
         // persist them, so blob-file GC would otherwise think recovered tables reference no
         // blob files and could delete blobs still in use. Only needed when blob files exist,
         // so a store that never used blob separation pays nothing.
-        if !opts.read_only && names.iter().any(|n| n.ends_with(".blob")) {
+        let any_blob_files = names.iter().any(|n| n.ends_with(".blob"))
+            || opts.remote_storage.as_ref().is_some_and(|r| {
+                r.list()
+                    .map(|l| l.iter().any(|n| n.ends_with(".blob")))
+                    .unwrap_or(false)
+            });
+        if !opts.read_only && any_blob_files {
             for level in vs.current.levels.iter_mut() {
                 for f in level.iter_mut() {
                     if !f.blob_refs.is_empty() {
                         continue;
                     }
-                    let bytes = fs.read(&dir.join(filenames::table(f.file_num)))?;
+                    // Source the table from the shared backend when it lives there.
+                    let table_name = filenames::table(f.file_num);
+                    let bytes = match &opts.remote_storage {
+                        Some(r) if r.exists(&table_name) => r.get(&table_name)?,
+                        _ => fs.read(&dir.join(&table_name))?,
+                    };
                     let refs = Reader::open(bytes, cmp.clone())?.blob_refs().to_vec();
                     if !refs.is_empty() {
                         let mut meta = (**f).clone();
@@ -865,6 +911,7 @@ impl DbInner {
             let blob_store = Arc::new(BlobStore {
                 fs: Arc::clone(&fs),
                 dir: dir.clone(),
+                remote: opts.remote_storage.clone(),
                 cache: Mutex::new(HashMap::new()),
             });
             return Ok(DbInner {
@@ -892,6 +939,8 @@ impl DbInner {
                 },
                 max_open_files: opts.max_open_files.max(1),
                 fs,
+                remote: opts.remote_storage.clone(),
+                create_on_shared: opts.create_on_shared,
                 _lock: None,
                 format_major_version: Mutex::new(format_major_version),
                 logger: opts.logger.clone(),
@@ -1011,6 +1060,7 @@ impl DbInner {
         let blob_store = Arc::new(BlobStore {
             fs: Arc::clone(&fs),
             dir: dir.clone(),
+            remote: opts.remote_storage.clone(),
             cache: Mutex::new(HashMap::new()),
         });
         Ok(DbInner {
@@ -1038,6 +1088,8 @@ impl DbInner {
             },
             max_open_files: opts.max_open_files.max(1),
             fs,
+            remote: opts.remote_storage.clone(),
+            create_on_shared: opts.create_on_shared,
             _lock: Some(lock),
             format_major_version: Mutex::new(format_major_version),
             logger: opts.logger.clone(),
@@ -1672,6 +1724,10 @@ impl DbInner {
             self.value_block_threshold,
             self.blob_value_threshold,
         )?;
+        // Move freshly-flushed tables to shared storage when create_on_shared is enabled.
+        for m in &metas {
+            self.upload_if_shared(m.file_num)?;
+        }
         let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
         let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
         let created: Vec<u64> = metas.iter().map(|m| m.file_num).collect();
@@ -2142,12 +2198,43 @@ impl DbInner {
         })
     }
 
+    /// Reads a database object (an sstable or blob file) named `name`, transparently sourcing
+    /// it from the shared/remote backend when present there, otherwise from the local `fs`.
+    fn read_object(&self, name: &str) -> Result<Vec<u8>> {
+        if let Some(remote) = &self.remote
+            && remote.exists(name)
+        {
+            return Ok(remote.get(name)?);
+        }
+        Ok(self.fs.read(&self.dir.join(name))?)
+    }
+
+    /// If `create_on_shared` is enabled, moves the just-written sstable (and its blob file, if
+    /// any) for `file_num` from the local `fs` into the shared/remote backend.
+    fn upload_if_shared(&self, file_num: u64) -> Result<()> {
+        if !self.create_on_shared {
+            return Ok(());
+        }
+        let Some(remote) = &self.remote else {
+            return Ok(());
+        };
+        for name in [filenames::table(file_num), filenames::blob(file_num)] {
+            let path = self.dir.join(&name);
+            if self.fs.exists(&path) {
+                let bytes = self.fs.read(&path)?;
+                remote.put(&name, &bytes)?;
+                let _ = self.fs.remove(&path);
+            }
+        }
+        Ok(())
+    }
+
     /// Opens (or returns a cached) reader for the sstable with the given file number.
     fn open_reader(&self, file_num: u64) -> Result<Arc<Reader>> {
         if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
             return Ok(Arc::clone(r));
         }
-        let bytes = self.fs.read(&self.dir.join(filenames::table(file_num)))?;
+        let bytes = self.read_object(&filenames::table(file_num))?;
         let reader = Arc::new(
             Reader::open_with_cache(bytes, self.cmp.clone(), file_num, self.block_cache.clone())?
                 .with_blob_resolver(

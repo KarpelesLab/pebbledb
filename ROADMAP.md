@@ -164,10 +164,14 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `RestrictToSpans`-style span restriction, via `Db::checkpoint_with_options`.)
 
 ### Remote / disaggregated storage
-- Wire the engine's sstable reads/writes onto the **`objstorage` provider** so shared
-  (remote) tables participate in the LSM. (The provider abstraction — local + the
-  `remote.Storage` interface with an in-memory backend — is implemented; concrete cloud
-  backends like S3/GCS/Azure are application code.)
+- (Done: the engine's sstable reads/writes are **wired onto shared/remote storage**. With
+  `Options::remote_storage` (a `RemoteStorage` backend) and `Options::create_on_shared`,
+  sstables and their blob files produced by flush, compaction, and ingest are written to the
+  shared backend; reads (point lookups, iteration, blob resolution, the open-time blob-ref
+  scan) transparently probe remote-then-local, and obsolete shared objects are deleted from
+  the backend. Survives reopen against the same backend. The `RemoteStorage` abstraction ships
+  with an in-memory backend; concrete cloud backends (S3/GCS/Azure) are application code, and
+  the exact on-disk objstorage catalog byte-format is a Go-interop-CI nuance.)
 
 ### WAL
 - The full `pebble/wal` failover **manager** (have: multi-directory write-failover +

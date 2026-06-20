@@ -163,6 +163,7 @@ impl DbInner {
         let mut new_files = Vec::new();
         for (path, file_num, seqnum) in &plan {
             let meta = self.rewrite_external(path, *file_num, *seqnum)?;
+            self.upload_if_shared(*file_num)?;
             new_files.push(NewFileEntry { level: 0, meta });
         }
 

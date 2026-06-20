@@ -14,10 +14,10 @@ lineage.
 > external-sstable ingestion, an `OPTIONS` file with format-major-version ratcheting, a
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
-> The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
-> provider into the engine and columnar key-schema byte-parity — most of it gated on the Go
-> interop CI) is catalogued in
-> [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
+> The remaining work toward full upstream parity is mostly cross-implementation **byte-parity**
+> (the objstorage catalog and columnar key-schema on-disk encodings), validated by the Go
+> interop CI, and is catalogued in [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet
+> stable.
 
 ## Capabilities
 
@@ -55,7 +55,9 @@ lineage.
   create-delete, format upgrade, write-stall, background-error), a `Logger`, and a `Cleaner`
   (delete or archive obsolete files).
 - **Filesystem & objects**: an `Fs` trait with `DiskFs`, in-memory `MemFs`, and a
-  disk-health-checking wrapper; an `objstorage` provider for local + shared/remote objects.
+  disk-health-checking wrapper; **shared/remote object storage** wired into the engine
+  (`Options::remote_storage` + `create_on_shared`) so sstables and blob files can live in a
+  pluggable `RemoteStorage` backend, with reads probing remote-then-local.
 - **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `scan` /
   `lsm`, `find`, and `bench`).
 

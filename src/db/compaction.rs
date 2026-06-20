@@ -760,6 +760,11 @@ impl DbInner {
             outputs.push(b.finish()?);
         }
 
+        // Move compaction outputs to shared storage when create_on_shared is enabled (off lock).
+        for m in &outputs {
+            self.upload_if_shared(m.file_num)?;
+        }
+
         // Phase C (locked): record the edit — delete every input, add every output to the
         // output level — apply it, and clear the inputs' `compacting` marks.
         let mut state = self.state.lock().unwrap();
