@@ -991,6 +991,7 @@ impl OutputBuilder {
             smallest_seqnum: self.smallest_seq.min(self.largest_seq),
             largest_seqnum: self.largest_seq,
             blob_refs,
+            backing: None,
         })
     }
 }

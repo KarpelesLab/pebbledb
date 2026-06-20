@@ -82,6 +82,19 @@ pub struct FileMetadata {
     /// serialized to the MANIFEST; repopulated at open by scanning the sstable's metaindex.
     /// Empty for tables that reference no blob files.
     pub blob_refs: Vec<u64>,
+    /// For a **virtual sstable**, the file number of the physical backing sstable it is a
+    /// bounded view of (`<backing>.sst` on disk); the view is restricted to `[smallest,
+    /// largest]`. `None` for an ordinary physical table (which is its own backing). Persisted
+    /// in the MANIFEST via the `CUSTOM_TAG_VIRTUAL` custom tag.
+    pub backing: Option<u64>,
+}
+
+impl FileMetadata {
+    /// The physical sstable file number to read from: the backing file for a virtual table,
+    /// otherwise the table's own number.
+    pub fn physical_num(&self) -> u64 {
+        self.backing.unwrap_or(self.file_num)
+    }
 }
 
 /// A newly added file together with the level it was added to.
@@ -248,7 +261,14 @@ impl VersionEdit {
             put_uvarint(&mut buf, *file_num);
         }
         for nf in &self.new_files {
-            put_uvarint(&mut buf, TAG_NEW_FILE2);
+            // A virtual table carries a backing-file custom tag, so it must use the
+            // custom-tag-capable NewFile4 layout; physical tables stay on NewFile2.
+            let tag = if nf.meta.backing.is_some() {
+                TAG_NEW_FILE4
+            } else {
+                TAG_NEW_FILE2
+            };
+            put_uvarint(&mut buf, tag);
             put_uvarint(&mut buf, nf.level as u64);
             put_uvarint(&mut buf, nf.meta.file_num);
             put_uvarint(&mut buf, nf.meta.size);
@@ -256,6 +276,11 @@ impl VersionEdit {
             put_bytes(&mut buf, &nf.meta.largest);
             put_uvarint(&mut buf, nf.meta.smallest_seqnum);
             put_uvarint(&mut buf, nf.meta.largest_seqnum);
+            if let Some(backing) = nf.meta.backing {
+                put_uvarint(&mut buf, CUSTOM_TAG_VIRTUAL);
+                put_uvarint(&mut buf, backing);
+                put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
+            }
         }
         buf
     }
@@ -318,9 +343,11 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
         (0, 0)
     };
 
-    if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
-        decode_custom_tags(d)?;
-    }
+    let backing = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
+        decode_custom_tags(d)?
+    } else {
+        None
+    };
 
     Ok(NewFileEntry {
         level,
@@ -333,6 +360,7 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             largest_seqnum,
             // Not serialized; the engine repopulates this from the sstable at open.
             blob_refs: Vec::new(),
+            backing,
         },
     })
 }
@@ -340,7 +368,8 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
 /// Consumes the custom-tag stream of a `NewFile4`/`NewFile5` record up to the terminator.
 /// Each tag's payload is parsed exactly so the stream stays aligned; payloads for features
 /// this engine does not model are discarded.
-fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<()> {
+fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<Option<u64>> {
+    let mut backing = None;
     loop {
         let custom = d.uvarint()?;
         match custom {
@@ -352,7 +381,7 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<()> {
             }
             CUSTOM_TAG_VIRTUAL => {
                 // Virtual table: the backing file's disk number follows.
-                let _backing_file_num = d.uvarint()?;
+                backing = Some(d.uvarint()?);
             }
             CUSTOM_TAG_SYNTHETIC_PREFIX | CUSTOM_TAG_SYNTHETIC_SUFFIX => {
                 let _field = d.bytes()?;
@@ -384,7 +413,7 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(backing)
 }
 
 #[cfg(test)]
@@ -402,6 +431,7 @@ mod tests {
             smallest_seqnum: ss,
             largest_seqnum: ls,
             blob_refs: Vec::new(),
+            backing: None,
         }
     }
 
@@ -466,6 +496,43 @@ mod tests {
         assert_eq!(nf.meta.smallest, small);
         assert_eq!(nf.meta.largest, large);
         assert_eq!((nf.meta.smallest_seqnum, nf.meta.largest_seqnum), (3, 9));
+    }
+
+    #[test]
+    fn virtual_file_backing_round_trips_through_manifest() {
+        // A virtual sstable (backing = Some) and a physical one in the same edit.
+        let mut virt = meta(7, "b", "m", 4, 9);
+        virt.backing = Some(3); // a bounded view over physical file 3
+        let phys = meta(8, "p", "z", 2, 6);
+        let edit = VersionEdit {
+            new_files: vec![
+                NewFileEntry {
+                    level: 5,
+                    meta: virt.clone(),
+                },
+                NewFileEntry {
+                    level: 5,
+                    meta: phys.clone(),
+                },
+            ],
+            ..Default::default()
+        };
+        let decoded = VersionEdit::decode(&edit.encode()).unwrap();
+        assert_eq!(decoded.new_files.len(), 2);
+        let dv = &decoded.new_files[0].meta;
+        assert_eq!(dv.file_num, 7);
+        assert_eq!(
+            dv.backing,
+            Some(3),
+            "virtual backing must survive the round trip"
+        );
+        assert_eq!(dv.physical_num(), 3);
+        assert_eq!(dv.smallest, virt.smallest);
+        assert_eq!(dv.largest, virt.largest);
+        let dp = &decoded.new_files[1].meta;
+        assert_eq!(dp.file_num, 8);
+        assert_eq!(dp.backing, None, "physical file has no backing");
+        assert_eq!(dp.physical_num(), 8);
     }
 
     #[test]

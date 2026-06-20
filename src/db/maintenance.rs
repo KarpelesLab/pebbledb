@@ -272,6 +272,7 @@ impl DbInner {
             smallest_seqnum: seqnum,
             largest_seqnum: seqnum,
             blob_refs,
+            backing: None,
         })
     }
 }

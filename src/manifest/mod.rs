@@ -216,6 +216,7 @@ mod tests {
             smallest_seqnum: ss,
             largest_seqnum: ls,
             blob_refs: Vec::new(),
+            backing: None,
         }
     }
 

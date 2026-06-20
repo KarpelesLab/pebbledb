@@ -2763,6 +2763,7 @@ fn write_memtable_to_sstables(
                 smallest_seqnum: smallest_seq.min(largest_seq),
                 largest_seqnum: largest_seq,
                 blob_refs,
+                backing: None,
             });
             let next = start_writer(&mut nfi)?;
             file_num = next.0;
@@ -2841,6 +2842,7 @@ fn write_memtable_to_sstables(
         smallest_seqnum: smallest_seq.min(largest_seq),
         largest_seqnum: largest_seq,
         blob_refs,
+        backing: None,
     });
     Ok(outputs)
 }
