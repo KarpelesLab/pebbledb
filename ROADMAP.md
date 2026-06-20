@@ -148,10 +148,11 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   open) is done.)
 
 ### Observability & file management
-- Remaining **`EventListener`** events: disk-slow routed from the health-checking vfs into the
-  DB listener. (Have: flush/compaction begin+end, table created/deleted/**validated**, **table
-  stats loaded**, ingest end, write-stall begin+end, WAL/MANIFEST create-delete, format
-  upgrade, background-error; plus `Db::validate_sstables` to drive table validation.)
+- (Done — the full **`EventListener`** surface: flush/compaction begin+end, table
+  created/deleted/**validated**, **table stats loaded**, ingest end, write-stall begin+end,
+  WAL/MANIFEST create-delete, format upgrade, background-error, and **disk-slow** routed from
+  the health-checking vfs via `Options::disk_slow_threshold`; plus `Db::validate_sstables` to
+  drive table validation.)
 - Further **`Metrics`** breadth (per-op latencies, amplification). (Have: core `Metrics`,
   the LSM view, a `Logger`, the `Cleaner`, and memtable-count write stalls.)
 

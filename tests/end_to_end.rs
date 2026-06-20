@@ -1143,6 +1143,50 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn disk_slow_events_are_routed_to_the_listener() {
+    use pebbledb::EventListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Counter {
+        slow: AtomicUsize,
+    }
+    impl EventListener for Counter {
+        fn on_disk_slow(&self, _op: &str, _path: &std::path::Path, _d: Duration) {
+            self.slow.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = temp_dir("disk-slow");
+    let counter = Arc::new(Counter::default());
+    // A 1ns threshold makes every real filesystem op count as "slow", so any write routes an
+    // on_disk_slow event — exercising the wiring deterministically without an artificial delay.
+    let db = Db::open(
+        &dir,
+        Options {
+            event_listener: Some(counter.clone()),
+            disk_slow_threshold: Some(Duration::from_nanos(1)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..50u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+
+    assert!(
+        counter.slow.load(Ordering::SeqCst) > 0,
+        "disk-slow events should be routed to the listener"
+    );
+    // Data is unaffected by the health-check wrapper.
+    assert_eq!(db.get(b"k000").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn validate_sstables_and_stats_events() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

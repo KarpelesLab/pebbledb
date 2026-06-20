@@ -142,6 +142,10 @@ pub struct Options {
     /// thread that spaces them out to avoid disk-I/O bursts; `0` (default) deletes inline and
     /// immediately.
     pub target_byte_deletion_rate: u64,
+    /// When set, the filesystem is wrapped in a health checker that reports any operation
+    /// taking at least this long to [`EventListener::on_disk_slow`]. `None` (default) leaves
+    /// the filesystem unwrapped.
+    pub disk_slow_threshold: Option<std::time::Duration>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -181,6 +185,9 @@ pub trait EventListener: Send + Sync {
     fn on_table_stats_loaded(&self, _tables: usize) {}
     /// Called after an sstable is validated, with its file number and whether it passed.
     fn on_table_validated(&self, _file_num: u64, _ok: bool) {}
+    /// Called when a filesystem operation exceeds the configured disk-slow threshold (routed
+    /// from the health-checking vfs when [`Options::disk_slow_threshold`] is set).
+    fn on_disk_slow(&self, _op: &str, _path: &Path, _duration: std::time::Duration) {}
 }
 
 /// A sink for the database's informational and error log messages, mirroring Pebble's
@@ -259,6 +266,7 @@ impl Default for Options {
             read_compaction_threshold: 1024,
             l1_max_bytes: 10 << 20,
             target_byte_deletion_rate: 0,
+            disk_slow_threshold: None,
         }
     }
 }
@@ -507,7 +515,23 @@ impl DbInner {
     /// the result in an `Arc` and spawns the worker.
     fn open_inner(dir: impl AsRef<Path>, opts: Options) -> Result<DbInner> {
         let dir = dir.as_ref().to_path_buf();
-        let fs = opts.fs.clone();
+        // With a disk-slow threshold configured, wrap the filesystem in a health checker that
+        // routes slow operations to the event listener's `on_disk_slow`.
+        let fs: Arc<dyn Fs> = match opts.disk_slow_threshold {
+            Some(threshold) => {
+                let listener = opts.event_listener.clone();
+                Arc::new(crate::vfs::DiskHealthCheckingFs::new(
+                    opts.fs.clone(),
+                    threshold,
+                    Arc::new(move |info| {
+                        if let Some(l) = &listener {
+                            l.on_disk_slow(info.op, &info.path, info.duration);
+                        }
+                    }),
+                ))
+            }
+            None => opts.fs.clone(),
+        };
 
         // WAL directories: the primary (override or the db dir) first, then any failover
         // directory. Recovery scans them all; the active WAL is created in the first that
