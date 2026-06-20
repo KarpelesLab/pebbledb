@@ -1503,7 +1503,11 @@ impl DbInner {
                     .iter()
                     .any(|filter| !reader.may_match_block_property(filter.as_ref()));
                 if !point_excluded {
-                    sources.push(Box::new(reader.iter()?));
+                    // Within a table that passes the table-level filter, skip individual data
+                    // blocks ruled out by the same filters via their per-block properties.
+                    sources.push(Box::new(
+                        reader.iter_with_filters(&opts.block_property_filters)?,
+                    ));
                 }
             }
         }

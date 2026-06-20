@@ -27,6 +27,62 @@ pub trait BlockPropertyCollector: Send {
     fn add(&mut self, internal_key: &[u8], value: &[u8]);
     /// Serializes the accumulated property for the whole table.
     fn finish(&mut self) -> Vec<u8>;
+    /// Serializes the property for the data block just finished and resets the per-block
+    /// accumulator (the per-*table* accumulation is unaffected). Returning an empty vector
+    /// means the collector contributes no per-block property. The default opts out of
+    /// per-block properties; collectors that support block-level filtering override it.
+    fn finish_data_block(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+/// Encodes per-block `(collector-name, property)` pairs for storage trailing a data block's
+/// index entry: `uvarint(count)` then, per pair, `uvarint(name_len) name uvarint(prop_len)
+/// prop`. An empty slice encodes to empty (nothing is appended to the index entry).
+pub(crate) fn encode_block_props(props: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use crate::base::varint::put_uvarint;
+    if props.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    put_uvarint(&mut out, props.len() as u64);
+    for (name, prop) in props {
+        put_uvarint(&mut out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        put_uvarint(&mut out, prop.len() as u64);
+        out.extend_from_slice(prop);
+    }
+    out
+}
+
+/// Decodes per-block properties produced by [`encode_block_props`]. Returns an empty vector
+/// for empty input or on any malformation (treated as "no per-block properties").
+pub(crate) fn decode_block_props(src: &[u8]) -> Vec<(String, Vec<u8>)> {
+    fn parse(src: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::base::varint::get_uvarint;
+        let mut p = 0usize;
+        let uv = |p: &mut usize| -> Option<u64> {
+            let (v, n) = get_uvarint(src.get(*p..)?)?;
+            *p += n;
+            Some(v)
+        };
+        let count = uv(&mut p)?;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let nl = uv(&mut p)? as usize;
+            let name = String::from_utf8(src.get(p..p + nl)?.to_vec()).ok()?;
+            p += nl;
+            let pl = uv(&mut p)? as usize;
+            let prop = src.get(p..p + pl)?.to_vec();
+            p += pl;
+            out.push((name, prop));
+        }
+        Some(out)
+    }
+    if src.is_empty() {
+        return Vec::new();
+    }
+    parse(src).unwrap_or_default()
 }
 
 /// Decides, from a table's stored property value, whether the table may contain data the

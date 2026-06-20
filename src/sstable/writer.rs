@@ -487,6 +487,20 @@ impl<W: Write> Writer<W> {
 
         let mut handle_enc = Vec::with_capacity(BLOCK_HANDLE_MAX_LEN);
         handle.encode_to(&mut handle_enc);
+        // Per-block properties: collect each collector's contribution for the block just
+        // finished and append them to the index entry (after the handle). Collectors that
+        // don't support per-block properties contribute nothing, leaving the entry unchanged.
+        let block_props: Vec<(String, Vec<u8>)> = self
+            .block_property_collectors
+            .iter_mut()
+            .filter_map(|c| {
+                let p = c.finish_data_block();
+                (!p.is_empty()).then(|| (c.name().to_string(), p))
+            })
+            .collect();
+        if !block_props.is_empty() {
+            handle_enc.extend_from_slice(&super::blockprop::encode_block_props(&block_props));
+        }
         // last_key is the separator for the just-flushed block; add it to the current
         // index partition and remember it as the partition's running last key.
         self.index_partition.add(&self.last_key, &handle_enc);

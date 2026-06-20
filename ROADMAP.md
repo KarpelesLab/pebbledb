@@ -77,11 +77,11 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 - Bloom-skip during `seek_prefix_ge`.
 
 ### Block properties
-- **Per-block** (vs per-table) properties stored in the index, and filter-driven block
-  skipping during compaction. (The table-level collector/filter mechanism is done, including
-  collectors wired into the flush/compaction writers via `Options::block_property_collectors`
-  and table-level filter skipping during iteration; the concrete MVCC-time collector is
-  CockroachDB's.)
+- (Done. **Per-block properties** are stored after each data block's index entry — collectors
+  emit them via `BlockPropertyCollector::finish_data_block`, and `Reader::iter_with_filters`
+  skips individual data blocks ruled out by `IterOptions::block_property_filters`, on top of
+  table-level skipping. Collectors are wired into the flush/compaction writers via
+  `Options::block_property_collectors`. The concrete MVCC-time collector is CockroachDB's.)
 
 ### Compaction
 - **Compaction scheduler**: multiple concurrent background compactions, prioritization.

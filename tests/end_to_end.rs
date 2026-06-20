@@ -1177,6 +1177,137 @@ fn per_level_target_file_size_splits_more() {
 }
 
 #[test]
+fn per_block_property_filter_skips_blocks() {
+    use pebbledb::base::internal_key::encoded_user_key;
+    use pebbledb::sstable::blockprop::{BlockPropertyCollector, BlockPropertyFilter};
+
+    // A collector tracking [min, max] user key both per data block and per table.
+    #[derive(Default)]
+    struct MinMax {
+        table: Option<(Vec<u8>, Vec<u8>)>,
+        block: Option<(Vec<u8>, Vec<u8>)>,
+    }
+    fn enc(span: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+        let (min, max) = span.clone().unwrap_or_default();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(min.len() as u32).to_le_bytes());
+        out.extend_from_slice(&min);
+        out.extend_from_slice(&max);
+        out
+    }
+    fn upd(span: &mut Option<(Vec<u8>, Vec<u8>)>, k: &[u8]) {
+        match span {
+            None => *span = Some((k.to_vec(), k.to_vec())),
+            Some((mn, mx)) => {
+                if k < mn.as_slice() {
+                    *mn = k.to_vec();
+                }
+                if k > mx.as_slice() {
+                    *mx = k.to_vec();
+                }
+            }
+        }
+    }
+    impl BlockPropertyCollector for MinMax {
+        fn name(&self) -> &str {
+            "test.minmax"
+        }
+        fn add(&mut self, ik: &[u8], _v: &[u8]) {
+            let k = encoded_user_key(ik).to_vec();
+            upd(&mut self.table, &k);
+            upd(&mut self.block, &k);
+        }
+        fn finish(&mut self) -> Vec<u8> {
+            enc(&self.table)
+        }
+        fn finish_data_block(&mut self) -> Vec<u8> {
+            let out = enc(&self.block);
+            self.block = None; // reset per-block accumulator; table state persists
+            out
+        }
+    }
+    struct RangeFilter {
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    }
+    impl BlockPropertyFilter for RangeFilter {
+        fn name(&self) -> &str {
+            "test.minmax"
+        }
+        fn intersects(&self, prop: &[u8]) -> bool {
+            let n = u32::from_le_bytes(prop[0..4].try_into().unwrap()) as usize;
+            let min = &prop[4..4 + n];
+            let max = &prop[4 + n..];
+            min < self.hi.as_slice() && max >= self.lo.as_slice()
+        }
+    }
+
+    let dir = temp_dir("per-block-bpc");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 8 << 20, // one memtable → one sstable with many blocks
+            l0_compaction_threshold: 100,
+            block_property_collectors: vec![Arc::new(|| Box::new(MinMax::default()))],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..4000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 8]).unwrap();
+    }
+    db.flush().unwrap();
+
+    let collect_filtered = |lo: &[u8], hi: &[u8]| -> Vec<Vec<u8>> {
+        let mut it = db
+            .iter_with_options(IterOptions {
+                block_property_filters: vec![Arc::new(RangeFilter {
+                    lo: lo.to_vec(),
+                    hi: hi.to_vec(),
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        it.first().unwrap();
+        while it.valid() {
+            out.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        out
+    };
+
+    // A narrow filter near the start: the table passes table-level (its range spans the key),
+    // but most data blocks are skipped, so far fewer than all 4000 keys come back.
+    let got = collect_filtered(b"k00000", b"k00010");
+    assert!(
+        got.contains(&b"k00000".to_vec()),
+        "first block's keys should be present"
+    );
+    assert!(
+        !got.contains(&b"k03999".to_vec()),
+        "a far block should be skipped"
+    );
+    assert!(
+        got.len() < 4000,
+        "block skipping should drop most keys, got {}",
+        got.len()
+    );
+
+    // No filter returns everything (sanity).
+    let mut all = db.iter().unwrap();
+    all.first().unwrap();
+    let mut n = 0;
+    while all.valid() {
+        n += 1;
+        all.next().unwrap();
+    }
+    assert_eq!(n, 4000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn l0_sublevels_reflect_overlap() {
     // Disjoint L0 files pack into one sublevel; overlapping ones each need their own.
     let opts = || Options {

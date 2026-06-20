@@ -468,24 +468,34 @@ impl Reader {
     /// Collects every data-block handle in the table, in order, flattening a two-level
     /// index. Used to drive full-table iteration.
     fn data_block_handles(&self) -> Result<Vec<BlockHandle>> {
+        Ok(self
+            .data_block_handles_raw()?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect())
+    }
+
+    /// Like [`data_block_handles`](Self::data_block_handles) but also returns the per-block
+    /// property bytes trailing each data block's index entry (empty when none were written).
+    fn data_block_handles_raw(&self) -> Result<Vec<(BlockHandle, Vec<u8>)>> {
         let mut handles = Vec::new();
         let mut index = self.index_iter()?;
         index.first();
         while index.valid() {
-            let (handle, _) = BlockHandle::decode(index.value())
+            let (handle, n) = BlockHandle::decode(index.value())
                 .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
             if self.two_level {
                 let partition = read_block(&self.file, handle, self.footer.checksum)?;
                 let mut pit = BlockIter::new(partition)?;
                 pit.first();
                 while pit.valid() {
-                    let (dh, _) = BlockHandle::decode(pit.value())
+                    let (dh, dn) = BlockHandle::decode(pit.value())
                         .ok_or_else(|| Error::corruption("sstable: bad index entry handle"))?;
-                    handles.push(dh);
+                    handles.push((dh, pit.value()[dn..].to_vec()));
                     pit.next();
                 }
             } else {
-                handles.push(handle);
+                handles.push((handle, index.value()[n..].to_vec()));
             }
             index.next();
         }
@@ -605,6 +615,42 @@ impl Reader {
         Ok(TableIter {
             reader: Arc::clone(self),
             handles,
+            block_skip: Vec::new(),
+            block_idx: None,
+            data: None,
+            cur_value: Vec::new(),
+        })
+    }
+
+    /// Like [`iter`](Self::iter) but skips data blocks ruled out by `filters` using the
+    /// per-block properties recorded in the index (Pebble's block-level property filtering).
+    /// Blocks with no matching property, or when `filters` is empty, are always read.
+    pub fn iter_with_filters(
+        self: &Arc<Reader>,
+        filters: &[std::sync::Arc<dyn blockprop::BlockPropertyFilter>],
+    ) -> Result<TableIter> {
+        let raw = self.data_block_handles_raw()?;
+        let mut handles = Vec::with_capacity(raw.len());
+        let mut block_skip = Vec::with_capacity(raw.len());
+        for (h, prop_bytes) in raw {
+            let skip = if filters.is_empty() || prop_bytes.is_empty() {
+                false
+            } else {
+                let props = blockprop::decode_block_props(&prop_bytes);
+                filters.iter().any(|f| {
+                    props
+                        .iter()
+                        .find(|(name, _)| name == f.name())
+                        .is_some_and(|(_, p)| !f.intersects(p))
+                })
+            };
+            handles.push(h);
+            block_skip.push(skip);
+        }
+        Ok(TableIter {
+            reader: Arc::clone(self),
+            handles,
+            block_skip,
             block_idx: None,
             data: None,
             cur_value: Vec::new(),
@@ -618,6 +664,9 @@ impl Reader {
 pub struct TableIter {
     reader: Arc<Reader>,
     handles: Vec<BlockHandle>,
+    /// Parallel to `handles`: whether each data block is skipped by a block-property filter.
+    /// Empty means "skip nothing" (the unfiltered iterator).
+    block_skip: Vec<bool>,
     /// Index into `handles` of the currently loaded block, if any.
     block_idx: Option<usize>,
     data: Option<BlockIter>,
@@ -626,6 +675,11 @@ pub struct TableIter {
 }
 
 impl TableIter {
+    /// Whether the block at `idx` is filtered out and should not be read.
+    fn skipped(&self, idx: usize) -> bool {
+        self.block_skip.get(idx).copied().unwrap_or(false)
+    }
+
     /// Loads the data block at `idx` (without positioning within it).
     fn load_block(&mut self, idx: usize) -> Result<()> {
         let block = self.reader.read_data_block(self.handles[idx])?;
@@ -652,6 +706,9 @@ impl TableIter {
     /// Advances to the first entry and returns whether one exists.
     pub fn first(&mut self) -> Result<bool> {
         for i in 0..self.handles.len() {
+            if self.skipped(i) {
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().first();
             if self.data.as_ref().unwrap().valid() {
@@ -668,6 +725,9 @@ impl TableIter {
         let mut i = self.handles.len();
         while i > 0 {
             i -= 1;
+            if self.skipped(i) {
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().last();
             if self.data.as_ref().unwrap().valid() {
@@ -707,9 +767,13 @@ impl TableIter {
             }
             None => return Ok(false),
         }
-        // Current data block exhausted; advance to the next non-empty block.
+        // Current data block exhausted; advance to the next non-empty, non-skipped block.
         let mut i = self.block_idx.expect("loaded") + 1;
         while i < self.handles.len() {
+            if self.skipped(i) {
+                i += 1;
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().first();
             if self.data.as_ref().unwrap().valid() {
@@ -734,10 +798,13 @@ impl TableIter {
             }
             None => return Ok(false),
         }
-        // Current data block exhausted at its front; retreat to the previous block.
+        // Current data block exhausted at its front; retreat to the previous non-skipped block.
         let mut i = self.block_idx.expect("loaded");
         while i > 0 {
             i -= 1;
+            if self.skipped(i) {
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().last();
             if self.data.as_ref().unwrap().valid() {
@@ -760,15 +827,21 @@ impl TableIter {
         };
         let idx = self.handles.iter().position(|x| *x == handle).unwrap_or(0);
         let cmp = self.reader.cmp.clone();
-        self.load_block(idx)?;
-        self.data.as_mut().unwrap().seek_ge(target, cmp.as_ref());
-        if self.data.as_ref().unwrap().valid() {
-            self.refresh_value()?;
-            return Ok(true);
+        if !self.skipped(idx) {
+            self.load_block(idx)?;
+            self.data.as_mut().unwrap().seek_ge(target, cmp.as_ref());
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
+            }
         }
-        // Target falls past this block; scan into later blocks.
+        // Target falls past this block (or it is filtered out); scan into later blocks.
         let mut i = idx + 1;
         while i < self.handles.len() {
+            if self.skipped(i) {
+                i += 1;
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().first();
             if self.data.as_ref().unwrap().valid() {
@@ -789,16 +862,21 @@ impl TableIter {
             None => return self.last(),
         };
         let cmp = self.reader.cmp.clone();
-        self.load_block(idx)?;
-        self.data.as_mut().unwrap().seek_lt(target, cmp.as_ref());
-        if self.data.as_ref().unwrap().valid() {
-            self.refresh_value()?;
-            return Ok(true);
+        if !self.skipped(idx) {
+            self.load_block(idx)?;
+            self.data.as_mut().unwrap().seek_lt(target, cmp.as_ref());
+            if self.data.as_ref().unwrap().valid() {
+                self.refresh_value()?;
+                return Ok(true);
+            }
         }
-        // Nothing < target in this block; retreat to earlier blocks.
+        // Nothing < target in this block (or it is filtered out); retreat to earlier blocks.
         let mut i = idx;
         while i > 0 {
             i -= 1;
+            if self.skipped(i) {
+                continue;
+            }
             self.load_block(i)?;
             self.data.as_mut().unwrap().last();
             if self.data.as_ref().unwrap().valid() {
