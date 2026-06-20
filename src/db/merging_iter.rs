@@ -550,6 +550,30 @@ impl DbIterator {
         self.valid = false;
     }
 
+    /// Reconfigures the iterator in place (Pebble's `Iterator.SetOptions`): updates the key
+    /// bounds, key-type selection, and range-key mask without rebuilding the underlying merge.
+    /// The position is invalidated — re-seek with [`first`](Self::first) / [`last`](Self::last)
+    /// / [`seek_ge`](Self::seek_ge) before reading again.
+    ///
+    /// Block-property filters are fixed when the iterator is created (they select which sstable
+    /// sources are read), so `opts.block_property_filters` is ignored here; create a new
+    /// iterator to change them.
+    pub fn set_options(&mut self, opts: IterOptions) {
+        self.lower_bound = opts.lower_bound;
+        self.upper_bound = opts.upper_bound;
+        self.mask_suffix = opts.range_key_masking_suffix;
+        self.key_type = opts.key_type;
+        self.prefix = None;
+        // RangesOnly walks a precomputed fragment list; (re)build or drop it to match the mode.
+        self.fragments = if self.key_type == IterKeyType::RangesOnly {
+            self.compute_fragments()
+        } else {
+            Vec::new()
+        };
+        self.frag_idx = 0;
+        self.valid = false;
+    }
+
     /// The current user key.
     pub fn key(&self) -> &[u8] {
         debug_assert!(self.valid);

@@ -78,8 +78,11 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `SetBounds`, range-key surfacing + coalescing, **range-key masking**, **block-property filters
   wired into iteration** (table-level skipping via `IterOptions::block_property_filters`),
   **`OnlyReadGuaranteedDurable`** (`IterOptions::only_durable`), and `ScanInternal`.
-- `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
-- Bloom-skip during `seek_prefix_ge`.
+- (`SetOptions` is done: `DbIterator::set_options` reconfigures bounds, key-type, and the
+  range-key mask in place without rebuilding the merge.) Iterator `Clone`; lazy values
+  (`LazyValue`) and value fetching.
+- Bloom-skip during `seek_prefix_ge` (needs a prefix extractor; the default comparer is
+  suffix-less, so the table bloom is whole-key and a partial-prefix skip would be unsound).
 
 ### Block properties
 - (Done. **Per-block properties** are stored after each data block's index entry — collectors

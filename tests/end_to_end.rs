@@ -2700,6 +2700,60 @@ fn iter_key_type_ranges_only_walks_spans() {
 }
 
 #[test]
+fn iterator_set_options_reconfigures_in_place() {
+    use pebbledb::{IterKeyType, IterOptions};
+    let dir = temp_dir("set-options");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for k in ["a", "b", "c", "d", "e"] {
+        db.set(k.as_bytes(), b"v").unwrap();
+    }
+    db.range_key_set(b"a", b"z", b"@t", b"rk").unwrap();
+
+    let mut it = db
+        .iter_with_options(IterOptions {
+            key_type: IterKeyType::PointsAndRanges,
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    assert_eq!(it.key(), b"a");
+    assert_eq!(it.range_keys().len(), 1, "range key surfaced by default");
+
+    // Reconfigure in place: PointsOnly within [c, e). Range keys no longer surfaced; bounds apply.
+    it.set_options(IterOptions {
+        key_type: IterKeyType::PointsOnly,
+        lower_bound: Some(b"c".to_vec()),
+        upper_bound: Some(b"e".to_vec()),
+        ..Default::default()
+    });
+    it.first().unwrap();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push(String::from_utf8_lossy(it.key()).into_owned());
+        assert!(
+            it.range_keys().is_empty(),
+            "PointsOnly suppresses range keys"
+        );
+        it.next().unwrap();
+    }
+    assert_eq!(got, vec!["c", "d"]);
+
+    // Reconfigure to RangesOnly: now walks the range-key span, not the points.
+    it.set_options(IterOptions {
+        key_type: IterKeyType::RangesOnly,
+        ..Default::default()
+    });
+    it.first().unwrap();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"a", "span [a, z) start");
+    assert_eq!(it.coalesced_range_keys().len(), 1);
+    it.next().unwrap();
+    assert!(!it.valid(), "only one span");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn metrics_fields_and_begin_events() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
