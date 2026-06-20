@@ -156,6 +156,10 @@ pub struct Options {
     /// is level `i`; levels beyond the vector fall back to `target_file_size`. Empty (default)
     /// uses `target_file_size` everywhere.
     pub level_target_file_sizes: Vec<u64>,
+    /// Maximum number of background compactions that may run concurrently (Pebble's
+    /// `MaxConcurrentCompactions`, default 1). Compactions pick disjoint input files, so
+    /// raising this lets independent compactions proceed in parallel on multiple cores.
+    pub max_concurrent_compactions: usize,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -279,6 +283,7 @@ impl Default for Options {
             disk_slow_threshold: None,
             value_block_threshold: None,
             level_target_file_sizes: Vec::new(),
+            max_concurrent_compactions: 1,
         }
     }
 }
@@ -330,6 +335,15 @@ struct State {
     /// Files whose wasted-seek count has crossed the read-compaction threshold and which are
     /// awaiting a read-triggered compaction. Drained by the background worker / `maybe_compact`.
     read_queue: Vec<u64>,
+    /// File numbers currently being compacted by some worker. The compaction picker skips
+    /// these so concurrent compactions never share inputs (and so a compaction's inputs stay
+    /// present in the version until its edit applies).
+    compacting: std::collections::HashSet<u64>,
+    /// Files removed from the live version but not yet deleted from disk. Each is kept here
+    /// with its `FileMetadata` so that, while an in-flight read still holds a snapshot that
+    /// references the file (its `Arc` strong count > 1), the on-disk `.sst` is preserved. A
+    /// file is deleted once only this list references it (count == 1).
+    obsolete: Vec<(u64, Arc<crate::manifest::FileMetadata>)>,
 }
 
 /// The shared inner state of a [`Db`], held behind an `Arc` so the background flush worker
@@ -380,6 +394,8 @@ pub struct DbInner {
     read_compaction_threshold: u32,
     /// Base-level (L1) size budget in bytes; deeper levels grow 10x per level.
     l1_max_bytes: u64,
+    /// Maximum number of background compactions allowed to run concurrently.
+    max_concurrent_compactions: usize,
     /// Minimum value size for out-of-line value-block storage; `None` keeps values inline.
     value_block_threshold: Option<usize>,
     /// Per-level output-sstable size targets; falls back to `target_file_size` past its end.
@@ -428,6 +444,44 @@ impl DbInner {
         self.delete_cv.notify_one();
     }
 
+    /// Records files removed from the live version as obsolete (pending deletion), holding a
+    /// reference to each so it is not deleted while an in-flight read still references it.
+    fn enqueue_obsolete<'a>(
+        &self,
+        files: impl Iterator<Item = &'a Arc<crate::manifest::FileMetadata>>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        for f in files {
+            state.obsolete.push((f.file_num, Arc::clone(f)));
+        }
+    }
+
+    /// Deletes obsolete files no live version snapshot references any more (their `FileMetadata`
+    /// `Arc` is held only by the obsolete list, i.e. strong count == 1). Files still referenced
+    /// by an in-flight read are kept and retried on the next call.
+    fn collect_obsolete(&self) {
+        let ready: Vec<u64> = {
+            let mut state = self.state.lock().unwrap();
+            let mut ready = Vec::new();
+            state.obsolete.retain(|(num, arc)| {
+                if Arc::strong_count(arc) == 1 {
+                    ready.push(*num);
+                    false
+                } else {
+                    true
+                }
+            });
+            ready
+        };
+        for file_num in ready {
+            self.cache.lock().unwrap().remove(&file_num);
+            self.clean_file(&self.dir.join(filenames::table(file_num)));
+            if let Some(l) = &self.listener {
+                l.on_table_deleted(file_num);
+            }
+        }
+    }
+
     /// The background deletion pacer: cleans queued obsolete files, sleeping between them so
     /// the byte-deletion rate stays under `target_byte_deletion_rate`. On shutdown it drains
     /// whatever remains immediately (unpaced) so nothing is left dangling.
@@ -472,7 +526,9 @@ impl DbInner {
 /// signaled to stop and joined when the `Db` is dropped.
 pub struct Db {
     inner: Arc<DbInner>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    /// Background flush/compaction workers (`max_concurrent_compactions` of them); they pick
+    /// disjoint compaction inputs so they run concurrently.
+    workers: Vec<std::thread::JoinHandle<()>>,
     /// The deletion-pacing thread, present only when `target_byte_deletion_rate > 0`.
     deleter: Option<std::thread::JoinHandle<()>>,
 }
@@ -493,7 +549,7 @@ impl Drop for Db {
             state.shutdown = true;
         }
         self.inner.work_cv.notify_all();
-        if let Some(h) = self.worker.take() {
+        for h in self.workers.drain(..) {
             let _ = h.join();
         }
         // Stop the deletion pacer (it drains any queued files before exiting).
@@ -512,14 +568,16 @@ impl Db {
     /// Opens the database in `dir`, creating it if `opts.create_if_missing` and absent.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let inner = Arc::new(DbInner::open_inner(dir, opts)?);
-        // Spawn the background flush/compaction worker for writable databases.
+        // Spawn the background flush/compaction worker pool for writable databases. Multiple
+        // workers pick disjoint compaction inputs, so compactions run concurrently.
         let read_only = inner.state.lock().unwrap().read_only;
-        let worker = if read_only {
-            None
-        } else {
-            let w = Arc::clone(&inner);
-            Some(std::thread::spawn(move || w.background_loop()))
-        };
+        let mut workers = Vec::new();
+        if !read_only {
+            for _ in 0..inner.max_concurrent_compactions.max(1) {
+                let w = Arc::clone(&inner);
+                workers.push(std::thread::spawn(move || w.background_loop()));
+            }
+        }
         // Spawn the deletion pacer only when pacing is enabled on a writable database.
         let deleter = if !read_only && inner.target_byte_deletion_rate > 0 {
             let d = Arc::clone(&inner);
@@ -529,7 +587,7 @@ impl Db {
         };
         Ok(Db {
             inner,
-            worker,
+            workers,
             deleter,
         })
     }
@@ -660,6 +718,8 @@ impl DbInner {
                 compaction_bytes: 0,
                 read_miss: std::collections::HashMap::new(),
                 read_queue: Vec::new(),
+                compacting: std::collections::HashSet::new(),
+                obsolete: Vec::new(),
             };
             return Ok(DbInner {
                 dir,
@@ -692,6 +752,7 @@ impl DbInner {
                 tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
                 read_compaction_threshold: opts.read_compaction_threshold,
                 l1_max_bytes: opts.l1_max_bytes.max(1),
+                max_concurrent_compactions: opts.max_concurrent_compactions.max(1),
                 value_block_threshold: opts.value_block_threshold,
                 level_target_file_sizes: opts.level_target_file_sizes.clone(),
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
@@ -794,6 +855,8 @@ impl DbInner {
             compaction_bytes: 0,
             read_miss: std::collections::HashMap::new(),
             read_queue: Vec::new(),
+            compacting: std::collections::HashSet::new(),
+            obsolete: Vec::new(),
         };
         Ok(DbInner {
             dir,
@@ -826,6 +889,7 @@ impl DbInner {
             tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
             read_compaction_threshold: opts.read_compaction_threshold,
             l1_max_bytes: opts.l1_max_bytes.max(1),
+            max_concurrent_compactions: opts.max_concurrent_compactions.max(1),
             value_block_threshold: opts.value_block_threshold,
             level_target_file_sizes: opts.level_target_file_sizes.clone(),
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
@@ -1145,7 +1209,7 @@ impl DbInner {
         // rotated memtable runs on the background worker, off this writer's path.
         if state.mem.size() as usize >= self.mem_table_size / 2 {
             self.rotate_memtable(state)?;
-            self.work_cv.notify_one();
+            self.work_cv.notify_all();
         }
 
         let base = state.vs.last_sequence + 1;
@@ -1328,9 +1392,10 @@ impl DbInner {
                 l.on_wal_deleted(popped_wal);
             }
         }
-        // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files).
-        self.maybe_compact(&mut state)?;
         drop(state);
+        // Keep the LSM in shape (e.g. drain L0 once it accumulates enough files). Runs off the
+        // state lock so its compaction writes don't block foreground reads/writes.
+        self.maybe_compact()?;
 
         self.log(&format!(
             "flushed memtable to {} sstable(s) starting at {first_file_num} ({flushed_bytes} bytes)",
@@ -1354,23 +1419,29 @@ impl DbInner {
         loop {
             {
                 let mut state = self.state.lock().unwrap();
-                while state.imm.is_empty() && state.read_queue.is_empty() && !state.shutdown {
+                // Wake for a memtable to flush, queued read-compactions, an available
+                // score-based compaction, or shutdown. Several workers may wake together and
+                // pick disjoint compactions (the `compacting` set keeps them from colliding).
+                while state.imm.is_empty()
+                    && state.read_queue.is_empty()
+                    && !self.compaction_available(&state)
+                    && !state.shutdown
+                {
                     state = self.work_cv.wait(state).unwrap();
                 }
                 if state.shutdown {
                     return; // any pending data stays in the WALs for recovery
                 }
             }
-            // Flush outside the state lock guard; errors are surfaced via the next
-            // foreground flush/open rather than panicking the worker. A flush's
-            // `maybe_compact` also services the read-compaction queue; if there was nothing
-            // to flush, service the queue directly.
+            // Flush one memtable (which also compacts), or — when there was nothing to flush —
+            // run any available compactions directly. Both happen off the state lock, so
+            // multiple workers run their (disjoint) compactions concurrently.
             let res = self.flush_one().and_then(|flushed| {
                 if flushed {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    self.maybe_compact()
                 }
-                let mut state = self.state.lock().unwrap();
-                self.run_read_compactions(&mut state)
             });
             if let Err(e) = res {
                 if let Some(l) = &self.listener {
@@ -1532,7 +1603,7 @@ impl DbInner {
             }
         }
         if queued {
-            self.work_cv.notify_one();
+            self.work_cv.notify_all();
         }
     }
 

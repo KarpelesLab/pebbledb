@@ -1194,6 +1194,57 @@ fn group_commit_is_durable_across_concurrent_writers_and_reopen() {
 }
 
 #[test]
+fn concurrent_compactions_stay_correct() {
+    // With several compaction workers, a write-heavy workload (many overwrites + deletes,
+    // forcing constant flushing and compaction) must remain correct: all live keys readable,
+    // deleted keys absent, and the data durable across a reopen.
+    let dir = temp_dir("concurrent-compactions");
+    {
+        let db = Db::open(
+            &dir,
+            Options {
+                mem_table_size: 16 * 1024,
+                l1_max_bytes: 64 * 1024, // keep levels small so compactions fire often
+                max_concurrent_compactions: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Several rounds overwriting a moderate keyspace, deleting a band each round.
+        for round in 0..6u32 {
+            for k in 0..1500u32 {
+                db.set(
+                    format!("k{k:05}").as_bytes(),
+                    format!("r{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+            for k in 0..200u32 {
+                db.delete(format!("k{k:05}").as_bytes()).unwrap();
+            }
+        }
+        // Final state: k00000..k00199 deleted; k00200..k01499 hold "r5".
+        for k in [0u32, 100, 199] {
+            assert_eq!(db.get(format!("k{k:05}").as_bytes()).unwrap(), None);
+        }
+        for k in [200u32, 800, 1499] {
+            assert_eq!(
+                db.get(format!("k{k:05}").as_bytes()).unwrap(),
+                Some(b"r5".to_vec())
+            );
+        }
+        assert_eq!(collect(&db).len(), 1300);
+    }
+    // Durable across reopen (the WAL/MANIFEST written under concurrent compaction recovers).
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"k00000").unwrap(), None);
+    assert_eq!(db.get(b"k01499").unwrap(), Some(b"r5".to_vec()));
+    assert_eq!(collect(&db).len(), 1300);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn per_level_target_file_size_splits_more() {
     // A tiny per-level target for L1 makes L0->L1 compaction emit many small files, where the
     // default 2 MiB target would produce just one.

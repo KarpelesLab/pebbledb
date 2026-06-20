@@ -145,9 +145,9 @@ impl DbInner {
             mw.write_record(&edit.encode())?;
             mw.sync_all()?;
         }
-        // The ingested files may have piled onto L0; keep the LSM in shape.
-        self.maybe_compact(&mut state)?;
         drop(state);
+        // The ingested files may have piled onto L0; keep the LSM in shape (off the lock).
+        self.maybe_compact()?;
         if let Some(l) = &self.listener {
             l.on_ingest_end(paths.len());
         }

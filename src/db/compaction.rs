@@ -72,35 +72,44 @@ impl DbInner {
         }
         // Flush the memtable (and drain the immutable queue) so its data participates.
         self.flush()?;
-        let mut state = self.state.lock().unwrap();
 
         // Walk levels from the top, pushing any file overlapping the range one level down,
         // until the data has reached the bottom level. The loop is bounded by the work
         // actually available (each pass strictly reduces the files above the bottom that
-        // overlap the range, or stops).
+        // overlap the range, or stops). Each compaction is built under a brief lock (marking
+        // its inputs) and run off-lock.
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
             let mut did_work = false;
             for level in 0..NUM_LEVELS - 1 {
-                let inputs: Vec<_> = self
-                    .range_overlap(&state.vs.current, level, start, end)
-                    .collect();
-                if inputs.is_empty() {
-                    continue;
-                }
-                let (min, max) = match key_range(self.cmp.as_ref(), &inputs) {
-                    Some(r) => r,
-                    None => continue,
+                let c = {
+                    let mut state = self.state.lock().unwrap();
+                    let inputs: Vec<_> = self
+                        .range_overlap(&state.vs.current, level, start, end)
+                        .filter(|f| !state.compacting.contains(&f.file_num))
+                        .collect();
+                    if inputs.is_empty() {
+                        continue;
+                    }
+                    let (min, max) = match key_range(self.cmp.as_ref(), &inputs) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let overlap =
+                        overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
+                    let c = Compaction {
+                        level,
+                        output_level: level + 1,
+                        inputs,
+                        overlap,
+                        mid: Vec::new(),
+                    };
+                    if Self::any_compacting(&state, &c) {
+                        continue;
+                    }
+                    Self::mark_compacting(&mut state, &c);
+                    c
                 };
-                let overlap =
-                    overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
-                let c = Compaction {
-                    level,
-                    output_level: level + 1,
-                    inputs,
-                    overlap,
-                    mid: Vec::new(),
-                };
-                self.run_compaction(&mut state, c)?;
+                self.run_compaction(c)?;
                 did_work = true;
             }
             if !did_work {
@@ -141,27 +150,58 @@ impl DbInner {
             .unwrap_or(self.target_file_size)
     }
 
-    /// Picks and runs compactions until none are needed (or a safety cap is hit).
-    pub(super) fn maybe_compact(&self, state: &mut State) -> Result<()> {
+    /// Marks a compaction's inputs as in-progress so other workers' pickers skip them.
+    fn mark_compacting(state: &mut State, c: &Compaction) {
+        for f in c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()) {
+            state.compacting.insert(f.file_num);
+        }
+    }
+
+    /// Whether any of a candidate compaction's inputs are already being compacted.
+    fn any_compacting(state: &State, c: &Compaction) -> bool {
+        c.inputs
+            .iter()
+            .chain(c.mid.iter())
+            .chain(c.overlap.iter())
+            .any(|f| state.compacting.contains(&f.file_num))
+    }
+
+    /// Picks and runs compactions until none are needed (or a safety cap is hit). Each
+    /// compaction is picked under a brief lock (marking its inputs `compacting`) and then run
+    /// off-lock by [`run_compaction`](Self::run_compaction), so this is safe to call from
+    /// several background workers at once — they pick disjoint inputs.
+    pub(super) fn maybe_compact(&self) -> Result<()> {
         // Service files queued by read-triggered compaction first.
-        self.run_read_compactions(state)?;
+        self.run_read_compactions()?;
         // Opportunistically drop whole files shadowed by a covering range tombstone before
         // scoring levels — this is free (a MANIFEST edit) and shrinks the work below.
-        self.delete_only_compact(state)?;
+        self.delete_only_compact()?;
         // Rewrite bottom-level files that carry now-droppable tombstones.
-        self.elision_only_compact(state)?;
+        self.elision_only_compact()?;
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
-            match self.pick_compaction(&state.vs.current) {
-                Some(c) => self.run_compaction(state, c)?,
+            let c = {
+                let mut state = self.state.lock().unwrap();
+                match self.pick_compaction(&state.vs.current) {
+                    Some(c) if !Self::any_compacting(&state, &c) => {
+                        Self::mark_compacting(&mut state, &c);
+                        Some(c)
+                    }
+                    _ => None,
+                }
+            };
+            match c {
+                Some(c) => self.run_compaction(c)?,
                 None => break,
             }
         }
         // With levels within budget, compact tombstone-dense files downward to reclaim space.
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
-            if !self.tombstone_density_compact(state)? {
+            if !self.tombstone_density_compact()? {
                 break;
             }
         }
+        // Reap any obsolete files whose last in-flight reader has since gone away.
+        self.collect_obsolete();
         Ok(())
     }
 
@@ -170,41 +210,55 @@ impl DbInner {
     /// file is compacted one level down (rewriting when there is overlapping data below,
     /// otherwise moving), reducing the read amplification of hot ranges. L0 entries are
     /// skipped (a single L0 file may not hold the newest version of its keys).
-    pub(super) fn run_read_compactions(&self, state: &mut State) -> Result<()> {
-        while let Some(file_num) = {
-            let q = &mut state.read_queue;
-            (!q.is_empty()).then(|| q.remove(0))
-        } {
-            state.read_miss.remove(&file_num);
-            // Locate the file and its current level (it may have moved or been dropped).
-            let mut found = None;
-            for level in 1..NUM_LEVELS - 1 {
-                if let Some(f) = state.vs.current.levels[level]
-                    .iter()
-                    .find(|f| f.file_num == file_num)
-                {
-                    found = Some((level, f.clone()));
+    pub(super) fn run_read_compactions(&self) -> Result<()> {
+        loop {
+            // Build the next read-triggered compaction under a brief lock, marking its inputs.
+            let c = {
+                let mut state = self.state.lock().unwrap();
+                let Some(file_num) = ({
+                    let q = &mut state.read_queue;
+                    (!q.is_empty()).then(|| q.remove(0))
+                }) else {
                     break;
+                };
+                state.read_miss.remove(&file_num);
+                // Locate the file and its current level (it may have moved or been dropped).
+                let mut found = None;
+                for level in 1..NUM_LEVELS - 1 {
+                    if let Some(f) = state.vs.current.levels[level]
+                        .iter()
+                        .find(|f| f.file_num == file_num)
+                    {
+                        found = Some((level, f.clone()));
+                        break;
+                    }
                 }
-            }
-            let Some((level, f)) = found else {
-                continue;
+                let Some((level, f)) = found else {
+                    continue;
+                };
+                let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(&f))
+                else {
+                    continue;
+                };
+                let overlap =
+                    overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
+                let c = Compaction {
+                    level,
+                    output_level: level + 1,
+                    inputs: vec![f],
+                    overlap,
+                    mid: Vec::new(),
+                };
+                if Self::any_compacting(&state, &c) {
+                    continue;
+                }
+                Self::mark_compacting(&mut state, &c);
+                self.log(&format!(
+                    "read-triggered compaction of sstable {file_num} at L{level}"
+                ));
+                c
             };
-            let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(&f)) else {
-                continue;
-            };
-            let overlap = overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
-            self.log(&format!(
-                "read-triggered compaction of sstable {file_num} at L{level}"
-            ));
-            let c = Compaction {
-                level,
-                output_level: level + 1,
-                inputs: vec![f],
-                overlap,
-                mid: Vec::new(),
-            };
-            self.run_compaction(state, c)?;
+            self.run_compaction(c)?;
         }
         Ok(())
     }
@@ -219,45 +273,59 @@ impl DbInner {
     /// a level (a cheap MANIFEST edit). Either way the file descends until it reaches the
     /// bottom level, where the elision-only pass finally drops the dead tombstones. Each step
     /// strictly increases the file's level, so the per-call loop terminates.
-    fn tombstone_density_compact(&self, state: &mut State) -> Result<bool> {
+    fn tombstone_density_compact(&self) -> Result<bool> {
         if self.tombstone_dense_compaction_threshold > 1.0 {
             return Ok(false);
         }
-        let version = state.vs.current.clone();
-        // Start at L1: L0 files are not range-partitioned, so a single L0 file may not hold
-        // the newest version of its keys — compacting it down in isolation could push a newer
-        // version below an older one. (Whole-L0 compactions are handled by the score picker.)
-        for level in 1..NUM_LEVELS - 1 {
-            for f in &version.levels[level] {
-                let reader = self.open_reader(f.file_num)?;
-                let props = reader.properties();
-                if props.num_entries == 0 {
-                    continue;
+        // Find a candidate and mark it under a brief lock, then run it off-lock.
+        let c = {
+            let mut state = self.state.lock().unwrap();
+            let version = state.vs.current.clone();
+            // Start at L1: L0 files are not range-partitioned, so a single L0 file may not hold
+            // the newest version of its keys — compacting it down in isolation could push a
+            // newer version below an older one. (Whole-L0 compactions go through the picker.)
+            let mut chosen = None;
+            'outer: for level in 1..NUM_LEVELS - 1 {
+                for f in &version.levels[level] {
+                    if state.compacting.contains(&f.file_num) {
+                        continue;
+                    }
+                    let reader = self.open_reader(f.file_num)?;
+                    let props = reader.properties();
+                    if props.num_entries == 0 {
+                        continue;
+                    }
+                    let frac = props.num_deletions as f64 / props.num_entries as f64;
+                    if frac < self.tombstone_dense_compaction_threshold {
+                        continue;
+                    }
+                    let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(f))
+                    else {
+                        continue;
+                    };
+                    let overlap = overlapping(self.cmp.as_ref(), &version, level + 1, &min, &max);
+                    self.log(&format!(
+                        "tombstone-density compaction of sstable {} at L{level} (fraction {frac:.2})",
+                        f.file_num
+                    ));
+                    chosen = Some(Compaction {
+                        level,
+                        output_level: level + 1,
+                        inputs: vec![f.clone()],
+                        overlap,
+                        mid: Vec::new(),
+                    });
+                    break 'outer;
                 }
-                let frac = props.num_deletions as f64 / props.num_entries as f64;
-                if frac < self.tombstone_dense_compaction_threshold {
-                    continue;
-                }
-                let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(f)) else {
-                    continue;
-                };
-                let overlap = overlapping(self.cmp.as_ref(), &version, level + 1, &min, &max);
-                self.log(&format!(
-                    "tombstone-density compaction of sstable {} at L{level} (fraction {frac:.2})",
-                    f.file_num
-                ));
-                let c = Compaction {
-                    level,
-                    output_level: level + 1,
-                    inputs: vec![f.clone()],
-                    overlap,
-                    mid: Vec::new(),
-                };
-                self.run_compaction(state, c)?;
-                return Ok(true);
             }
-        }
-        Ok(false)
+            let Some(c) = chosen else {
+                return Ok(false);
+            };
+            Self::mark_compacting(&mut state, &c);
+            c
+        };
+        self.run_compaction(c)?;
+        Ok(true)
     }
 
     /// Delete-only compaction (Pebble): drop files that are entirely shadowed by a covering
@@ -269,10 +337,11 @@ impl DbInner {
     /// Conservative: skipped entirely while any snapshot is open, since a snapshot at a
     /// sequence number between the file's versions and the tombstone could still observe the
     /// pre-deletion state.
-    fn delete_only_compact(&self, state: &mut State) -> Result<()> {
+    fn delete_only_compact(&self) -> Result<()> {
         if !self.open_snapshots().is_empty() {
             return Ok(());
         }
+        let mut state = self.state.lock().unwrap();
         let version = state.vs.current.clone();
         // Every range tombstone in the LSM, tagged with the level it lives in.
         let mut tombstones: Vec<(usize, Vec<u8>, Vec<u8>, u64)> = Vec::new();
@@ -288,12 +357,17 @@ impl DbInner {
             return Ok(());
         }
         // Files in strictly deeper levels fully contained in a tombstone span and older than it.
-        let mut to_drop: Vec<(usize, u64)> = Vec::new();
+        let mut to_drop: Vec<(usize, Arc<FileMetadata>)> = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (tlevel, start, end, seq) in &tombstones {
             for (dlevel, files) in version.levels.iter().enumerate().skip(tlevel + 1) {
                 for f in files {
-                    if f.largest_seqnum >= *seq || seen.contains(&f.file_num) {
+                    // Skip files an in-progress compaction is using as input — dropping them
+                    // would pull the rug out from under that compaction's reads.
+                    if f.largest_seqnum >= *seq
+                        || seen.contains(&f.file_num)
+                        || state.compacting.contains(&f.file_num)
+                    {
                         continue;
                     }
                     let fs = encoded_user_key(&f.smallest);
@@ -302,7 +376,7 @@ impl DbInner {
                     let contained = self.cmp.compare(start, fs) != std::cmp::Ordering::Greater
                         && self.cmp.compare(fl, end) == std::cmp::Ordering::Less;
                     if contained {
-                        to_drop.push((dlevel, f.file_num));
+                        to_drop.push((dlevel, f.clone()));
                         seen.insert(f.file_num);
                     }
                 }
@@ -316,8 +390,8 @@ impl DbInner {
             last_sequence: Some(state.vs.last_sequence),
             ..Default::default()
         };
-        for (level, file_num) in &to_drop {
-            edit.deleted_files.push((*level, *file_num));
+        for (level, f) in &to_drop {
+            edit.deleted_files.push((*level, f.file_num));
         }
         state.vs.apply(&edit)?;
         if let Some(mw) = state.manifest.as_mut() {
@@ -325,16 +399,16 @@ impl DbInner {
             mw.sync_all()?;
         }
         state.compaction_count += 1;
-        for (_, file_num) in &to_drop {
-            self.cache.lock().unwrap().remove(file_num);
-            self.clean_file(&self.dir.join(filenames::table(*file_num)));
-            if let Some(l) = &self.listener {
-                l.on_table_deleted(*file_num);
-            }
+        // Defer deletion until no in-flight read still references these files.
+        for (_, f) in &to_drop {
+            state.obsolete.push((f.file_num, f.clone()));
             self.log(&format!(
-                "delete-only compaction dropped sstable {file_num}"
+                "delete-only compaction dropped sstable {}",
+                f.file_num
             ));
         }
+        drop(state);
+        self.collect_obsolete();
         Ok(())
     }
 
@@ -348,37 +422,45 @@ impl DbInner {
     /// Conservative: skipped while any snapshot is open. With no snapshots every version sits
     /// in the top stripe, so all tombstones are elided and the rewritten file carries none —
     /// guaranteeing the rewrite cannot re-trigger itself.
-    fn elision_only_compact(&self, state: &mut State) -> Result<()> {
+    fn elision_only_compact(&self) -> Result<()> {
         if !self.open_snapshots().is_empty() {
             return Ok(());
         }
         let bottom = NUM_LEVELS - 1;
-        let version = state.vs.current.clone();
-        // Pick the first bottom file that actually carries tombstones to drop.
-        let mut target = None;
-        for f in &version.levels[bottom] {
-            let reader = self.open_reader(f.file_num)?;
-            let props = reader.properties();
-            if props.num_deletions > 0 || props.num_range_deletions > 0 {
-                target = Some(f.clone());
-                break;
+        // Build the candidate compaction under a brief lock, marking its input.
+        let c = {
+            let mut state = self.state.lock().unwrap();
+            let version = state.vs.current.clone();
+            let mut target = None;
+            for f in &version.levels[bottom] {
+                if state.compacting.contains(&f.file_num) {
+                    continue;
+                }
+                let reader = self.open_reader(f.file_num)?;
+                let props = reader.properties();
+                if props.num_deletions > 0 || props.num_range_deletions > 0 {
+                    target = Some(f.clone());
+                    break;
+                }
             }
-        }
-        let Some(file) = target else {
-            return Ok(());
+            let Some(file) = target else {
+                return Ok(());
+            };
+            self.log(&format!(
+                "elision-only compaction rewriting sstable {} at L{bottom}",
+                file.file_num
+            ));
+            let c = Compaction {
+                level: bottom,
+                output_level: bottom,
+                inputs: vec![file],
+                overlap: Vec::new(),
+                mid: Vec::new(),
+            };
+            Self::mark_compacting(&mut state, &c);
+            c
         };
-        self.log(&format!(
-            "elision-only compaction rewriting sstable {} at L{bottom}",
-            file.file_num
-        ));
-        let c = Compaction {
-            level: bottom,
-            output_level: bottom,
-            inputs: vec![file],
-            overlap: Vec::new(),
-            mid: Vec::new(),
-        };
-        self.run_compaction(state, c)
+        self.run_compaction(c)
     }
 
     /// The compaction score of a level: how far over its trigger it is. A level with the
@@ -391,6 +473,13 @@ impl DbInner {
             let total: u64 = version.levels[level].iter().map(|f| f.size).sum();
             total as f64 / level_budget(self.l1_max_bytes, level) as f64
         }
+    }
+
+    /// Whether a score-based compaction is available that does not collide with one already in
+    /// progress — used as a background-worker wake predicate.
+    pub(super) fn compaction_available(&self, state: &State) -> bool {
+        self.pick_compaction(&state.vs.current)
+            .is_some_and(|c| !Self::any_compacting(state, &c))
     }
 
     /// Chooses the next compaction, if any level needs one. Levels are scored and the
@@ -459,20 +548,38 @@ impl DbInner {
         })
     }
 
-    /// Executes a compaction: merges the inputs, writes outputs, and records the edit.
-    fn run_compaction(&self, state: &mut State, c: Compaction) -> Result<()> {
-        // Move compaction: a single input file that does not overlap any file in the output
-        // level can be relevelled by a MANIFEST edit alone — no rewrite. (Pebble's move
-        // compaction.) The file's sstable content is independent of its level, so its keys,
-        // tombstones, and range keys are all carried correctly by the move. (An elision-only
-        // compaction, where the output level equals the input level, must instead rewrite.)
-        if c.inputs.len() == 1
-            && c.overlap.is_empty()
-            && c.mid.is_empty()
-            && c.output_level != c.level
-        {
-            return self.run_move_compaction(state, c);
-        }
+    /// Executes a compaction whose inputs were marked `compacting` by the picker. The
+    /// expensive merge and sstable writes run **without** the state lock — only the output
+    /// file-number reservation (phase A) and the MANIFEST edit (phase C) hold it — so reads,
+    /// writes, and other compactions proceed concurrently. The input files' `compacting`
+    /// marks are cleared when the edit applies (or, for a move, inside `run_move_compaction`).
+    fn run_compaction(&self, c: Compaction) -> Result<()> {
+        // Phase A (locked): a single non-overlapping file is relevelled by a MANIFEST edit
+        // alone (move compaction); otherwise reserve enough output file numbers — output
+        // bytes never exceed total input bytes — and snapshot the open-snapshot list.
+        let (output_nums, snapshots) = {
+            let mut state = self.state.lock().unwrap();
+            if c.inputs.len() == 1
+                && c.overlap.is_empty()
+                && c.mid.is_empty()
+                && c.output_level != c.level
+            {
+                return self.run_move_compaction(&mut state, c);
+            }
+            let total_in: u64 = c
+                .inputs
+                .iter()
+                .chain(c.mid.iter())
+                .chain(c.overlap.iter())
+                .map(|f| f.size)
+                .sum();
+            let target = self.target_file_size_for(c.output_level).max(1);
+            let n = (total_in / target + 2) as usize;
+            let nums: Vec<u64> = (0..n).map(|_| state.vs.allocate_file_number()).collect();
+            (nums, self.open_snapshots())
+        };
+        let mut output_nums = output_nums.into_iter();
+
         let input_count = c.inputs.len() + c.mid.len() + c.overlap.len();
         if !c.mid.is_empty() {
             self.log(&format!(
@@ -519,10 +626,10 @@ impl DbInner {
                 .then(b.kind.as_u8().cmp(&a.kind.as_u8()))
         });
 
-        // Open snapshots define stripe boundaries: within each stripe (the versions
-        // between two consecutive snapshot sequence numbers) only the newest version is
-        // kept, so every snapshot can still observe the version it needs.
-        let snapshots = self.open_snapshots();
+        // `snapshots` (the open-snapshot stripe boundaries) was captured under the phase-A
+        // lock. A snapshot opening during this unlocked write takes a sequence number above
+        // all compacted data, so it lands in the top stripe — whose newest version per key is
+        // always kept — and is therefore unaffected by this compaction.
 
         let mut outputs: Vec<FileMetadata> = Vec::new();
         let mut builder: Option<OutputBuilder> = None;
@@ -584,8 +691,13 @@ impl DbInner {
             }
 
             if builder.is_none() {
+                let num = output_nums.next().ok_or_else(|| {
+                    crate::Error::InvalidState(
+                        "compaction: out of preallocated file numbers".into(),
+                    )
+                })?;
                 builder = Some(self.new_output(
-                    state,
+                    num,
                     &tombstones,
                     write_tombstones,
                     &range_keys,
@@ -605,8 +717,11 @@ impl DbInner {
         // If the compaction produced only range deletions/keys (no surviving point keys),
         // still emit a file to carry them.
         if outputs.is_empty() && (write_tombstones || write_range_keys) {
+            let num = output_nums.next().ok_or_else(|| {
+                crate::Error::InvalidState("compaction: out of preallocated file numbers".into())
+            })?;
             let b = self.new_output(
-                state,
+                num,
                 &tombstones,
                 write_tombstones,
                 &range_keys,
@@ -615,7 +730,9 @@ impl DbInner {
             outputs.push(b.finish()?);
         }
 
-        // Record the edit: delete every input, add every output to the output level.
+        // Phase C (locked): record the edit — delete every input, add every output to the
+        // output level — apply it, and clear the inputs' `compacting` marks.
+        let mut state = self.state.lock().unwrap();
         let mut edit = VersionEdit {
             next_file_number: Some(state.vs.next_file_number),
             last_sequence: Some(state.vs.last_sequence),
@@ -647,18 +764,22 @@ impl DbInner {
         }
         state.compaction_count += 1;
         state.compaction_bytes += output_bytes;
+        // Clear the inputs' `compacting` marks now that they are removed from the version.
+        for f in c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()) {
+            state.compacting.remove(&f.file_num);
+        }
+        drop(state);
+        // Wake other workers to pick up any follow-up compaction this one enabled.
+        self.work_cv.notify_all();
         if let Some(l) = &self.listener {
             l.on_compaction_end(c.output_level, input_count, num_outputs);
         }
 
-        // Dispose of the obsolete input files (cache + on disk, via the cleaner).
-        for (_, file_num) in &edit.deleted_files {
-            self.cache.lock().unwrap().remove(file_num);
-            self.clean_file(&self.dir.join(filenames::table(*file_num)));
-            if let Some(l) = &self.listener {
-                l.on_table_deleted(*file_num);
-            }
-        }
+        // Mark the obsolete input files for deletion. They are only removed once no live
+        // version snapshot (held by an in-flight read) still references them — see
+        // `collect_obsolete` — so a concurrent read can't open a file mid-deletion.
+        self.enqueue_obsolete(c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()));
+        self.collect_obsolete();
         Ok(())
     }
 
@@ -688,6 +809,8 @@ impl DbInner {
             mw.sync_all()?;
         }
         state.compaction_count += 1;
+        // Clear the input's `compacting` mark (it was set by the picker).
+        state.compacting.remove(&file_num);
         // No file is removed from disk: the moved sstable is reused at its new level.
         self.log(&format!(
             "moved sstable {file_num} from L{} to L{}",
@@ -703,13 +826,12 @@ impl DbInner {
     /// range keys.
     fn new_output(
         &self,
-        state: &mut State,
+        file_num: u64,
         tombstones: &[RangeTombstone],
         write_tombstones: bool,
         range_keys: &[RangeKeyEntry],
         write_range_keys: bool,
     ) -> Result<OutputBuilder> {
-        let file_num = state.vs.allocate_file_number();
         let mut b = OutputBuilder::new(self, file_num)?;
         if write_tombstones {
             for t in tombstones {
