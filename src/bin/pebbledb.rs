@@ -46,6 +46,7 @@ fn run(args: &[&str]) -> Result<(), String> {
         ["db", "get", dir, key] => db_get(dir, key),
         ["db", "scan", dir] => db_scan(dir),
         ["db", "lsm", dir] => db_lsm(dir),
+        ["find", dir, key] => db_find(dir, key),
         ["help" | "-h" | "--help"] | [] => {
             print_usage();
             Ok(())
@@ -65,7 +66,8 @@ fn print_usage() {
          pebbledb manifest dump <MANIFEST>\n  \
          pebbledb db get        <dir> <key>\n  \
          pebbledb db scan       <dir>\n  \
-         pebbledb db lsm        <dir>"
+         pebbledb db lsm        <dir>\n  \
+         pebbledb find          <dir> <key>"
     );
 }
 
@@ -253,4 +255,18 @@ fn db_lsm(dir: &str) -> Result<(), String> {
     let db = open_ro(dir)?;
     print!("{}", db.lsm_view());
     Ok(())
+}
+
+fn db_find(dir: &str, key: &str) -> Result<(), String> {
+    let db = open_ro(dir)?;
+    match db.get(key.as_bytes()).map_err(|e| format!("get: {e}"))? {
+        Some(v) => {
+            println!("found: {} => {}", key, show(&v));
+            Ok(())
+        }
+        None => {
+            println!("not found: {key}");
+            Ok(())
+        }
+    }
 }

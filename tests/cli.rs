@@ -110,6 +110,26 @@ fn db_lsm_runs() {
 }
 
 #[test]
+fn find_locates_a_key() {
+    let dir = temp_dir("find");
+    {
+        let db = Db::open(&dir, Options::default()).unwrap();
+        db.set(b"alpha", b"one").unwrap();
+        db.flush().unwrap();
+    }
+    let (ok, out) = run(&["find", dir.to_str().unwrap(), "alpha"]);
+    assert!(ok, "find failed: {out}");
+    assert!(out.contains("found"), "{out}");
+    assert!(out.contains("one"), "{out}");
+
+    let (ok, out) = run(&["find", dir.to_str().unwrap(), "missing"]);
+    assert!(ok); // not-found is a successful query
+    assert!(out.contains("not found"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn manifest_dump_runs() {
     let dir = temp_dir("manifest");
     {

@@ -1348,6 +1348,40 @@ fn l0_compaction_threshold_is_configurable() {
 }
 
 #[test]
+fn snapshot_iter_with_bounds() {
+    let dir = temp_dir("snap-iter-bounds");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..50u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v1").unwrap();
+    }
+    let snap = db.snapshot();
+    // Mutate after the snapshot; the snapshot's bounded iterator ignores the changes.
+    for i in 0..50u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v2").unwrap();
+    }
+    let mut it = snap
+        .iter_with_options(IterOptions {
+            lower_bound: Some(b"k010".to_vec()),
+            upper_bound: Some(b"k015".to_vec()),
+        })
+        .unwrap();
+    it.first().unwrap();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push((
+            String::from_utf8_lossy(it.key()).into_owned(),
+            String::from_utf8_lossy(it.value()).into_owned(),
+        ));
+        it.next().unwrap();
+    }
+    assert_eq!(got.len(), 5); // k010..k014
+    assert!(got.iter().all(|(_, v)| v == "v1")); // snapshot view, pre-mutation
+    assert_eq!(got[0].0, "k010");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

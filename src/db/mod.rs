@@ -1409,6 +1409,11 @@ impl Snapshot<'_> {
     pub fn iter(&self) -> Result<DbIterator> {
         self.db.iter_at(self.seqnum)
     }
+
+    /// Returns an iterator over the snapshot's view with the given bounds/options.
+    pub fn iter_with_options(&self, opts: IterOptions) -> Result<DbIterator> {
+        self.db.iter_at_with_options(self.seqnum, opts)
+    }
 }
 
 impl Drop for Snapshot<'_> {
