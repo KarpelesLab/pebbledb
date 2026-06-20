@@ -1061,6 +1061,34 @@ fn iterator_set_bounds_reuses_iterator() {
 }
 
 #[test]
+fn iterator_coalesces_range_keys() {
+    let dir = temp_dir("rangekey-coalesce");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"m", b"point").unwrap();
+    // Two suffixed range keys over [a, z), then unset one of them.
+    db.range_key_set(b"a", b"z", b"@1", b"v1").unwrap();
+    db.range_key_set(b"a", b"z", b"@2", b"v2").unwrap();
+    db.range_key_unset(b"a", b"z", b"@1").unwrap();
+
+    let mut it = db.iter().unwrap();
+    it.seek_ge(b"m").unwrap();
+    assert!(it.valid());
+    let eff = it.coalesced_range_keys();
+    // @1 was unset; only @2 remains in force.
+    assert_eq!(eff.len(), 1);
+    assert_eq!(eff[0].suffix, b"@2");
+    assert_eq!(eff[0].value, b"v2");
+
+    // A range-key delete clears everything.
+    db.range_key_delete(b"a", b"z").unwrap();
+    let mut it = db.iter().unwrap();
+    it.seek_ge(b"m").unwrap();
+    assert!(it.coalesced_range_keys().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

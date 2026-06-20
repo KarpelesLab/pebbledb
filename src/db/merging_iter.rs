@@ -363,6 +363,57 @@ impl DbIterator {
             .collect()
     }
 
+    /// The *effective* range keys at the current position: the covering
+    /// `RANGEKEYSET`/`UNSET`/`DEL` entries coalesced into the set of `(suffix, value)`
+    /// pairs in force, sorted by suffix. Newer entries win; a `RANGEKEYUNSET` removes a
+    /// suffix and a `RANGEKEYDEL` removes everything older. (Pebble's range-key
+    /// coalescing, on top of the raw entries from [`DbIterator::range_keys`].)
+    pub fn coalesced_range_keys(&self) -> Vec<crate::base::range_key::SuffixValue> {
+        use crate::base::internal_key::InternalKeyKind;
+        use crate::base::range_key::{decode_end, decode_set_suffix_values, decode_unset_suffixes};
+        use std::collections::BTreeMap;
+
+        // Covering entries, newest sequence number first.
+        let mut covering = self.range_keys();
+        covering.sort_by(|a, b| b.seqnum.cmp(&a.seqnum));
+
+        let mut decided: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        let mut set: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for e in &covering {
+            match e.kind {
+                InternalKeyKind::RangeKeyDelete => break, // everything older is deleted
+                InternalKeyKind::RangeKeySet => {
+                    let Ok((_, payload)) = decode_end(e.kind, &e.value) else {
+                        continue;
+                    };
+                    let Ok(svs) = decode_set_suffix_values(payload) else {
+                        continue;
+                    };
+                    for sv in svs {
+                        if decided.insert(sv.suffix.clone()) {
+                            set.insert(sv.suffix, sv.value);
+                        }
+                    }
+                }
+                InternalKeyKind::RangeKeyUnset => {
+                    let Ok((_, payload)) = decode_end(e.kind, &e.value) else {
+                        continue;
+                    };
+                    let Ok(suffixes) = decode_unset_suffixes(payload) else {
+                        continue;
+                    };
+                    for s in suffixes {
+                        decided.insert(s); // shadows older SETs for this suffix
+                    }
+                }
+                _ => {}
+            }
+        }
+        set.into_iter()
+            .map(|(suffix, value)| crate::base::range_key::SuffixValue { suffix, value })
+            .collect()
+    }
+
     /// Whether the iterator is positioned at a valid key.
     pub fn valid(&self) -> bool {
         self.valid
