@@ -84,8 +84,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `Options::block_property_collectors`. The concrete MVCC-time collector is CockroachDB's.)
 
 ### Compaction
-- **Compaction scheduler**: multiple concurrent background compactions, prioritization.
-- (Done. **Multilevel compaction** — when a single-file `level → level+1` compaction's output
+- (Done. **Compaction scheduler** — compactions run off the state lock (reserve+snapshot,
+  write, then apply), pickers mark a `compacting` file set so `Options::max_concurrent_compactions`
+  background workers compact disjoint files in parallel; obsolete files are deleted only once
+  no in-flight read references them. **Multilevel compaction** — when a single-file `level → level+1` compaction's output
   would also overlap `level+2`, all three levels are folded into one compaction writing
   straight to `level+2`; the base-level budget is `Options::l1_max_bytes` (Pebble's
   `LBaseMaxBytes`). **Flush splitting** — a point-only memtable is split into multiple L0
