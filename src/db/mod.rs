@@ -128,6 +128,11 @@ pub struct Options {
     /// **tombstone-density** compaction — compacted down to reclaim space even when its level
     /// is within budget (default 0.10, Pebble's default). Set to a value `> 1.0` to disable.
     pub tombstone_dense_compaction_threshold: f64,
+    /// Number of "wasted" read seeks through a file — reads that passed through it to find the
+    /// key in a deeper level — that trigger a **read-triggered compaction** of that file
+    /// (Pebble's allowed-seeks heuristic, which it derives from file size; here a fixed knob).
+    /// `0` disables read-triggered compactions (default 1024).
+    pub read_compaction_threshold: u32,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -238,6 +243,7 @@ impl Default for Options {
             l0_compaction_threshold: 4,
             target_file_size: 2 << 20,
             tombstone_dense_compaction_threshold: 0.10,
+            read_compaction_threshold: 1024,
         }
     }
 }
@@ -264,6 +270,13 @@ struct State {
     flush_count: u64,
     /// Number of compactions performed this session.
     compaction_count: u64,
+    /// Per-file count of "wasted" read seeks: reads that passed through the file (it
+    /// overlapped the key by range but held no version of it) before finding the key in a
+    /// deeper level. Drives read-triggered compaction.
+    read_miss: std::collections::HashMap<u64, u32>,
+    /// Files whose wasted-seek count has crossed the read-compaction threshold and which are
+    /// awaiting a read-triggered compaction. Drained by the background worker / `maybe_compact`.
+    read_queue: Vec<u64>,
 }
 
 /// The shared inner state of a [`Db`], held behind an `Arc` so the background flush worker
@@ -310,6 +323,8 @@ pub struct DbInner {
     block_property_collectors: Vec<BlockPropertyCollectorFactory>,
     /// Point-tombstone fraction that makes a file eligible for tombstone-density compaction.
     tombstone_dense_compaction_threshold: f64,
+    /// Wasted-seek count that triggers a read-triggered compaction (0 disables).
+    read_compaction_threshold: u32,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -483,6 +498,8 @@ impl DbInner {
                 shutdown: false,
                 flush_count: 0,
                 compaction_count: 0,
+                read_miss: std::collections::HashMap::new(),
+                read_queue: Vec::new(),
             };
             return Ok(DbInner {
                 dir,
@@ -513,6 +530,7 @@ impl DbInner {
                 cleaner: opts.cleaner.clone(),
                 block_property_collectors: opts.block_property_collectors.clone(),
                 tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
+                read_compaction_threshold: opts.read_compaction_threshold,
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -598,6 +616,8 @@ impl DbInner {
             shutdown: false,
             flush_count: 0,
             compaction_count: 0,
+            read_miss: std::collections::HashMap::new(),
+            read_queue: Vec::new(),
         };
         Ok(DbInner {
             dir,
@@ -628,6 +648,7 @@ impl DbInner {
             cleaner: opts.cleaner.clone(),
             block_property_collectors: opts.block_property_collectors.clone(),
             tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
+            read_compaction_threshold: opts.read_compaction_threshold,
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
@@ -1062,7 +1083,7 @@ impl DbInner {
         loop {
             {
                 let mut state = self.state.lock().unwrap();
-                while state.imm.is_empty() && !state.shutdown {
+                while state.imm.is_empty() && state.read_queue.is_empty() && !state.shutdown {
                     state = self.work_cv.wait(state).unwrap();
                 }
                 if state.shutdown {
@@ -1070,8 +1091,17 @@ impl DbInner {
                 }
             }
             // Flush outside the state lock guard; errors are surfaced via the next
-            // foreground flush/open rather than panicking the worker.
-            if let Err(e) = self.flush_one() {
+            // foreground flush/open rather than panicking the worker. A flush's
+            // `maybe_compact` also services the read-compaction queue; if there was nothing
+            // to flush, service the queue directly.
+            let res = self.flush_one().and_then(|flushed| {
+                if flushed {
+                    return Ok(());
+                }
+                let mut state = self.state.lock().unwrap();
+                self.run_read_compactions(&mut state)
+            });
+            if let Err(e) = res {
                 if let Some(l) = &self.listener {
                     l.on_background_error(&e.to_string());
                 }
@@ -1165,7 +1195,11 @@ impl DbInner {
                 }
             }
         }
-        // Sstables: L0 newest-first, then L1..L6.
+        // Sstables: L0 newest-first, then L1..L6. Files that overlap the key by range but hold
+        // no version of it are "passed through"; if the key is then found in a deeper sstable,
+        // those passes are charged as wasted seeks to drive read-triggered compaction.
+        let mut passed: Vec<u64> = Vec::new();
+        let mut resolved_in_sstable = false;
         if !terminated {
             'levels: for level in 0..NUM_LEVELS {
                 for f in version.overlapping(cmp, level, key) {
@@ -1177,10 +1211,19 @@ impl DbInner {
                         snapshot,
                     ));
                     if resolve_versions(reader.lookup_versions(key, snapshot)?, max_rts).is_some() {
+                        resolved_in_sstable = true;
                         break 'levels;
+                    }
+                    // Only L1+ files are eligible for read-triggered compaction (L0 files are
+                    // not range-partitioned, so a single-file compaction of one is unsafe).
+                    if level > 0 {
+                        passed.push(f.file_num);
                     }
                 }
             }
+        }
+        if resolved_in_sstable && !passed.is_empty() {
+            self.charge_read_seeks(&passed);
         }
 
         if operands.is_empty() {
@@ -1192,6 +1235,33 @@ impl DbInner {
         match &self.merger {
             Some(m) => Ok(Some(m.full_merge(key, base.as_deref(), &operands))),
             None => Ok(operands.pop()), // no merger configured: newest operand
+        }
+    }
+
+    /// Records wasted read seeks against `files` (read-triggered compaction). When a file's
+    /// count crosses [`Options::read_compaction_threshold`] it is queued for compaction and
+    /// the background worker is woken. Cheap and lock-light: only taken when a read actually
+    /// passed through files to reach a deeper level, and a no-op when the feature is disabled.
+    fn charge_read_seeks(&self, files: &[u64]) {
+        let threshold = self.read_compaction_threshold;
+        if threshold == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.read_only {
+            return;
+        }
+        let mut queued = false;
+        for &file_num in files {
+            let count = state.read_miss.entry(file_num).or_insert(0);
+            *count += 1;
+            if *count >= threshold && !state.read_queue.contains(&file_num) {
+                state.read_queue.push(file_num);
+                queued = true;
+            }
+        }
+        if queued {
+            self.work_cv.notify_one();
         }
     }
 

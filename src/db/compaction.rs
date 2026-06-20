@@ -129,6 +129,8 @@ impl DbInner {
 
     /// Picks and runs compactions until none are needed (or a safety cap is hit).
     pub(super) fn maybe_compact(&self, state: &mut State) -> Result<()> {
+        // Service files queued by read-triggered compaction first.
+        self.run_read_compactions(state)?;
         // Opportunistically drop whole files shadowed by a covering range tombstone before
         // scoring levels — this is free (a MANIFEST edit) and shrinks the work below.
         self.delete_only_compact(state)?;
@@ -145,6 +147,49 @@ impl DbInner {
             if !self.tombstone_density_compact(state)? {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// Read-triggered compaction (Pebble): compact files queued in `state.read_queue` because
+    /// reads repeatedly passed through them to find keys in deeper levels. Each queued L1+
+    /// file is compacted one level down (rewriting when there is overlapping data below,
+    /// otherwise moving), reducing the read amplification of hot ranges. L0 entries are
+    /// skipped (a single L0 file may not hold the newest version of its keys).
+    pub(super) fn run_read_compactions(&self, state: &mut State) -> Result<()> {
+        while let Some(file_num) = {
+            let q = &mut state.read_queue;
+            (!q.is_empty()).then(|| q.remove(0))
+        } {
+            state.read_miss.remove(&file_num);
+            // Locate the file and its current level (it may have moved or been dropped).
+            let mut found = None;
+            for level in 1..NUM_LEVELS - 1 {
+                if let Some(f) = state.vs.current.levels[level]
+                    .iter()
+                    .find(|f| f.file_num == file_num)
+                {
+                    found = Some((level, f.clone()));
+                    break;
+                }
+            }
+            let Some((level, f)) = found else {
+                continue;
+            };
+            let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(&f)) else {
+                continue;
+            };
+            let overlap = overlapping(self.cmp.as_ref(), &state.vs.current, level + 1, &min, &max);
+            self.log(&format!(
+                "read-triggered compaction of sstable {file_num} at L{level}"
+            ));
+            let c = Compaction {
+                level,
+                output_level: level + 1,
+                inputs: vec![f],
+                overlap,
+            };
+            self.run_compaction(state, c)?;
         }
         Ok(())
     }

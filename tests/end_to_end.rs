@@ -652,6 +652,61 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn read_triggered_compaction_moves_a_passed_through_file() {
+    // Low threshold so a handful of reads trigger it.
+    let dir = temp_dir("read-triggered");
+    let db = Db::open(
+        &dir,
+        Options {
+            read_compaction_threshold: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Seed key "m" at the bottom level.
+    db.set(b"m", b"v").unwrap();
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // Build an L1 file whose range [a..z] spans "m" but which contains no "m": four L0 flushes
+    // of keys around "m" reach the file-count trigger and merge into a single L1 file.
+    for k in [b"a".as_ref(), b"b", b"c", b"z"] {
+        db.set(k, b"v").unwrap();
+        db.flush().unwrap();
+    }
+    let m = db.metrics();
+    assert_eq!(
+        m.level_files[1], 1,
+        "expected one L1 file spanning m: {:?}",
+        m.level_files
+    );
+
+    // Reading "m" repeatedly passes through that L1 file (it spans "m" but lacks it) to reach
+    // the bottom — charging wasted seeks until the file crosses the threshold and is queued.
+    for _ in 0..6 {
+        assert_eq!(db.get(b"m").unwrap(), Some(b"v".to_vec()));
+    }
+    // A synchronous flush drains the read-compaction queue (the background worker may also
+    // have); either way the passed-through L1 file is compacted down off L1.
+    db.set(b"trigger", b"v").unwrap();
+    db.flush().unwrap();
+
+    let m2 = db.metrics();
+    assert_eq!(
+        m2.level_files[1], 0,
+        "the passed-through file should be moved off L1 by read-triggered compaction: {:?}",
+        m2.level_files
+    );
+    // All data still readable.
+    assert_eq!(db.get(b"m").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"a").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"z").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tombstone_density_compaction_drains_a_dense_file() {
     let dir = temp_dir("tombstone-density");
     let db = Db::open(&dir, Options::default()).unwrap();
