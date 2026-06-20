@@ -302,6 +302,11 @@ pub struct IterOptions {
     /// shadowing remains correct. Empty (default) disables filtering.
     pub block_property_filters:
         Vec<std::sync::Arc<dyn crate::sstable::blockprop::BlockPropertyFilter>>,
+    /// Restrict iteration to data that is guaranteed durable — i.e. already flushed to
+    /// sstables (Pebble's `OnlyReadGuaranteedDurable`). When set, the mutable and immutable
+    /// memtables (and their range tombstones / range keys) are excluded, so only state that
+    /// would survive a process crash without an OS flush is visible.
+    pub only_durable: bool,
 }
 
 /// A bidirectional iterator over a database's user keys at a fixed snapshot.

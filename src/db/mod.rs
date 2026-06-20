@@ -1215,13 +1215,19 @@ impl DbInner {
         };
 
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
-        let mut tombstones = mem.range_tombstones();
-        let mut range_keys = mem.range_keys();
-        sources.push(Box::new(mem.scan()));
-        for m in imm.iter().rev() {
-            tombstones.extend(m.range_tombstones());
-            range_keys.extend(m.range_keys());
-            sources.push(Box::new(m.scan()));
+        let mut tombstones = Vec::new();
+        let mut range_keys = Vec::new();
+        // In durable-only mode the memtables are skipped entirely: only flushed sstables (and
+        // their tombstones / range keys) are visible.
+        if !opts.only_durable {
+            tombstones = mem.range_tombstones();
+            range_keys = mem.range_keys();
+            sources.push(Box::new(mem.scan()));
+            for m in imm.iter().rev() {
+                tombstones.extend(m.range_tombstones());
+                range_keys.extend(m.range_keys());
+                sources.push(Box::new(m.scan()));
+            }
         }
         for level in version.levels.iter() {
             for f in level {

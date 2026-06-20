@@ -652,6 +652,46 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn only_durable_iterator_excludes_memtable() {
+    let dir = temp_dir("durable");
+    let db = Db::open(&dir, Options::default()).unwrap();
+
+    // Flush one key to an sstable (durable), keep another only in the memtable.
+    db.set(b"flushed", b"v").unwrap();
+    db.flush().unwrap();
+    db.set(b"memonly", b"v").unwrap();
+
+    let durable_keys = |db: &Db| -> Vec<Vec<u8>> {
+        let mut it = db
+            .iter_with_options(IterOptions {
+                only_durable: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        it.first().unwrap();
+        while it.valid() {
+            out.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        out
+    };
+
+    // A normal iterator sees both; the durable-only iterator sees only the flushed key.
+    assert_eq!(collect(&db).len(), 2);
+    assert_eq!(durable_keys(&db), vec![b"flushed".to_vec()]);
+
+    // After flushing the memtable, the durable view includes the previously memtable-only key.
+    db.flush().unwrap();
+    assert_eq!(
+        durable_keys(&db),
+        vec![b"flushed".to_vec(), b"memonly".to_vec()]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn block_property_filter_skips_nonmatching_sstables() {
     use pebbledb::base::internal_key::encoded_user_key;
     use pebbledb::sstable::blockprop::{BlockPropertyCollector, BlockPropertyFilter};

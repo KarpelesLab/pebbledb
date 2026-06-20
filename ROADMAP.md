@@ -68,10 +68,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   provide read-your-own-writes), batch reuse/reset, and large batches handled as flushables.
 
 ### Iterators
-- Remaining **`IterOptions`**: key-type selection (point / range / both),
-  `OnlyReadGuaranteedDurable`. (`SetBounds`, range-key surfacing + coalescing, **range-key
-  masking**, **block-property filters wired into iteration** — table-level skipping via
-  `IterOptions::block_property_filters` — and `ScanInternal` are done.)
+- Remaining **`IterOptions`**: key-type selection (point / range / both). (`SetBounds`,
+  range-key surfacing + coalescing, **range-key masking**, **block-property filters wired
+  into iteration** — table-level skipping via `IterOptions::block_property_filters` —
+  **`OnlyReadGuaranteedDurable`** (`IterOptions::only_durable`), and `ScanInternal` are done.)
 - `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
 - Bloom-skip during `seek_prefix_ge`.
 
