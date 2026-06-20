@@ -151,6 +151,11 @@ pub struct Options {
     /// inline in data blocks (Pebble's value blocks). `None` (default) keeps all values inline.
     /// Enabling it writes tables in a value-block-capable format (Pebble v3).
     pub value_block_threshold: Option<usize>,
+    /// Per-level output sstable size targets (Pebble's per-level `TargetFileSize`). Index `i`
+    /// overrides [`target_file_size`](Options::target_file_size) for compactions whose output
+    /// is level `i`; levels beyond the vector fall back to `target_file_size`. Empty (default)
+    /// uses `target_file_size` everywhere.
+    pub level_target_file_sizes: Vec<u64>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -273,6 +278,7 @@ impl Default for Options {
             target_byte_deletion_rate: 0,
             disk_slow_threshold: None,
             value_block_threshold: None,
+            level_target_file_sizes: Vec::new(),
         }
     }
 }
@@ -369,6 +375,8 @@ pub struct DbInner {
     l1_max_bytes: u64,
     /// Minimum value size for out-of-line value-block storage; `None` keeps values inline.
     value_block_threshold: Option<usize>,
+    /// Per-level output-sstable size targets; falls back to `target_file_size` past its end.
+    level_target_file_sizes: Vec<u64>,
     /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
     target_byte_deletion_rate: u64,
     /// Queue of obsolete files awaiting paced deletion (only used when the rate is non-zero).
@@ -673,6 +681,7 @@ impl DbInner {
                 read_compaction_threshold: opts.read_compaction_threshold,
                 l1_max_bytes: opts.l1_max_bytes.max(1),
                 value_block_threshold: opts.value_block_threshold,
+                level_target_file_sizes: opts.level_target_file_sizes.clone(),
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
                 delete_queue: Mutex::new(DeleteQueue::default()),
                 delete_cv: Condvar::new(),
@@ -804,6 +813,7 @@ impl DbInner {
             read_compaction_threshold: opts.read_compaction_threshold,
             l1_max_bytes: opts.l1_max_bytes.max(1),
             value_block_threshold: opts.value_block_threshold,
+            level_target_file_sizes: opts.level_target_file_sizes.clone(),
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
             delete_queue: Mutex::new(DeleteQueue::default()),
             delete_cv: Condvar::new(),

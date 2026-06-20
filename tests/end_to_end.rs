@@ -1143,6 +1143,40 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn per_level_target_file_size_splits_more() {
+    // A tiny per-level target for L1 makes L0->L1 compaction emit many small files, where the
+    // default 2 MiB target would produce just one.
+    let dir = temp_dir("per-level-target");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 16 * 1024,
+            // Override only L1's target to 4 KiB (index 0 = L0, unused).
+            level_target_file_sizes: vec![0, 4 * 1024],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..3000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 40]).unwrap();
+    }
+    db.flush().unwrap();
+
+    let m = db.metrics();
+    assert!(
+        m.level_files[1] > 1,
+        "L1 should be split into many small files by the per-level target: {:?}",
+        m.level_files
+    );
+    // Data is intact.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 40]));
+    assert_eq!(db.get(b"k02999").unwrap(), Some(vec![b'v'; 40]));
+    assert_eq!(collect(&db).len(), 3000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn l0_sublevels_reflect_overlap() {
     // Disjoint L0 files pack into one sublevel; overlapping ones each need their own.
     let opts = || Options {

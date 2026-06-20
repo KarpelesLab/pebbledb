@@ -131,6 +131,16 @@ impl DbInner {
         })
     }
 
+    /// The output sstable size target for a compaction producing files at `level`: the
+    /// per-level override from `level_target_file_sizes` if present, else `target_file_size`.
+    fn target_file_size_for(&self, level: usize) -> u64 {
+        self.level_target_file_sizes
+            .get(level)
+            .copied()
+            .filter(|&s| s > 0)
+            .unwrap_or(self.target_file_size)
+    }
+
     /// Picks and runs compactions until none are needed (or a safety cap is hit).
     pub(super) fn maybe_compact(&self, state: &mut State) -> Result<()> {
         // Service files queued by read-triggered compaction first.
@@ -584,7 +594,7 @@ impl DbInner {
             }
             let b = builder.as_mut().unwrap();
             b.add(&ikey, &value)?;
-            if b.writer.estimated_size() >= self.target_file_size {
+            if b.writer.estimated_size() >= self.target_file_size_for(c.output_level) {
                 outputs.push(builder.take().unwrap().finish()?);
             }
         }

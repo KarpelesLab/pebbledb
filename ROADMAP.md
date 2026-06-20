@@ -146,7 +146,8 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   locking + sync, and the disk-health-checking FS emitting `DiskSlow`.)
 
 ### Options, format & migrations
-- Full **`Options`** surface incl. per-level options. (Step-wise **format-major-version
+- Full **`Options`** surface. (**Per-level options** — per-level output target file sizes via
+  `Options::level_target_file_sizes` — are done. Step-wise **format-major-version
   migrations** and the `OPTIONS` round-trip are done; per-version migrations are currently
   no-ops awaiting versions that need them; the **comparer/merger name→impl registry**
   (`Options::comparers` / `Options::mergers`, resolved against the store's recorded names at
