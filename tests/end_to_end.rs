@@ -468,6 +468,77 @@ fn open_rejects_comparer_mismatch() {
 }
 
 #[test]
+fn comparer_registry_resolves_recorded_comparer() {
+    use pebbledb::{Comparer, DefaultComparer};
+    use std::cmp::Ordering;
+
+    // A bytewise comparer reporting a non-default name.
+    struct Renamed(DefaultComparer);
+    impl Comparer for Renamed {
+        fn name(&self) -> &str {
+            "test.RegistryComparator"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+            self.0.compare(a, b)
+        }
+        fn abbreviated_key(&self, key: &[u8]) -> u64 {
+            self.0.abbreviated_key(key)
+        }
+        fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]) {
+            self.0.separator(dst, a, b)
+        }
+        fn successor(&self, dst: &mut Vec<u8>, a: &[u8]) {
+            self.0.successor(dst, a)
+        }
+    }
+
+    let dir = temp_dir("cmp-registry");
+    {
+        // Create the store with the custom comparer as the primary comparer.
+        let db = Db::open(
+            &dir,
+            Options {
+                comparer: Arc::new(Renamed(DefaultComparer)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.set(b"k", b"v").unwrap();
+        db.flush().unwrap();
+    }
+
+    // Reopen with the DEFAULT comparer primary, but the custom one in the registry: the
+    // recorded name is resolved from `comparers`, so the open succeeds and data reads back.
+    {
+        let db = Db::open(
+            &dir,
+            Options {
+                comparer: Arc::new(DefaultComparer),
+                comparers: vec![Arc::new(Renamed(DefaultComparer))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    // Reopen with neither the matching comparer nor a registry entry: open must fail.
+    let err = Db::open(
+        &dir,
+        Options {
+            comparer: Arc::new(DefaultComparer),
+            ..Default::default()
+        },
+    );
+    assert!(
+        err.is_err(),
+        "open without the recorded comparer should fail"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn range_key_masking_hides_older_point_versions() {
     use pebbledb::{Comparer, DefaultComparer};
     use std::cmp::Ordering;

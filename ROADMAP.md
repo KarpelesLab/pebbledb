@@ -68,10 +68,9 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   provide read-your-own-writes), batch reuse/reset, and large batches handled as flushables.
 
 ### Iterators
-- Remaining **`IterOptions`**: key-type selection (point / range / both), **range-key
-  masking**, table filters, **block-property filters wired into iteration**,
-  `OnlyReadGuaranteedDurable`. (`SetBounds`, range-key surfacing + coalescing, and
-  `ScanInternal` are done.)
+- Remaining **`IterOptions`**: key-type selection (point / range / both), table filters,
+  **block-property filters wired into iteration**, `OnlyReadGuaranteedDurable`. (`SetBounds`,
+  range-key surfacing + coalescing, **range-key masking**, and `ScanInternal` are done.)
 - `SetOptions`, `Clone`; lazy values (`LazyValue`) and value fetching.
 - Bloom-skip during `seek_prefix_ge`.
 
@@ -121,14 +120,17 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   locking + sync, and the disk-health-checking FS emitting `DiskSlow`.)
 
 ### Options, format & migrations
-- Full **`Options`** surface incl. per-level options and a **comparer/merger name→impl
-  registry**. (Step-wise **format-major-version migrations** and the `OPTIONS` round-trip
-  are done; per-version migrations are currently no-ops awaiting versions that need them.)
+- Full **`Options`** surface incl. per-level options. (Step-wise **format-major-version
+  migrations** and the `OPTIONS` round-trip are done; per-version migrations are currently
+  no-ops awaiting versions that need them; the **comparer/merger name→impl registry**
+  (`Options::comparers` / `Options::mergers`, resolved against the store's recorded names at
+  open) is done.)
 
 ### Observability & file management
-- Remaining **`EventListener`** events (manifest/WAL create-delete, table stats/validated,
-  disk-slow, background-error). (Have: flush/compaction begin+end, table created/deleted,
-  ingest end, write-stall begin+end.)
+- Remaining **`EventListener`** events (table stats loaded / validated, disk-slow routed
+  from the health-checking vfs). (Have: flush/compaction begin+end, table created/deleted,
+  ingest end, write-stall begin+end, WAL/MANIFEST create-delete, format upgrade,
+  background-error.)
 - Further **`Metrics`** breadth (per-op latencies, amplification). (Have: core `Metrics`,
   the LSM view, a `Logger`, the `Cleaner`, and memtable-count write stalls.)
 

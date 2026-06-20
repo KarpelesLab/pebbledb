@@ -71,6 +71,16 @@ pub struct Options {
     /// Optional merge operator. Required to read keys written with `merge`; without it,
     /// a merge resolves to its newest operand.
     pub merger: Option<Arc<dyn crate::base::merge::Merger>>,
+    /// Additional comparers, keyed by [`name`](Comparer::name), consulted when opening a
+    /// store whose recorded comparer name differs from [`comparer`](Options::comparer). This
+    /// is Pebble's comparer registry: it lets one process open stores written with different
+    /// comparers without knowing which in advance. The recorded comparer must be either
+    /// [`comparer`](Options::comparer) or present here, or the open fails.
+    pub comparers: Vec<Arc<dyn Comparer>>,
+    /// Additional merge operators, keyed by [`name`](crate::base::merge::Merger::name),
+    /// consulted when opening a store whose recorded merger name differs from
+    /// [`merger`](Options::merger). Pebble's merger registry.
+    pub mergers: Vec<Arc<dyn crate::base::merge::Merger>>,
     /// Size in bytes of the shared block cache for decompressed blocks (default 8 MiB).
     /// Zero disables block caching.
     pub block_cache_size: usize,
@@ -199,6 +209,8 @@ impl Default for Options {
             wal_sync: true,
             event_listener: None,
             merger: None,
+            comparers: Vec::new(),
+            mergers: Vec::new(),
             block_cache_size: 8 << 20,
             max_open_files: 1000,
             fs: Arc::new(DiskFs),
@@ -387,15 +399,33 @@ impl DbInner {
         let mut names: Vec<String> = fs.list(&dir)?;
         names.sort();
 
-        let cmp = opts.comparer.clone();
+        // Read the existing OPTIONS file (if any) once: it records the comparer and merger
+        // names the store was written with, which drive registry resolution below.
+        let options_file = match filenames::current_options(&names) {
+            Some(name) => {
+                let text = String::from_utf8_lossy(&fs.read(&dir.join(&name))?).into_owned();
+                Some(OptionsFile::decode(&text)?)
+            }
+            None => None,
+        };
+
+        // Resolve the effective comparer/merger by the store's recorded names, consulting the
+        // registries (`Options::comparers` / `Options::mergers`). This lets one process open
+        // stores written with different comparers without knowing which in advance.
+        let cmp = resolve_comparer(
+            &opts,
+            options_file.as_ref().map(|o| o.comparer_name.as_str()),
+        )?;
+        let merger = resolve_merger(
+            &opts,
+            options_file.as_ref().and_then(|o| o.merger_name.as_deref()),
+        );
         let mut mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
 
         // Resolve the format major version: an existing OPTIONS file's value (validated
-        // against the configured comparer), or the option for a fresh store.
-        let format_major_version = match filenames::current_options(&names) {
-            Some(name) => {
-                let text = String::from_utf8_lossy(&fs.read(&dir.join(&name))?).into_owned();
-                let of = OptionsFile::decode(&text)?;
+        // against the resolved comparer), or the option for a fresh store.
+        let format_major_version = match &options_file {
+            Some(of) => {
                 of.validate(cmp.name())?;
                 of.format_major_version
             }
@@ -447,7 +477,7 @@ impl DbInner {
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
                 listener: opts.event_listener.clone(),
-                merger: opts.merger.clone(),
+                merger: merger.clone(),
                 block_cache: if opts.block_cache_size > 0 {
                     Some(Arc::new(crate::cache::BlockCache::new(
                         opts.block_cache_size,
@@ -553,7 +583,7 @@ impl DbInner {
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
             listener: opts.event_listener.clone(),
-            merger: opts.merger.clone(),
+            merger: merger.clone(),
             block_cache: if opts.block_cache_size > 0 {
                 Some(Arc::new(crate::cache::BlockCache::new(
                     opts.block_cache_size,
@@ -1617,6 +1647,49 @@ fn recover_wals(
     }
     vs.last_sequence = last_seq;
     Ok(vs)
+}
+
+/// Resolves the comparer to open a store with, given the comparer name recorded in its
+/// OPTIONS file (if any). Prefers [`Options::comparer`] when its name matches (or nothing is
+/// recorded), then searches the [`Options::comparers`] registry. Fails if the recorded
+/// comparer is neither configured nor registered.
+fn resolve_comparer(opts: &Options, recorded: Option<&str>) -> Result<Arc<dyn Comparer>> {
+    let Some(name) = recorded.filter(|n| !n.is_empty()) else {
+        return Ok(opts.comparer.clone());
+    };
+    if opts.comparer.name() == name {
+        return Ok(opts.comparer.clone());
+    }
+    if let Some(c) = opts.comparers.iter().find(|c| c.name() == name) {
+        return Ok(c.clone());
+    }
+    Err(Error::InvalidState(format!(
+        "db: store recorded comparer {name:?} but it is neither Options::comparer ({:?}) nor in \
+         Options::comparers; register it to open this store",
+        opts.comparer.name()
+    )))
+}
+
+/// Resolves the merge operator to open a store with, given the merger name recorded in its
+/// OPTIONS file (if any). Prefers [`Options::merger`] when its name matches, then searches
+/// the [`Options::mergers`] registry. Falls back to [`Options::merger`] (possibly `None`)
+/// when the recorded merger is unknown — matching the engine's lenient handling of a merge
+/// without an operator (it resolves to the newest operand).
+fn resolve_merger(
+    opts: &Options,
+    recorded: Option<&str>,
+) -> Option<Arc<dyn crate::base::merge::Merger>> {
+    if let Some(name) = recorded.filter(|n| !n.is_empty()) {
+        if let Some(m) = &opts.merger
+            && m.name() == name
+        {
+            return Some(m.clone());
+        }
+        if let Some(m) = opts.mergers.iter().find(|m| m.name() == name) {
+            return Some(m.clone());
+        }
+    }
+    opts.merger.clone()
 }
 
 /// Creates a WAL file numbered `wal_number`, trying `wal_dirs[start_idx..]` in order until
