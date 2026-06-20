@@ -105,7 +105,8 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `Options::target_byte_deletion_rate`, a background pacer spacing obsolete-file deletion.)
 
 ### Commit pipeline
-- True **group commit** (batch many committers through one WAL sync + memtable apply).
+- (Done.) **Group commit**: a leader-follower pipeline batches many concurrent committers
+  through one WAL sync + a run of memtable applies (`apply` enqueues, then leads or waits).
 
 ### Snapshots
 - (Done: the consistent seqnum-pinned snapshotting model, and **EventuallyFileOnlySnapshot**
