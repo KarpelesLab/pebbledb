@@ -27,6 +27,7 @@
 //! [`columnar`] (a complete columnar table writer/reader); cross-implementation parity
 //! with Pebble's production columnar tables is validated by the interop CI.
 
+pub mod blob;
 pub mod block;
 pub mod blockprop;
 pub mod colblk;
