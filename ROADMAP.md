@@ -143,8 +143,7 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 - Consistency checking (`level_checker`) over columnar tables.
 
 ### Tooling & testing
-- Remaining `pebble` **CLI** subcommands (`bench`, `find`). (Have: `sstable`/`wal`/
-  `manifest` dump, `db get`/`scan`/`lsm`.)
+- (Have: `sstable`/`wal`/`manifest` dump, `db get`/`scan`/`lsm`, `find`, and `bench`.)
 - Port Pebble's **data-driven test corpus** and a **metamorphic** harness; add a
   **libFuzzer** target. (A seeded model test provides randomized coverage today.)
 

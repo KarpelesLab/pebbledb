@@ -130,6 +130,20 @@ fn find_locates_a_key() {
 }
 
 #[test]
+fn bench_runs_and_reports() {
+    let dir = temp_dir("bench");
+    // A small count keeps the test fast; the binary creates the store itself.
+    let (ok, out) = run(&["bench", dir.to_str().unwrap(), "500"]);
+    assert!(ok, "bench failed: {out}");
+    assert!(out.contains("write: 500 keys"), "{out}");
+    assert!(out.contains("read:  500 keys"), "{out}");
+    assert!(out.contains("500 found"), "{out}");
+    assert!(out.contains("ops/sec"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn manifest_dump_runs() {
     let dir = temp_dir("manifest");
     {

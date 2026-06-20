@@ -12,6 +12,9 @@
 //! pebbledb manifest dump <MANIFEST>     dump a MANIFEST's version edits
 //! pebbledb db get        <dir> <key>    read one key from a database (read-only)
 //! pebbledb db scan       <dir>          scan all visible keys (read-only)
+//! pebbledb db lsm        <dir>          print the LSM level/file layout (read-only)
+//! pebbledb find          <dir> <key>    report whether a key is present (read-only)
+//! pebbledb bench         <dir> [count]  write then read `count` keys, reporting throughput
 //! ```
 
 use std::process::ExitCode;
@@ -47,6 +50,13 @@ fn run(args: &[&str]) -> Result<(), String> {
         ["db", "scan", dir] => db_scan(dir),
         ["db", "lsm", dir] => db_lsm(dir),
         ["find", dir, key] => db_find(dir, key),
+        ["bench", dir] => db_bench(dir, 100_000),
+        ["bench", dir, count] => {
+            let n = count
+                .parse::<u64>()
+                .map_err(|_| format!("bench: invalid count {count:?}"))?;
+            db_bench(dir, n)
+        }
         ["help" | "-h" | "--help"] | [] => {
             print_usage();
             Ok(())
@@ -67,7 +77,8 @@ fn print_usage() {
          pebbledb db get        <dir> <key>\n  \
          pebbledb db scan       <dir>\n  \
          pebbledb db lsm        <dir>\n  \
-         pebbledb find          <dir> <key>"
+         pebbledb find          <dir> <key>\n  \
+         pebbledb bench         <dir> [count]"
     );
 }
 
@@ -269,4 +280,49 @@ fn db_find(dir: &str, key: &str) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// A small write/read throughput benchmark: fills a fresh store with `count` sequential
+/// key/value pairs, then reads them all back, reporting elapsed time and operations/second
+/// for each phase. In the spirit of Pebble's `pebble bench`.
+fn db_bench(dir: &str, count: u64) -> Result<(), String> {
+    use std::time::Instant;
+
+    let db = Db::open(dir, Options::default()).map_err(|e| format!("open {dir}: {e}"))?;
+
+    let rate = |n: u64, secs: f64| -> f64 { if secs > 0.0 { n as f64 / secs } else { 0.0 } };
+
+    // Write phase.
+    let t0 = Instant::now();
+    for i in 0..count {
+        let key = format!("key{i:012}");
+        db.set(key.as_bytes(), b"benchmark-value")
+            .map_err(|e| format!("set: {e}"))?;
+    }
+    db.flush().map_err(|e| format!("flush: {e}"))?;
+    let write_secs = t0.elapsed().as_secs_f64();
+    println!(
+        "write: {count} keys in {write_secs:.3}s ({:.0} ops/sec)",
+        rate(count, write_secs)
+    );
+
+    // Read phase.
+    let t1 = Instant::now();
+    let mut found = 0u64;
+    for i in 0..count {
+        let key = format!("key{i:012}");
+        if db
+            .get(key.as_bytes())
+            .map_err(|e| format!("get: {e}"))?
+            .is_some()
+        {
+            found += 1;
+        }
+    }
+    let read_secs = t1.elapsed().as_secs_f64();
+    println!(
+        "read:  {count} keys in {read_secs:.3}s ({:.0} ops/sec), {found} found",
+        rate(count, read_secs)
+    );
+    Ok(())
 }
