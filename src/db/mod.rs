@@ -2618,12 +2618,14 @@ fn l0_sublevel_count(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> usize {
 fn engine_writer_options(
     value_block_threshold: Option<usize>,
     blob_value_threshold: Option<usize>,
+    blob_file_num: u64,
 ) -> WriterOptions {
     let mut o = WriterOptions::default();
     if value_block_threshold.is_some() || blob_value_threshold.is_some() {
         o.table_format = crate::sstable::TableFormat::Pebble(3);
         o.value_block_threshold = value_block_threshold;
         o.blob_value_threshold = blob_value_threshold;
+        o.blob_file_num = Some(blob_file_num);
     }
     o
 }
@@ -2665,7 +2667,7 @@ fn write_memtable_to_sstables(
         let mut w = Writer::new(
             fs.create(&path)?,
             cmp.clone(),
-            engine_writer_options(value_block_threshold, blob_value_threshold),
+            engine_writer_options(value_block_threshold, blob_value_threshold, file_num),
         );
         for factory in collectors {
             w.add_block_property_collector(factory());

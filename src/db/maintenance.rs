@@ -191,7 +191,11 @@ impl DbInner {
             self.cmp.clone(),
             // Honor the engine's value separation when rewriting the ingested table, so large
             // ingested values land in value blocks / a sibling blob file (ingest-with-blobs).
-            super::engine_writer_options(self.value_block_threshold, self.blob_value_threshold),
+            super::engine_writer_options(
+                self.value_block_threshold,
+                self.blob_value_threshold,
+                file_num,
+            ),
         );
 
         let mut smallest: Option<Vec<u8>> = None;

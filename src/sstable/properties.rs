@@ -223,6 +223,10 @@ pub const META_RANGE_KEY_NAME: &str = "pebble.range_key";
 /// The metaindex key under which the value-block index is stored.
 pub const META_VALUE_INDEX_NAME: &str = "pebble.value_index";
 
+/// The metaindex key under which pebbledb stores the table's blob-reference list (the blob
+/// file numbers referenced by `KIND_BLOB` values). pebbledb-specific.
+pub const META_BLOB_REFS_NAME: &str = "pebbledb.blob_refs";
+
 #[cfg(test)]
 mod tests {
     use super::*;

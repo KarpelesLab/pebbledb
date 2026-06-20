@@ -872,7 +872,11 @@ impl OutputBuilder {
             // reference) and, when blob separation is enabled, re-stores large values in this
             // output's own blob file — so large values stay out of the sstable across
             // compactions. Each input's blob file becomes obsolete with its sstable.
-            super::engine_writer_options(db.value_block_threshold, db.blob_value_threshold),
+            super::engine_writer_options(
+                db.value_block_threshold,
+                db.blob_value_threshold,
+                file_num,
+            ),
         );
         for factory in &db.block_property_collectors {
             writer.add_block_property_collector(factory());

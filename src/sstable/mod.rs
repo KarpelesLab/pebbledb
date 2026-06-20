@@ -179,6 +179,7 @@ struct MetaBlocks {
     range_dels: Vec<RangeTombstone>,
     range_keys: Vec<RangeKeyEntry>,
     value_block_handles: Vec<BlockHandle>,
+    blob_refs: Vec<u64>,
 }
 
 /// Reads the metaindex and the meta blocks it references (`rocksdb.properties`,
@@ -192,6 +193,7 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
     let mut range_del_handle = None;
     let mut range_key_handle = None;
     let mut value_index: Option<valblk::IndexHandle> = None;
+    let mut blob_refs: Vec<u64> = Vec::new();
     while it.valid() {
         let key = it.key();
         if key == properties::META_PROPERTIES_NAME.as_bytes() {
@@ -202,6 +204,17 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
             range_key_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         } else if key == properties::META_VALUE_INDEX_NAME.as_bytes() {
             value_index = Some(valblk::decode_index_handle(it.value())?);
+        } else if key == properties::META_BLOB_REFS_NAME.as_bytes() {
+            // Inline list: count, then that many blob file numbers (uvarints).
+            let v = it.value();
+            let (count, mut off) = crate::base::varint::get_uvarint(v)
+                .ok_or_else(|| Error::corruption("sstable: bad blob-refs count"))?;
+            for _ in 0..count {
+                let (num, n) = crate::base::varint::get_uvarint(&v[off..])
+                    .ok_or_else(|| Error::corruption("sstable: bad blob-ref number"))?;
+                blob_refs.push(num);
+                off += n;
+            }
         } else if key.starts_with(b"fullfilter.") {
             filter_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
         }
@@ -269,6 +282,7 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
         range_dels,
         range_keys,
         value_block_handles,
+        blob_refs,
     })
 }
 
@@ -293,6 +307,9 @@ pub struct Reader {
     prefixed_values: bool,
     /// Handles of the table's value blocks, indexed by block number.
     value_block_handles: Vec<BlockHandle>,
+    /// Blob file numbers this table references; a `KIND_BLOB` value's `file_index` indexes
+    /// into this list. Empty when the table references no blob files.
+    blob_refs: Vec<u64>,
     /// This table's file number, used as the block-cache key prefix.
     file_num: u64,
     /// Optional shared block cache for decompressed blocks.
@@ -345,6 +362,7 @@ impl Reader {
             index,
             prefixed_values,
             value_block_handles: meta.value_block_handles,
+            blob_refs: meta.blob_refs,
             props: meta.props,
             filter: meta.filter,
             range_dels: meta.range_dels,
@@ -366,6 +384,11 @@ impl Reader {
     /// The table's range tombstones.
     pub fn range_tombstones(&self) -> &[RangeTombstone] {
         &self.range_dels
+    }
+
+    /// The blob file numbers this table references (for blob-file GC).
+    pub fn blob_refs(&self) -> &[u64] {
+        &self.blob_refs
     }
 
     /// The table's range-key entries.
@@ -455,9 +478,13 @@ impl Reader {
                 Ok(block[start..end].to_vec())
             }
             k if k == blob::KIND_BLOB => {
-                let h = blob::decode_handle(&stored[1..])?;
+                let (file_index, h) = blob::decode_ref(&stored[1..])?;
+                let blob_num = *self
+                    .blob_refs
+                    .get(file_index as usize)
+                    .ok_or_else(|| Error::corruption("sstable: blob file_index out of range"))?;
                 match &self.blob_resolver {
-                    Some(r) => r.resolve(self.file_num, h),
+                    Some(r) => r.resolve(blob_num, h),
                     None => Err(Error::Unsupported(
                         "sstable: blob-referenced value (no blob resolver)",
                     )),

@@ -69,6 +69,25 @@ pub fn encode_handle(h: BlobHandle) -> Vec<u8> {
     dst
 }
 
+/// Encodes a blob *reference* as stored in an sstable data block (after the `KIND_BLOB`
+/// value-prefix byte): a `file_index` into the table's blob-reference list, then the handle.
+pub fn encode_ref(file_index: u32, h: BlobHandle) -> Vec<u8> {
+    let mut dst = Vec::new();
+    put_uvarint(&mut dst, u64::from(file_index));
+    put_uvarint(&mut dst, u64::from(h.value_len));
+    put_uvarint(&mut dst, u64::from(h.block_num));
+    put_uvarint(&mut dst, u64::from(h.offset_in_block));
+    dst
+}
+
+/// Decodes a blob reference (see [`encode_ref`]): `(file_index, handle)`.
+pub fn decode_ref(src: &[u8]) -> Result<(u32, BlobHandle)> {
+    let (file_index, n0) =
+        get_uvarint(src).ok_or_else(|| Error::corruption("blob: bad ref file_index"))?;
+    let h = decode_handle(&src[n0..])?;
+    Ok((file_index as u32, h))
+}
+
 /// Decodes a blob handle (`value_len`, `block_num`, `offset_in_block` as uvarints).
 pub fn decode_handle(src: &[u8]) -> Result<BlobHandle> {
     let (value_len, n1) =

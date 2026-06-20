@@ -28,8 +28,8 @@ use crate::{Error, Result};
 
 use super::block::{BlockHandle, ChecksumType, CompressionType, TRAILER_LEN};
 use super::properties::{
-    BINARY_SEARCH_INDEX, META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME,
-    META_VALUE_INDEX_NAME, Properties, TWO_LEVEL_INDEX,
+    BINARY_SEARCH_INDEX, META_BLOB_REFS_NAME, META_PROPERTIES_NAME, META_RANGE_DEL_NAME,
+    META_RANGE_KEY_NAME, META_VALUE_INDEX_NAME, Properties, TWO_LEVEL_INDEX,
 };
 use super::{
     LEVELDB_MAGIC, MAGIC_LEN, PEBBLE_MAGIC, ROCKSDB_FOOTER_LEN, ROCKSDB_MAGIC, TableFormat,
@@ -75,6 +75,10 @@ pub struct WriterOptions {
     /// bytes are produced alongside the table and retrieved via
     /// [`Writer::take_blob_file`]. `None` disables blob separation (default `None`).
     pub blob_value_threshold: Option<usize>,
+    /// The file number to assign this table's own blob file (the one produced by blob
+    /// separation). Recorded in the table's blob-reference list so reads can locate it.
+    /// Required when `blob_value_threshold` is set; ignored otherwise.
+    pub blob_file_num: Option<u64>,
 }
 
 impl Default for WriterOptions {
@@ -89,6 +93,7 @@ impl Default for WriterOptions {
             index_block_size: 256 << 10,
             value_block_threshold: None,
             blob_value_threshold: None,
+            blob_file_num: None,
         }
     }
 }
@@ -223,6 +228,11 @@ pub struct Writer<W: Write> {
     blob_threshold: Option<usize>,
     /// Accumulates the table's blob file when blob separation is enabled.
     blob_writer: Option<super::blob::BlobFileWriter>,
+    /// File number of this table's own blob file (from `blob_value_threshold` separation).
+    own_blob_num: Option<u64>,
+    /// Blob file numbers this table references, in order; a stored blob reference's
+    /// `file_index` indexes into this list. Recorded in the metaindex.
+    blob_refs: Vec<u64>,
     /// The current (open) value block's contents.
     vblk_buf: Vec<u8>,
     /// On-disk handles of completed value blocks, indexed by block number.
@@ -248,6 +258,7 @@ impl<W: Write> Writer<W> {
         };
         let blob_writer = blob_threshold
             .map(|_| super::blob::BlobFileWriter::new(opts.compression, opts.checksum));
+        let blob_file_num = opts.blob_file_num;
         Writer {
             w,
             opts,
@@ -277,6 +288,8 @@ impl<W: Write> Writer<W> {
             value_threshold,
             blob_threshold,
             blob_writer,
+            own_blob_num: blob_file_num,
+            blob_refs: Vec::new(),
             vblk_buf: Vec::new(),
             value_block_handles: Vec::new(),
             vblk_num: 0,
@@ -293,6 +306,39 @@ impl<W: Write> Writer<W> {
         c: Box<dyn super::blockprop::BlockPropertyCollector>,
     ) {
         self.block_property_collectors.push(c);
+    }
+
+    /// Returns the `file_index` for blob file `num` in this table's blob-reference list,
+    /// appending it if not already referenced.
+    fn blob_ref_index(&mut self, num: u64) -> u32 {
+        if let Some(i) = self.blob_refs.iter().position(|&n| n == num) {
+            i as u32
+        } else {
+            self.blob_refs.push(num);
+            (self.blob_refs.len() - 1) as u32
+        }
+    }
+
+    /// The blob files this table references (for recording in [`FileMetadata`] blob refs).
+    pub fn blob_refs(&self) -> &[u64] {
+        &self.blob_refs
+    }
+
+    /// Adds a point entry whose value is a **preserved** blob reference: `value` stays in the
+    /// existing blob file `blob_num` (used by compaction to avoid rewriting the value). The
+    /// internal key is added with a `KIND_BLOB` reference pointing at `blob_num`.
+    pub fn add_preserved_blob(
+        &mut self,
+        internal_key: &[u8],
+        blob_num: u64,
+        handle: super::blob::BlobHandle,
+    ) -> Result<()> {
+        let idx = self.blob_ref_index(blob_num);
+        let mut enc = vec![super::blob::KIND_BLOB << 6];
+        enc.extend_from_slice(&super::blob::encode_ref(idx, handle));
+        // The real value lives in the existing blob file and is not fetched, so block-property
+        // collectors see no value contribution for a preserved blob reference.
+        self.add_encoded(internal_key, &enc, &[], handle.value_len as usize)
     }
 
     /// Takes the table's blob file bytes, if blob separation produced any. The blob writer is
@@ -324,8 +370,12 @@ impl<W: Write> Writer<W> {
                 .as_mut()
                 .expect("blob writer present when blob_threshold is set")
                 .add(value)?;
+            let own = self
+                .own_blob_num
+                .expect("blob_file_num set when blob_value_threshold is set");
+            let idx = self.blob_ref_index(own);
             let mut enc = vec![blob::KIND_BLOB << 6];
-            enc.extend_from_slice(&blob::encode_handle(handle));
+            enc.extend_from_slice(&blob::encode_ref(idx, handle));
             return Ok(enc);
         }
         // Large values go out-of-line to a value block.
@@ -470,6 +520,27 @@ impl<W: Write> Writer<W> {
             return Ok(());
         }
 
+        // For value-prefixing formats the stored value is the prefix-encoded value (and
+        // large values may be moved to a value block or the blob file).
+        let stored = self.encode_point_value(value)?;
+        self.add_encoded(internal_key, &stored, value, value.len())
+    }
+
+    /// Adds a point entry whose data-block value is already encoded (`stored`). `value_props`
+    /// is the value fed to block-property collectors (the real value, or empty when it is not
+    /// available — e.g. a preserved blob reference), and `raw_value_len` is the logical value
+    /// size for stats. Enforces increasing key order and updates the filter and counters.
+    fn add_encoded(
+        &mut self,
+        internal_key: &[u8],
+        stored: &[u8],
+        value_props: &[u8],
+        raw_value_len: usize,
+    ) -> Result<()> {
+        use crate::base::internal_key::InternalKeyKind;
+        let kind = crate::base::internal_key::trailer_kind(
+            crate::base::internal_key::encoded_trailer(internal_key),
+        );
         if !self.last_key.is_empty()
             && compare_encoded(self.cmp.as_ref(), &self.last_key, internal_key)
                 != std::cmp::Ordering::Less
@@ -483,16 +554,13 @@ impl<W: Write> Writer<W> {
 
         // Feed every point entry to the block-property collectors.
         for c in &mut self.block_property_collectors {
-            c.add(internal_key, value);
+            c.add(internal_key, value_props);
         }
 
-        // For value-prefixing formats the stored value is the prefix-encoded value (and
-        // large values may be moved to a value block).
-        let stored = self.encode_point_value(value)?;
-        self.data_block.add(internal_key, &stored);
+        self.data_block.add(internal_key, stored);
         self.num_entries += 1;
         self.raw_key_size += internal_key.len() as u64;
-        self.raw_value_size += value.len() as u64;
+        self.raw_value_size += raw_value_len as u64;
         if matches!(
             kind,
             InternalKeyKind::Delete | InternalKeyKind::SingleDelete | InternalKeyKind::DeleteSized
@@ -613,6 +681,17 @@ impl<W: Write> Writer<W> {
         if !self.value_block_handles.is_empty() {
             let entry = self.write_value_index()?;
             meta_entries.push(entry);
+        }
+
+        // Blob-reference list (pebbledb-specific): the blob file numbers this table
+        // references, so reads can map a stored reference's file_index to a blob file.
+        if !self.blob_refs.is_empty() {
+            let mut v = Vec::new();
+            put_uvarint(&mut v, self.blob_refs.len() as u64);
+            for &n in &self.blob_refs {
+                put_uvarint(&mut v, n);
+            }
+            meta_entries.push((META_BLOB_REFS_NAME.to_string(), v));
         }
 
         // Range-deletion block (compressed like data), referenced under
