@@ -1579,10 +1579,19 @@ fn blob_files_separate_large_values_and_read_back() {
     .unwrap();
     check_all(&db);
 
-    // Compaction resolves blob-referenced values and re-stores them, so the blob files written
-    // at flush become obsolete and are removed — and every value still reads correctly.
+    // Blob-file rewrite: compaction keeps large values in a (new) blob file rather than
+    // re-inlining them into the sstable, and every value still reads correctly.
     db.compact_range(None, None).unwrap();
     check_all(&db);
+    let blob_after = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
+        .count();
+    assert!(
+        blob_after >= 1,
+        "compaction should rewrite large values into a blob file, not re-inline them"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

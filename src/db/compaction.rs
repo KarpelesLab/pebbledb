@@ -19,6 +19,7 @@
 //! every open-snapshot stripe, so versions an open snapshot can observe are retained;
 //! tombstones are elided only at the bottom level and only above all snapshots.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use crate::Result;
@@ -867,11 +868,11 @@ impl OutputBuilder {
         let mut writer = Writer::new(
             db.fs.create(&path)?,
             db.cmp.clone(),
-            // Compaction resolves blob-referenced values on read and re-stores them in place /
-            // in value blocks, so a compacted table carries no blob references (its inputs'
-            // blob files become obsolete with their sstables). Blob separation itself happens
-            // at flush time.
-            super::engine_writer_options(db.value_block_threshold, None),
+            // Blob-file rewrite: compaction reads each input value (resolving any blob
+            // reference) and, when blob separation is enabled, re-stores large values in this
+            // output's own blob file — so large values stay out of the sstable across
+            // compactions. Each input's blob file becomes obsolete with its sstable.
+            super::engine_writer_options(db.value_block_threshold, db.blob_value_threshold),
         );
         for factory in &db.block_property_collectors {
             writer.add_block_property_collector(factory());
@@ -942,9 +943,17 @@ impl OutputBuilder {
         Ok(())
     }
 
-    fn finish(self) -> Result<FileMetadata> {
+    fn finish(mut self) -> Result<FileMetadata> {
+        let blob_bytes = self.writer.take_blob_file()?;
         let mut file = self.writer.finish()?;
         file.sync_all()?;
+        // Write this output's sibling blob file, if blob rewrite separated any values.
+        if let Some(b) = &blob_bytes {
+            let blob_path = self.path.with_file_name(filenames::blob(self.file_num));
+            let mut bf = self.fs.create(&blob_path)?;
+            bf.write_all(b)?;
+            bf.sync_all()?;
+        }
         let size = self.fs.size(&self.path)?;
         Ok(FileMetadata {
             file_num: self.file_num,

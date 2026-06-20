@@ -133,13 +133,14 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `Options::blob_value_threshold` set, flush writes the largest values to a sibling `<num>.blob`
   file (the `sstable::blob` module's writer/reader); the sstable stores a `KIND_BLOB`
   value-prefix + handle, reads resolve it through a `BlobResolver` against the blob file, and
-  compaction resolves blob references back in place (so input blob files become obsolete with
+  and **blob-file rewrite during compaction** keeps large values out of the sstable across
+  compactions (each output writes its own blob file; inputs' blob files become obsolete with
   their sstables and are deleted; `checkpoint` copies blob files too).
   Remaining for full upstream parity (the **cross-sstable sharing** optimization): independent
   blob file numbers with MANIFEST blob references and refcounting, so a compaction can rewrite
-  an sstable's keys while *preserving* its blob references (avoiding the value rewrite) — plus
-  blob-file rewrite/GC and ingest-with-blobs. Byte-parity of the blob format is a Go-interop-CI
-  item.
+  an sstable's keys while *preserving* references to an existing blob file (avoiding the value
+  rewrite entirely) — plus blob GC by reference and ingest-with-blobs. Byte-parity of the blob
+  format is a Go-interop-CI item.
 
 ### Ingestion & maintenance
 - **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of
