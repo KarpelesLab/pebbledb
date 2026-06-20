@@ -30,7 +30,7 @@ use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEd
 use crate::sstable::Writer;
 use crate::vfs::{Fs, WritableFile};
 
-use super::merging_iter::{InternalIter, MergingIter};
+use super::merging_iter::{BoundedIter, InternalIter, MergingIter};
 use super::{DbInner, State, filenames};
 
 /// Safety cap on compactions per `maybe_compact` call.
@@ -602,10 +602,29 @@ impl DbInner {
         let mut tombstones: Vec<RangeTombstone> = Vec::new();
         let mut range_keys: Vec<RangeKeyEntry> = Vec::new();
         for f in c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()) {
-            let reader = self.open_reader(f.file_num)?;
+            // A virtual input reads its physical backing, bounded to the virtual's range.
+            let reader = self.open_reader(f.physical_num())?;
             tombstones.extend_from_slice(reader.range_tombstones());
-            range_keys.extend_from_slice(reader.range_keys());
-            sources.push(Box::new(reader.iter()?));
+            if f.backing.is_some() {
+                let lo = encoded_user_key(&f.smallest);
+                let hi = encoded_user_key(&f.largest);
+                for rk in reader.range_keys() {
+                    if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
+                        && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
+                    {
+                        range_keys.push(rk.clone());
+                    }
+                }
+                sources.push(Box::new(BoundedIter::new(
+                    Box::new(reader.iter()?),
+                    f.smallest.clone(),
+                    f.largest.clone(),
+                    self.cmp.clone(),
+                )));
+            } else {
+                range_keys.extend_from_slice(reader.range_keys());
+                sources.push(Box::new(reader.iter()?));
+            }
         }
         let mut merge = MergingIter::new(sources, self.cmp.clone())?;
 

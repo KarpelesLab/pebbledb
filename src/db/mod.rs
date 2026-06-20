@@ -43,7 +43,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::base::comparer::{Comparer, DefaultComparer};
-use crate::base::internal_key::{InternalKey, InternalKeyKind, SeqNum, encoded_user_key};
+use crate::base::internal_key::{
+    InternalKey, InternalKeyKind, SeqNum, compare_encoded, encoded_user_key,
+};
 use crate::base::range_del::{RangeTombstone, max_covering_seqnum};
 use crate::base::range_key::RangeKeyEntry;
 use crate::batch::Batch;
@@ -529,41 +531,61 @@ impl DbInner {
     /// `Arc` is held only by the obsolete list, i.e. strong count == 1). Files still referenced
     /// by an in-flight read are kept and retried on the next call.
     fn collect_obsolete(&self) {
-        let (ready, candidate_blobs, live_blobs) = {
+        use std::collections::HashSet;
+        let (ready, candidate_tables, live_tables, candidate_blobs, live_blobs) = {
             let mut state = self.state.lock().unwrap();
             let mut ready = Vec::new();
-            // Blob files referenced by the sstables being removed are candidates for deletion.
+            // Physical sstables and blob files referenced by the removed (logical) files are
+            // candidates for deletion. A virtual sstable contributes its backing file.
+            let mut candidate_tables: Vec<u64> = Vec::new();
             let mut candidate_blobs: Vec<u64> = Vec::new();
             state.obsolete.retain(|(num, arc)| {
                 if Arc::strong_count(arc) == 1 {
                     ready.push(*num);
+                    candidate_tables.push(arc.physical_num());
                     candidate_blobs.extend(arc.blob_refs.iter().copied());
                     false
                 } else {
                     true
                 }
             });
-            // A blob file is live while any current-version file — or any obsolete file still
-            // held by an in-flight read — references it. Computed under the lock so it reflects
-            // the version a concurrent compaction's just-applied output is already part of; a
-            // candidate is only ever a blob the removed sstables referenced, so a concurrent
-            // compaction's brand-new blob (referenced by no removed sstable) is never deleted.
-            let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            // A physical file (sstable backing or blob) is live while any current-version file —
+            // or any obsolete file still held by an in-flight read — references it. Computed
+            // under the lock so it reflects the version a concurrent compaction's just-applied
+            // output is already part of; a candidate is only ever a file the removed sstables
+            // referenced, so a concurrent compaction's brand-new file is never deleted.
+            let mut live_tables: HashSet<u64> = HashSet::new();
+            let mut live_blobs: HashSet<u64> = HashSet::new();
             for level in state.vs.current.levels.iter() {
                 for f in level {
-                    live.extend(f.blob_refs.iter().copied());
+                    live_tables.insert(f.physical_num());
+                    live_blobs.extend(f.blob_refs.iter().copied());
                 }
             }
             for (_, arc) in &state.obsolete {
-                live.extend(arc.blob_refs.iter().copied());
+                live_tables.insert(arc.physical_num());
+                live_blobs.extend(arc.blob_refs.iter().copied());
             }
-            (ready, candidate_blobs, live)
+            (
+                ready,
+                candidate_tables,
+                live_tables,
+                candidate_blobs,
+                live_blobs,
+            )
         };
-        for file_num in ready {
-            self.cache.lock().unwrap().remove(&file_num);
-            self.clean_file(&self.dir.join(filenames::table(file_num)));
-            if let Some(l) = &self.listener {
-                l.on_table_deleted(file_num);
+        // The logical tables are gone from the version; notify listeners.
+        if let Some(l) = &self.listener {
+            for file_num in &ready {
+                l.on_table_deleted(*file_num);
+            }
+        }
+        // Delete physical sstables no live or in-flight file still references (a backing file
+        // shared by virtual sstables survives until the last referrer is gone).
+        for phys in candidate_tables {
+            if !live_tables.contains(&phys) {
+                self.cache.lock().unwrap().remove(&phys);
+                self.clean_file(&self.dir.join(filenames::table(phys)));
             }
         }
         // Delete blob files the removed sstables referenced that no live file still needs.
@@ -1166,14 +1188,123 @@ impl DbInner {
         self.apply(b)
     }
 
-    /// Removes every key in `[start, end)` and physically reclaims the space, by writing a
-    /// range deletion over the span and then compacting it toward the bottom level so the
-    /// covered data is dropped rather than just hidden. A simplified form of Pebble's
-    /// `Excise` (which also rewrites partially-overlapping boundary files as virtual
-    /// sstables; here the compaction rewrites them).
+    /// Removes every key in the half-open user-key range `[start, end)` using **virtual
+    /// sstables** (Pebble's `Excise`): each sstable overlapping the span is replaced by up to
+    /// two virtual sstables — bounded views over the same physical backing file for the parts
+    /// outside `[start, end)` — instead of being rewritten. A file lying wholly inside the span
+    /// is dropped; the parts inside the span are simply not covered by any virtual, so their
+    /// keys vanish. The backing file is reclaimed once no virtual references it.
     pub fn excise(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        self.delete_range(start, end)?;
-        self.compact_range(Some(start), Some(end))
+        if self.state.lock().unwrap().read_only {
+            return Err(Error::InvalidState("db: opened read-only".into()));
+        }
+        if self.cmp.compare(start, end) != std::cmp::Ordering::Less {
+            return Ok(());
+        }
+        // Flush so all committed data (including the memtable) lives in sstables we can split.
+        self.flush()?;
+
+        let dropped: Vec<Arc<FileMetadata>> = {
+            let mut state = self.state.lock().unwrap();
+            let cmp = self.cmp.clone();
+
+            // Files overlapping [start, end), with their level.
+            let mut overlaps: Vec<(usize, Arc<FileMetadata>)> = Vec::new();
+            for (level, files) in state.vs.current.levels.iter().enumerate() {
+                for f in files {
+                    let fl = encoded_user_key(&f.largest);
+                    let fsm = encoded_user_key(&f.smallest);
+                    if cmp.compare(fl, start) != std::cmp::Ordering::Less
+                        && cmp.compare(fsm, end) == std::cmp::Ordering::Less
+                    {
+                        overlaps.push((level, Arc::clone(f)));
+                    }
+                }
+            }
+            if overlaps.is_empty() {
+                return Ok(());
+            }
+
+            let mut edit = VersionEdit::default();
+            for (level, f) in &overlaps {
+                edit.deleted_files.push((*level, f.file_num));
+                let phys = f.physical_num();
+                let reader = self.open_reader(phys)?;
+
+                // Left part: the file's keys with user key < start.
+                if cmp.compare(encoded_user_key(&f.smallest), start) == std::cmp::Ordering::Less {
+                    let mut probe = start.to_vec();
+                    probe.extend_from_slice(&u64::MAX.to_le_bytes());
+                    let mut it = reader.iter()?;
+                    it.seek_ge(&probe)?;
+                    it.prev()?;
+                    if it.valid()
+                        && cmp.compare(encoded_user_key(it.key()), start)
+                            == std::cmp::Ordering::Less
+                        && compare_encoded(cmp.as_ref(), it.key(), &f.smallest)
+                            != std::cmp::Ordering::Less
+                    {
+                        let num = state.vs.allocate_file_number();
+                        edit.new_files.push(NewFileEntry {
+                            level: *level,
+                            meta: FileMetadata {
+                                file_num: num,
+                                size: f.size,
+                                smallest: f.smallest.clone(),
+                                largest: it.key().to_vec(),
+                                smallest_seqnum: f.smallest_seqnum,
+                                largest_seqnum: f.largest_seqnum,
+                                blob_refs: f.blob_refs.clone(),
+                                backing: Some(phys),
+                            },
+                        });
+                    }
+                }
+
+                // Right part: the file's keys with user key >= end.
+                if cmp.compare(encoded_user_key(&f.largest), end) != std::cmp::Ordering::Less {
+                    let mut probe = end.to_vec();
+                    probe.extend_from_slice(&u64::MAX.to_le_bytes());
+                    let mut it = reader.iter()?;
+                    it.seek_ge(&probe)?;
+                    if it.valid()
+                        && compare_encoded(cmp.as_ref(), it.key(), &f.largest)
+                            != std::cmp::Ordering::Greater
+                    {
+                        let num = state.vs.allocate_file_number();
+                        edit.new_files.push(NewFileEntry {
+                            level: *level,
+                            meta: FileMetadata {
+                                file_num: num,
+                                size: f.size,
+                                smallest: it.key().to_vec(),
+                                largest: f.largest.clone(),
+                                smallest_seqnum: f.smallest_seqnum,
+                                largest_seqnum: f.largest_seqnum,
+                                blob_refs: f.blob_refs.clone(),
+                                backing: Some(phys),
+                            },
+                        });
+                    }
+                }
+            }
+
+            edit.next_file_number = Some(state.vs.next_file_number);
+            edit.last_sequence = Some(state.vs.last_sequence);
+            state.vs.apply(&edit)?;
+            if let Some(mw) = state.manifest.as_mut() {
+                mw.write_record(&edit.encode())?;
+                mw.sync_all()?;
+            }
+            let dropped: Vec<Arc<FileMetadata>> = overlaps.into_iter().map(|(_, f)| f).collect();
+            for f in &dropped {
+                state.obsolete.push((f.file_num, Arc::clone(f)));
+            }
+            dropped
+        };
+        drop(dropped);
+        self.collect_obsolete();
+        Ok(())
     }
 
     /// Sets a range key over `[start, end)` at `suffix` to `value`.
@@ -1234,7 +1365,7 @@ impl DbInner {
         }
         for level in version.levels.iter() {
             for f in level {
-                let reader = self.open_reader(f.file_num)?;
+                let reader = self.open_reader(f.physical_num())?;
                 collect(reader.range_keys().to_vec())?;
             }
         }
@@ -1742,7 +1873,7 @@ impl DbInner {
         if !terminated {
             'levels: for level in 0..NUM_LEVELS {
                 for f in version.overlapping(cmp, level, key) {
-                    let reader = self.open_reader(f.file_num)?;
+                    let reader = self.open_reader(f.physical_num())?;
                     max_rts = max_rts.max(max_covering_seqnum(
                         reader.range_tombstones(),
                         cmp,
@@ -1874,11 +2005,26 @@ impl DbInner {
         }
         for level in version.levels.iter() {
             for f in level {
-                let reader = self.open_reader(f.file_num)?;
+                // A virtual sstable reads from its physical backing file, bounded to its range.
+                let reader = self.open_reader(f.physical_num())?;
                 // Range tombstones and range keys must be consulted even when a block-property
-                // filter rules the table's point keys out: they can shadow keys elsewhere.
+                // filter rules the table's point keys out: they can shadow keys elsewhere. For
+                // a virtual file, surface only range keys starting within its bounds (so a
+                // backing range key in an excised span is not resurfaced).
                 tombstones.extend_from_slice(reader.range_tombstones());
-                range_keys.extend_from_slice(reader.range_keys());
+                if f.backing.is_some() {
+                    let lo = encoded_user_key(&f.smallest);
+                    let hi = encoded_user_key(&f.largest);
+                    for rk in reader.range_keys() {
+                        if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
+                            && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
+                        {
+                            range_keys.push(rk.clone());
+                        }
+                    }
+                } else {
+                    range_keys.extend_from_slice(reader.range_keys());
+                }
                 let point_excluded = opts
                     .block_property_filters
                     .iter()
@@ -1886,9 +2032,18 @@ impl DbInner {
                 if !point_excluded {
                     // Within a table that passes the table-level filter, skip individual data
                     // blocks ruled out by the same filters via their per-block properties.
-                    sources.push(Box::new(
-                        reader.iter_with_filters(&opts.block_property_filters)?,
-                    ));
+                    let inner: Box<dyn InternalIter> =
+                        Box::new(reader.iter_with_filters(&opts.block_property_filters)?);
+                    if f.backing.is_some() {
+                        sources.push(Box::new(merging_iter::BoundedIter::new(
+                            inner,
+                            f.smallest.clone(),
+                            f.largest.clone(),
+                            self.cmp.clone(),
+                        )));
+                    } else {
+                        sources.push(inner);
+                    }
                 }
             }
         }
@@ -1958,10 +2113,20 @@ impl DbInner {
         }
         for level in version.levels.iter() {
             for f in level {
-                let reader = self.open_reader(f.file_num)?;
+                let reader = self.open_reader(f.physical_num())?;
                 range_dels.extend_from_slice(reader.range_tombstones());
                 range_keys.extend_from_slice(reader.range_keys());
-                sources.push(Box::new(reader.iter()?));
+                let inner: Box<dyn InternalIter> = Box::new(reader.iter()?);
+                if f.backing.is_some() {
+                    sources.push(Box::new(merging_iter::BoundedIter::new(
+                        inner,
+                        f.smallest.clone(),
+                        f.largest.clone(),
+                        self.cmp.clone(),
+                    )));
+                } else {
+                    sources.push(inner);
+                }
             }
         }
         let mut merge = merging_iter::MergingIter::new(sources, self.cmp.clone())?;

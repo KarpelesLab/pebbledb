@@ -3057,6 +3057,54 @@ fn excise_removes_and_reclaims_range() {
 }
 
 #[test]
+fn excise_uses_virtual_sstables_without_rewriting() {
+    let dir = temp_dir("excise-virtual");
+    let ssts = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sst"))
+            .collect()
+    };
+
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..200u32 {
+        db.set(format!("k{i:04}").as_bytes(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap(); // collapse to a single bottom sstable
+    let before = ssts(&dir);
+
+    // Excise a middle span: [k0050, k0150) removes k0050..=k0149 (100 keys).
+    db.excise(b"k0050", b"k0150").unwrap();
+
+    // The physical sstable is reused as a virtual backing — no new sstable is written and the
+    // straddling backing file is not deleted (two virtual views reference it).
+    assert_eq!(
+        ssts(&dir),
+        before,
+        "excise should reuse the physical file via virtual sstables, not rewrite it"
+    );
+
+    let check = |db: &Db| {
+        assert_eq!(db.get(b"k0049").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(db.get(b"k0050").unwrap(), None);
+        assert_eq!(db.get(b"k0149").unwrap(), None);
+        assert_eq!(db.get(b"k0150").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(collect(db).len(), 100, "100 of 200 keys remain");
+    };
+    check(&db);
+
+    // Reopen: the virtual files' backing references are repopulated and reads still resolve.
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    check(&db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn table_stats_aggregate_deletions() {
     let dir = temp_dir("table-stats");
     let db = Db::open(&dir, Options::default()).unwrap();

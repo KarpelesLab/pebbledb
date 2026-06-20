@@ -147,10 +147,15 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   open) remains a Go-interop-CI item.
 
 ### Ingestion & maintenance
-- **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of
-  compacting), **download** (rewrite remote/external files to local), and flushable ingests.
-  (`Db::excise`, `Db::ingest_and_excise`, external sstable `ingest`, `Db::compact`, and
-  `EstimateDiskUsage` exist; excise currently reclaims via compaction.)
+- (Done: **virtual sstables**. `Db::excise` now replaces each overlapping sstable with up to
+  two *virtual* sstables — bounded views over the shared physical backing file
+  (`FileMetadata::backing`, persisted via the `CUSTOM_TAG_VIRTUAL` MANIFEST tag) — instead of
+  rewriting; the excised span is simply uncovered. Reads of a virtual file read its backing
+  bounded to `[smallest, largest]` (point lookups, iteration, and compaction inputs), and a
+  backing file is reclaimed by reference-based GC once no virtual references it. `Db::excise`,
+  `Db::ingest_and_excise`, external sstable `ingest`, `Db::compact`, and `EstimateDiskUsage`
+  also exist.) Remaining: **download** (rewrite remote/external files to local) and flushable
+  ingests.
 - (Done: **checkpoint options** — `CheckpointOptions` with a flush toggle and
   `RestrictToSpans`-style span restriction, via `Db::checkpoint_with_options`.)
 

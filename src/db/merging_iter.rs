@@ -117,6 +117,112 @@ impl InternalIter for OwnedMemIter {
     }
 }
 
+/// Restricts an inner [`InternalIter`] to the inclusive encoded-internal-key range
+/// `[lo, hi]`. Used to read a **virtual sstable** — a bounded view over a shared physical
+/// backing table — so it yields only the keys within the virtual file's bounds.
+pub(crate) struct BoundedIter {
+    inner: Box<dyn InternalIter>,
+    lo: Vec<u8>,
+    hi: Vec<u8>,
+    cmp: Arc<dyn Comparer>,
+    valid: bool,
+}
+
+impl BoundedIter {
+    pub(crate) fn new(
+        inner: Box<dyn InternalIter>,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+        cmp: Arc<dyn Comparer>,
+    ) -> BoundedIter {
+        BoundedIter {
+            inner,
+            lo,
+            hi,
+            cmp,
+            valid: false,
+        }
+    }
+
+    /// Recomputes validity from the inner position, requiring it to lie within `[lo, hi]`.
+    fn refresh(&mut self) {
+        self.valid = self.inner.valid()
+            && compare_encoded(self.cmp.as_ref(), self.inner.key(), &self.lo)
+                != std::cmp::Ordering::Less
+            && compare_encoded(self.cmp.as_ref(), self.inner.key(), &self.hi)
+                != std::cmp::Ordering::Greater;
+    }
+
+    /// After a reverse positioning, steps back over any keys above `hi`, then refreshes.
+    fn settle_reverse(&mut self) -> Result<()> {
+        while self.inner.valid()
+            && compare_encoded(self.cmp.as_ref(), self.inner.key(), &self.hi)
+                == std::cmp::Ordering::Greater
+        {
+            self.inner.retreat()?;
+        }
+        self.refresh();
+        Ok(())
+    }
+}
+
+impl InternalIter for BoundedIter {
+    fn first(&mut self) -> Result<()> {
+        let lo = self.lo.clone();
+        self.inner.seek_ge(&lo)?;
+        self.refresh();
+        Ok(())
+    }
+    fn last(&mut self) -> Result<()> {
+        self.inner.last()?;
+        self.settle_reverse()
+    }
+    fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        // Clamp the seek target up to the lower bound.
+        let t = if compare_encoded(self.cmp.as_ref(), target, &self.lo) == std::cmp::Ordering::Less
+        {
+            self.lo.clone()
+        } else {
+            target.to_vec()
+        };
+        self.inner.seek_ge(&t)?;
+        self.refresh();
+        Ok(())
+    }
+    fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+        self.inner.seek_lt(target)?;
+        self.settle_reverse()
+    }
+    fn valid(&self) -> bool {
+        self.valid
+    }
+    fn key(&self) -> &[u8] {
+        self.inner.key()
+    }
+    fn value(&self) -> &[u8] {
+        self.inner.value()
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.inner.advance()?;
+        // Past the upper bound ends forward iteration.
+        self.valid = self.inner.valid()
+            && compare_encoded(self.cmp.as_ref(), self.inner.key(), &self.hi)
+                != std::cmp::Ordering::Greater;
+        Ok(())
+    }
+    fn retreat(&mut self) -> Result<()> {
+        self.inner.retreat()?;
+        // Before the lower bound ends reverse iteration.
+        self.valid = self.inner.valid()
+            && compare_encoded(self.cmp.as_ref(), self.inner.key(), &self.lo)
+                != std::cmp::Ordering::Less;
+        Ok(())
+    }
+    fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
+        self.inner.blob_ref()
+    }
+}
+
 /// Interleaves several internal iterators, exposing the globally smallest internal key.
 ///
 /// Used both by [`DbIterator`] (with snapshot collapsing on top) and directly by

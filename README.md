@@ -15,8 +15,8 @@ lineage.
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
 > The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
-> provider into the engine, virtual sstables, and columnar key-schema byte-parity — most of it
-> gated on the Go interop CI) is catalogued in
+> provider into the engine and columnar key-schema byte-parity — most of it gated on the Go
+> interop CI) is catalogued in
 > [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
 
 ## Capabilities
@@ -46,7 +46,9 @@ lineage.
   property collectors/filters via `Options::block_property_collectors`) and the columnar
   (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
 - **Operations**: `checkpoint` (with flush/span-restriction options), external sstable
-  `ingest`, `Options` + `OPTIONS` file with a **comparer/merger name→impl registry**,
+  `ingest`, **`excise`** via **virtual sstables** (bounded views over a shared backing file,
+  so a range is removed by rewriting only boundary files), `Options` + `OPTIONS` file with a
+  **comparer/merger name→impl registry**,
   tunable level budgets (`l1_max_bytes`), step-wise `FormatMajorVersion` migrations,
   `Metrics`, an `lsm_view`, an `EventListener` (flush/compaction, table, WAL/MANIFEST
   create-delete, format upgrade, write-stall, background-error), a `Logger`, and a `Cleaner`
