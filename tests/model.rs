@@ -87,21 +87,21 @@ fn run_with_seed(seed: u64) {
 
     for step in 0..2000u64 {
         match rng.below(100) {
-            // ~55%: set a key.
-            0..=54 => {
+            // ~48%: set a key.
+            0..=47 => {
                 let k = key(rng.next());
                 let v = format!("v{}", rng.next() % 100_000).into_bytes();
                 db.set(&k, &v).unwrap();
                 model.insert(k, v);
             }
-            // ~20%: delete a key.
-            55..=74 => {
+            // ~17%: delete a key.
+            48..=64 => {
                 let k = key(rng.next());
                 db.delete(&k).unwrap();
                 model.remove(&k);
             }
-            // ~12%: delete a range [a, b).
-            75..=86 => {
+            // ~11%: delete a range [a, b).
+            65..=75 => {
                 let a = rng.next() % 256;
                 let b = a + 1 + rng.below(40);
                 let start = format!("key{a:04}").into_bytes();
@@ -113,10 +113,67 @@ fn run_with_seed(seed: u64) {
                     !(k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice())
                 });
             }
+            // ~8%: an indexed batch of a few sets and a delete, committed atomically.
+            76..=83 => {
+                let mut ib = db.indexed_batch();
+                let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+                for _ in 0..3 {
+                    let k = key(rng.next());
+                    let v = format!("b{}", rng.next() % 100_000).into_bytes();
+                    ib.set(&k, &v);
+                    pending.push((k, Some(v)));
+                }
+                let dk = key(rng.next());
+                ib.delete(&dk);
+                pending.push((dk, None));
+                // Read-your-own-writes: the last pending op for each key is visible pre-commit.
+                if let Some((k, want)) = pending.last() {
+                    assert_eq!(
+                        ib.get(&db, k).unwrap().as_ref(),
+                        want.as_ref(),
+                        "indexed-batch read-your-own-writes mismatch"
+                    );
+                }
+                db.write(ib.into_batch()).unwrap();
+                for (k, v) in pending {
+                    match v {
+                        Some(v) => {
+                            model.insert(k, v);
+                        }
+                        None => {
+                            model.remove(&k);
+                        }
+                    }
+                }
+            }
             // ~6%: explicit flush.
-            87..=92 => db.flush().unwrap(),
+            84..=89 => db.flush().unwrap(),
             // ~3%: manual compaction.
-            93..=95 => db.compact_range(None, None).unwrap(),
+            90..=92 => db.compact_range(None, None).unwrap(),
+            // ~3%: snapshot isolation — the snapshot keeps its view across later mutations.
+            93..=95 => {
+                let snap = db.snapshot();
+                let snap_model: Vec<(Vec<u8>, Vec<u8>)> =
+                    model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                // Mutate after the snapshot.
+                for _ in 0..3 {
+                    let k = key(rng.next());
+                    let v = format!("v{}", rng.next() % 100_000).into_bytes();
+                    db.set(&k, &v).unwrap();
+                    model.insert(k, v);
+                }
+                let mut sit = snap.iter().unwrap();
+                sit.first().unwrap();
+                let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                while sit.valid() {
+                    got.push((sit.key().to_vec(), sit.value().to_vec()));
+                    sit.next().unwrap();
+                }
+                assert_eq!(
+                    got, snap_model,
+                    "snapshot view diverged from model-at-snapshot"
+                );
+            }
             // ~4%: reopen the database (exercises WAL recovery + MANIFEST reload).
             _ => {
                 drop(db);
@@ -137,7 +194,7 @@ fn run_with_seed(seed: u64) {
 #[test]
 fn model_based_random_operations() {
     // A handful of fixed seeds for reproducible coverage.
-    for seed in [1u64, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0, 42] {
+    for seed in [1u64, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0, 42, 0xCAFE_F00D, 7] {
         run_with_seed(seed);
     }
 }
