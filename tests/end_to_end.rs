@@ -982,6 +982,48 @@ fn iterator_surfaces_range_keys_at_position() {
 }
 
 #[test]
+fn scan_internal_exposes_all_versions_and_tombstones() {
+    use pebbledb::base::internal_key::{InternalKeyKind, encoded_user_key, trailer_kind};
+
+    let dir = temp_dir("scan-internal");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"k", b"v1").unwrap();
+    db.set(b"k", b"v2").unwrap(); // a newer version of the same key
+    db.delete(b"gone").unwrap(); // a tombstone
+    db.range_key_set(b"a", b"c", b"@1", b"rk").unwrap();
+    let mut batch = Batch::new();
+    batch.delete_range(b"x", b"y");
+    db.write(batch).unwrap();
+
+    let scan = db.scan_internal().unwrap();
+
+    // Both versions of "k" are present (a plain iterator would collapse them).
+    let k_versions: Vec<_> = scan
+        .points
+        .iter()
+        .filter(|(ik, _)| encoded_user_key(ik) == b"k")
+        .collect();
+    assert_eq!(k_versions.len(), 2, "both versions of k must be exposed");
+
+    // The point tombstone for "gone" is exposed as a Delete.
+    let gone = scan
+        .points
+        .iter()
+        .find(|(ik, _)| encoded_user_key(ik) == b"gone")
+        .expect("gone tombstone present");
+    let kind = trailer_kind(pebbledb::base::internal_key::encoded_trailer(&gone.0));
+    assert_eq!(kind, InternalKeyKind::Delete);
+
+    // The range deletion and range key are exposed separately.
+    assert_eq!(scan.range_dels.len(), 1);
+    assert_eq!(scan.range_dels[0].start, b"x");
+    assert_eq!(scan.range_keys.len(), 1);
+    assert_eq!(scan.range_keys[0].start, b"a");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

@@ -42,7 +42,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::base::comparer::{Comparer, DefaultComparer};
 use crate::base::internal_key::{InternalKey, InternalKeyKind, SeqNum, encoded_user_key};
-use crate::base::range_del::max_covering_seqnum;
+use crate::base::range_del::{RangeTombstone, max_covering_seqnum};
 use crate::base::range_key::RangeKeyEntry;
 use crate::batch::Batch;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, VersionEdit, VersionSet};
@@ -1073,6 +1073,50 @@ impl DbInner {
         )
     }
 
+    /// Scans the raw internal contents of the LSM (Pebble's `ScanInternal`): **every**
+    /// version of every point key (including tombstones and superseded versions), in
+    /// internal-key order, plus the range tombstones and range keys. Unlike [`DbInner::iter`],
+    /// nothing is collapsed or hidden — this exposes the internal keyspace as replication
+    /// and disaggregated-storage tooling needs it.
+    pub fn scan_internal(&self) -> Result<InternalScan> {
+        let (mem, imm, version) = {
+            let state = self.state.lock().unwrap();
+            (
+                Arc::clone(&state.mem),
+                state.imm.clone(),
+                state.vs.current.clone(),
+            )
+        };
+        let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
+        let mut range_dels = mem.range_tombstones();
+        let mut range_keys = mem.range_keys();
+        sources.push(Box::new(mem.scan()));
+        for m in imm.iter().rev() {
+            range_dels.extend(m.range_tombstones());
+            range_keys.extend(m.range_keys());
+            sources.push(Box::new(m.scan()));
+        }
+        for level in version.levels.iter() {
+            for f in level {
+                let reader = self.open_reader(f.file_num)?;
+                range_dels.extend_from_slice(reader.range_tombstones());
+                range_keys.extend_from_slice(reader.range_keys());
+                sources.push(Box::new(reader.iter()?));
+            }
+        }
+        let mut merge = merging_iter::MergingIter::new(sources, self.cmp.clone())?;
+        let mut points = Vec::new();
+        while merge.valid() {
+            points.push((merge.key().to_vec(), merge.value().to_vec()));
+            merge.advance()?;
+        }
+        Ok(InternalScan {
+            points,
+            range_dels,
+            range_keys,
+        })
+    }
+
     /// Opens (or returns a cached) reader for the sstable with the given file number.
     fn open_reader(&self, file_num: u64) -> Result<Arc<Reader>> {
         if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
@@ -1219,6 +1263,19 @@ impl Drop for Snapshot<'_> {
             snaps.swap_remove(pos);
         }
     }
+}
+
+/// The raw internal contents of the LSM, as returned by [`DbInner::scan_internal`].
+#[derive(Clone, Debug, Default)]
+pub struct InternalScan {
+    /// Every point entry as `(encoded internal key, value)`, in internal-key order
+    /// (ascending user key, then descending sequence number) — all versions, including
+    /// tombstones.
+    pub points: Vec<(Vec<u8>, Vec<u8>)>,
+    /// All range tombstones across the LSM.
+    pub range_dels: Vec<RangeTombstone>,
+    /// All range-key entries across the LSM.
+    pub range_keys: Vec<RangeKeyEntry>,
 }
 
 /// A point-in-time summary of the LSM tree's shape.
