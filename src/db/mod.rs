@@ -283,6 +283,13 @@ impl Default for Options {
     }
 }
 
+/// Completion slot for one queued write in the group-commit pipeline. The commit leader
+/// stores the result and signals; the submitting thread waits on it.
+struct CommitSlot {
+    result: Mutex<Option<Result<()>>>,
+    cv: Condvar,
+}
+
 /// Queue of obsolete files awaiting paced deletion, plus a shutdown flag for the pacer.
 #[derive(Default)]
 struct DeleteQueue {
@@ -383,6 +390,11 @@ pub struct DbInner {
     delete_queue: Mutex<DeleteQueue>,
     /// Signals the deletion pacer that work was queued (or shutdown requested).
     delete_cv: Condvar,
+    /// Group-commit queue: writes awaiting commit, each with its batch and completion slot.
+    commit_q: Mutex<Vec<(Batch, Arc<CommitSlot>)>>,
+    /// Serializes the group-commit leader (the thread that flushes a batch of queued writes
+    /// through one WAL sync + memtable apply).
+    commit_leader: Mutex<()>,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -685,6 +697,8 @@ impl DbInner {
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
                 delete_queue: Mutex::new(DeleteQueue::default()),
                 delete_cv: Condvar::new(),
+                commit_q: Mutex::new(Vec::new()),
+                commit_leader: Mutex::new(()),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -817,6 +831,8 @@ impl DbInner {
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
             delete_queue: Mutex::new(DeleteQueue::default()),
             delete_cv: Condvar::new(),
+            commit_q: Mutex::new(Vec::new()),
+            commit_leader: Mutex::new(()),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
@@ -1033,18 +1049,71 @@ impl DbInner {
     }
 
     /// Atomically applies all operations in `batch`.
-    pub fn apply(&self, mut batch: Batch) -> Result<()> {
+    ///
+    /// Commits go through a **group-commit** pipeline: a write enqueues its batch and then
+    /// either becomes the *leader* — flushing every currently-queued batch through a single
+    /// WAL sync and a run of memtable applies — or waits for a concurrent leader to commit
+    /// its batch. Under concurrency this amortizes one `fsync` across many writers; with a
+    /// single writer it degrades to one batch per commit.
+    pub fn apply(&self, batch: Batch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        let slot = Arc::new(CommitSlot {
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        });
+        self.commit_q
+            .lock()
+            .unwrap()
+            .push((batch, Arc::clone(&slot)));
+
+        loop {
+            // Already committed by a concurrent leader?
+            if let Some(r) = slot.result.lock().unwrap().take() {
+                return r;
+            }
+            match self.commit_leader.try_lock() {
+                Ok(_leader) => {
+                    // We are the leader: drain and commit the whole queue.
+                    let group: Vec<(Batch, Arc<CommitSlot>)> =
+                        std::mem::take(&mut *self.commit_q.lock().unwrap());
+                    if group.is_empty() {
+                        continue; // another leader already took our batch; re-check our slot
+                    }
+                    let result = self.commit_group(&group);
+                    // Publish the (cloned) result to each waiter and wake it.
+                    for (_, s) in &group {
+                        *s.result.lock().unwrap() = Some(clone_commit_result(&result));
+                        s.cv.notify_all();
+                    }
+                    // The leader lock drops here; our slot is now populated and the loop returns.
+                }
+                Err(_) => {
+                    // A leader is committing; wait until our batch's result is published.
+                    let mut r = slot.result.lock().unwrap();
+                    while r.is_none() {
+                        r = slot.cv.wait(r).unwrap();
+                    }
+                    return r.take().unwrap();
+                }
+            }
+        }
+    }
+
+    /// Commits a group of queued batches under one state-lock acquisition and a single WAL
+    /// sync, assigning sequence numbers in queue order. Returns one shared result for the
+    /// whole group (all batches in a group share fate: they are made durable and visible
+    /// together, or fail together).
+    fn commit_group(&self, group: &[(Batch, Arc<CommitSlot>)]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.read_only {
             return Err(Error::InvalidState("db: opened read-only".into()));
         }
 
         // Write stall: if too many immutable memtables are awaiting flush, block until the
-        // background worker drains the queue below the threshold. Bounds memory when writes
-        // outrun flushing.
+        // background worker drains the queue below the threshold (checked once for the group;
+        // the wait releases the lock so the flush worker can make progress).
         let mut stalled = false;
         while state.imm.len() >= self.mem_stop_threshold {
             if !stalled {
@@ -1059,19 +1128,30 @@ impl DbInner {
             l.on_write_stall_end();
         }
 
+        for (batch, _) in group {
+            self.commit_one(&mut state, batch)?;
+        }
+        Ok(())
+    }
+
+    /// Applies a single batch within a held state lock: memtable rotation, sequence
+    /// assignment, WAL append+sync (with failover), and memtable apply. Write-stall
+    /// backpressure is applied once per group by the caller (it owns the lock guard).
+    fn commit_one(&self, state: &mut State, batch: &Batch) -> Result<()> {
+        let mut batch = batch.clone();
         // Rotate once the memtable has used half its arena, leaving the rest as headroom
         // for this batch (the arena fills faster than wire bytes due to per-node
         // overhead, so the threshold is measured in arena bytes). The actual flush of the
         // rotated memtable runs on the background worker, off this writer's path.
         if state.mem.size() as usize >= self.mem_table_size / 2 {
-            self.rotate_memtable(&mut state)?;
+            self.rotate_memtable(state)?;
             self.work_cv.notify_one();
         }
 
         let base = state.vs.last_sequence + 1;
         batch.set_seqnum(base);
         if state.wal.is_some() {
-            self.append_to_wal(&mut state, &batch)?;
+            self.append_to_wal(state, &batch)?;
         }
         state.mem.apply(&batch)?;
         state.vs.last_sequence = base + u64::from(batch.count()) - 1;
@@ -1143,6 +1223,14 @@ impl DbInner {
     fn rotate_memtable(&self, state: &mut State) -> Result<()> {
         if state.mem.is_empty() {
             return Ok(());
+        }
+        // Group commit defers WAL syncs, so the outgoing WAL may hold un-synced records that
+        // belong to the memtable being rotated out. Sync it before it becomes immutable so
+        // that data is durable even though it is not yet in an sstable.
+        if self.wal_sync
+            && let Some(w) = state.wal.as_mut()
+        {
+            let _ = w.sync_all();
         }
         let new_wal = state.vs.allocate_file_number();
         // Keep the active WAL directory across rotation (don't fall back to the primary if
@@ -2194,6 +2282,15 @@ fn create_wal(
 /// boundaries (Pebble's flush splitting), using `file_nums` in order; range tombstones / range
 /// keys force a single output file (fragmenting them across splits is not done here).
 #[allow(clippy::too_many_arguments)]
+/// Reproduces a group-commit result for each waiter. `Error` is not `Clone`, so an error is
+/// re-expressed (preserving its message) — every batch in a failed group sees the failure.
+fn clone_commit_result(r: &Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => Err(Error::InvalidState(format!("group commit failed: {e}"))),
+    }
+}
+
 /// Computes the number of **L0 sublevels** (Pebble's read-amplification measure for L0):
 /// L0 files can overlap, so they are greedily packed — newest first — into the fewest layers
 /// of mutually non-overlapping files. Within one sublevel a read touches at most one file, so

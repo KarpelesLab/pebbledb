@@ -1143,6 +1143,57 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn group_commit_is_durable_across_concurrent_writers_and_reopen() {
+    // Many writer threads commit concurrently through the group-commit pipeline; after a
+    // clean close every committed write must be recoverable from the WAL on reopen.
+    let dir = temp_dir("group-commit");
+    {
+        let db = Arc::new(
+            Db::open(
+                &dir,
+                Options {
+                    mem_table_size: 32 * 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let writers = 8;
+        let per_writer = 500u32;
+        let mut handles = Vec::new();
+        for w in 0..writers {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_writer {
+                    let k = format!("w{w:02}-k{i:04}");
+                    db.set(k.as_bytes(), format!("v{i}").as_bytes()).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Do NOT flush — the data lives only in the WAL + memtable, so reopen must recover it.
+    }
+
+    // Reopen: recovery replays the WAL written by the group-commit pipeline.
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for w in 0..8 {
+        for i in [0u32, 1, 250, 499] {
+            let k = format!("w{w:02}-k{i:04}");
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes()),
+                "lost {k} across group-commit + reopen"
+            );
+        }
+    }
+    assert_eq!(collect(&db).len(), 8 * 500);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn per_level_target_file_size_splits_more() {
     // A tiny per-level target for L1 makes L0->L1 compaction emit many small files, where the
     // default 2 MiB target would produce just one.
