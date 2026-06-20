@@ -140,7 +140,63 @@ impl DbInner {
                 None => break,
             }
         }
+        // With levels within budget, compact tombstone-dense files downward to reclaim space.
+        for _ in 0..MAX_COMPACTIONS_PER_CALL {
+            if !self.tombstone_density_compact(state)? {
+                break;
+            }
+        }
         Ok(())
+    }
+
+    /// Tombstone-density compaction (Pebble): compact a file whose point-tombstone fraction
+    /// exceeds [`Options::tombstone_dense_compaction_threshold`] toward the bottom, even
+    /// though its level is within budget, so its accumulated tombstones stop lingering.
+    /// Returns whether a compaction was run.
+    ///
+    /// When the next level holds overlapping data the compaction rewrites it, applying the
+    /// tombstones and reclaiming the shadowed space; when it does not, the file is moved down
+    /// a level (a cheap MANIFEST edit). Either way the file descends until it reaches the
+    /// bottom level, where the elision-only pass finally drops the dead tombstones. Each step
+    /// strictly increases the file's level, so the per-call loop terminates.
+    fn tombstone_density_compact(&self, state: &mut State) -> Result<bool> {
+        if self.tombstone_dense_compaction_threshold > 1.0 {
+            return Ok(false);
+        }
+        let version = state.vs.current.clone();
+        // Start at L1: L0 files are not range-partitioned, so a single L0 file may not hold
+        // the newest version of its keys — compacting it down in isolation could push a newer
+        // version below an older one. (Whole-L0 compactions are handled by the score picker.)
+        for level in 1..NUM_LEVELS - 1 {
+            for f in &version.levels[level] {
+                let reader = self.open_reader(f.file_num)?;
+                let props = reader.properties();
+                if props.num_entries == 0 {
+                    continue;
+                }
+                let frac = props.num_deletions as f64 / props.num_entries as f64;
+                if frac < self.tombstone_dense_compaction_threshold {
+                    continue;
+                }
+                let Some((min, max)) = key_range(self.cmp.as_ref(), std::slice::from_ref(f)) else {
+                    continue;
+                };
+                let overlap = overlapping(self.cmp.as_ref(), &version, level + 1, &min, &max);
+                self.log(&format!(
+                    "tombstone-density compaction of sstable {} at L{level} (fraction {frac:.2})",
+                    f.file_num
+                ));
+                let c = Compaction {
+                    level,
+                    output_level: level + 1,
+                    inputs: vec![f.clone()],
+                    overlap,
+                };
+                self.run_compaction(state, c)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Delete-only compaction (Pebble): drop files that are entirely shadowed by a covering

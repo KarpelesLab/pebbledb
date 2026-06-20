@@ -652,6 +652,58 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn tombstone_density_compaction_drains_a_dense_file() {
+    let dir = temp_dir("tombstone-density");
+    let db = Db::open(&dir, Options::default()).unwrap();
+
+    // Four L0 flushes — including a batch of deletes — reach the L0 file-count trigger (4),
+    // so the score picker merges them into a single L1 file. Because L1 is not the bottom
+    // level, the 50 deletes are retained, making that L1 file tombstone-dense (~49%).
+    for i in 0..100u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0..50u32 {
+        db.delete(format!("k{i:03}").as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+    for tag in ["x1", "x2"] {
+        db.set(tag.as_bytes(), b"v").unwrap();
+        db.flush().unwrap();
+    }
+
+    // The score picker leaves L1 within budget, so only the tombstone-density pass acts on the
+    // dense L1 file — pushing it down to the bottom level (everything above it is now empty).
+    let m = db.metrics();
+    assert_eq!(m.level_files[0], 0, "L0 drained: {:?}", m.level_files);
+    assert_eq!(
+        *m.level_files.last().unwrap(),
+        1,
+        "dense file pushed to the bottom level: {:?}",
+        m.level_files
+    );
+    let above_bottom: usize = m.level_files[..m.level_files.len() - 1].iter().sum();
+    assert_eq!(
+        above_bottom, 0,
+        "nothing should remain above the bottom: {:?}",
+        m.level_files
+    );
+
+    // One more flush lets the elision-only pass drop the now-bottom tombstones.
+    db.set(b"y1", b"v").unwrap();
+    db.flush().unwrap();
+
+    // Deletes were applied; survivors remain.
+    assert_eq!(db.get(b"k000").unwrap(), None);
+    assert_eq!(db.get(b"k049").unwrap(), None);
+    assert_eq!(db.get(b"k050").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"k099").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"x1").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn elision_only_compaction_drops_bottom_tombstones() {
     use pebbledb::DefaultComparer;
     use pebbledb::sstable::Reader;

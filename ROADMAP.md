@@ -84,13 +84,14 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 
 ### Compaction
 - **Compaction scheduler**: multiple concurrent background compactions, prioritization.
-- **Read-triggered compactions** (`read_compaction_queue`), **tombstone-density**
-  compactions, **multilevel** compaction, and flush splitting. (Table stats —
-  `Db::table_stats`, aggregate tombstone/range-key/entry counts — are available to drive
-  these; **move compactions** — relevelling a single non-overlapping file by a MANIFEST edit
-  without rewriting — **delete-only compactions** — dropping files entirely shadowed by a
-  covering range tombstone — and **elision-only compactions** — rewriting a bottom file to
-  drop its now-dead tombstones — are done.)
+- **Read-triggered compactions** (`read_compaction_queue`), **multilevel** compaction, and
+  flush splitting. (Done, each driven by table stats / on-disk properties: **move
+  compactions** — relevelling a single non-overlapping file by a MANIFEST edit without
+  rewriting; **delete-only compactions** — dropping files entirely shadowed by a covering
+  range tombstone; **elision-only compactions** — rewriting a bottom file to drop its
+  now-dead tombstones; and **tombstone-density compactions** — pushing a file whose
+  point-tombstone fraction exceeds `Options::tombstone_dense_compaction_threshold` toward the
+  bottom for elision.)
 - Read/write-amplification scoring, explicit **L0 sublevels**, and **deletion pacing**.
 
 ### Commit pipeline

@@ -124,6 +124,10 @@ pub struct Options {
     /// Target size in bytes of an output sstable before it is split during compaction
     /// (default 2 MiB).
     pub target_file_size: u64,
+    /// Fraction of a file's entries that must be point tombstones before it is eligible for a
+    /// **tombstone-density** compaction — compacted down to reclaim space even when its level
+    /// is within budget (default 0.10, Pebble's default). Set to a value `> 1.0` to disable.
+    pub tombstone_dense_compaction_threshold: f64,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -233,6 +237,7 @@ impl Default for Options {
             mem_table_stop_writes_threshold: 4,
             l0_compaction_threshold: 4,
             target_file_size: 2 << 20,
+            tombstone_dense_compaction_threshold: 0.10,
         }
     }
 }
@@ -303,6 +308,8 @@ pub struct DbInner {
     cleaner: Arc<dyn Cleaner>,
     /// Factories for block-property collectors run over every sstable written.
     block_property_collectors: Vec<BlockPropertyCollectorFactory>,
+    /// Point-tombstone fraction that makes a file eligible for tombstone-density compaction.
+    tombstone_dense_compaction_threshold: f64,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -505,6 +512,7 @@ impl DbInner {
                 logger: opts.logger.clone(),
                 cleaner: opts.cleaner.clone(),
                 block_property_collectors: opts.block_property_collectors.clone(),
+                tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -619,6 +627,7 @@ impl DbInner {
             logger: opts.logger.clone(),
             cleaner: opts.cleaner.clone(),
             block_property_collectors: opts.block_property_collectors.clone(),
+            tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
