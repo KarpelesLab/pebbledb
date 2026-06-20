@@ -1053,6 +1053,51 @@ fn block_property_filter_skips_nonmatching_sstables() {
 }
 
 #[test]
+fn eventually_file_only_snapshot_is_consistent_and_scoped() {
+    let dir = temp_dir("efos");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..30u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v1").unwrap();
+    }
+
+    // An EFOS over [k005, k015) flushes and pins the current view.
+    let efos = db
+        .new_eventually_file_only_snapshot(vec![(b"k005".to_vec(), b"k015".to_vec())])
+        .unwrap();
+
+    // Mutate after the snapshot; the EFOS keeps the pre-mutation view.
+    for i in 0..30u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v2").unwrap();
+    }
+
+    // Reads inside the span see the consistent (pre-mutation) value.
+    assert_eq!(efos.get(b"k010").unwrap(), Some(b"v1".to_vec()));
+    // Reads outside the registered spans are rejected.
+    assert!(efos.get(b"k000").is_err());
+    assert!(efos.get(b"k020").is_err());
+
+    // A span iterator yields the consistent view over the registered range.
+    let mut it = efos.iter_span(b"k005", b"k015").unwrap();
+    it.first().unwrap();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push((
+            String::from_utf8_lossy(it.key()).into_owned(),
+            String::from_utf8_lossy(it.value()).into_owned(),
+        ));
+        it.next().unwrap();
+    }
+    assert_eq!(got.len(), 10); // k005..k014
+    assert!(got.iter().all(|(_, v)| v == "v1"));
+    assert_eq!(got[0].0, "k005");
+
+    // Iterating outside the registered span is rejected.
+    assert!(efos.iter_span(b"k000", b"k030").is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn checkpoint_restricted_to_spans() {
     use pebbledb::CheckpointOptions;
 

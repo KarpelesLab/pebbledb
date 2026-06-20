@@ -101,7 +101,11 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 - True **group commit** (batch many committers through one WAL sync + memtable apply).
 
 ### Snapshots
-- **EventuallyFileOnlySnapshot** (EFOS) and the consistent `read_state` snapshotting model.
+- (Done: the consistent seqnum-pinned snapshotting model, and **EventuallyFileOnlySnapshot**
+  — `Db::new_eventually_file_only_snapshot(spans)` returns a consistent, span-scoped snapshot
+  that flushes to become file-backed and rejects reads outside its spans. The disjoint-range
+  excise optimization — letting an excise over ranges disjoint from the EFOS proceed without
+  invalidating it — remains, pending virtual sstables.)
 
 ### Value separation & blob files
 - **Value separation** at flush/compaction time (write large values to blob files),

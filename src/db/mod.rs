@@ -1580,6 +1580,28 @@ impl DbInner {
         Snapshot { db: self, seqnum }
     }
 
+    /// Creates an [`EventuallyFileOnlySnapshot`] scoped to `spans` (Pebble's EFOS): a
+    /// consistent read view restricted to the given `[start, end)` key ranges. The memtable
+    /// is flushed first so the snapshot's data is immediately backed by sstables ("file-only")
+    /// rather than pinning the memtable. Like a regular snapshot it pins its sequence number,
+    /// so compaction retains the versions it needs until it is dropped.
+    pub fn new_eventually_file_only_snapshot(
+        &self,
+        spans: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<EventuallyFileOnlySnapshot<'_>> {
+        // Realize the "file-only" property by flushing in-memory data to sstables.
+        if !self.state.lock().unwrap().read_only {
+            self.flush()?;
+        }
+        let seqnum = self.last_sequence();
+        self.snapshots.lock().unwrap().push(seqnum);
+        Ok(EventuallyFileOnlySnapshot {
+            db: self,
+            seqnum,
+            spans,
+        })
+    }
+
     /// The sorted sequence numbers of currently-open snapshots.
     fn open_snapshots(&self) -> Vec<SeqNum> {
         let mut s = self.snapshots.lock().unwrap().clone();
@@ -1618,6 +1640,76 @@ impl Snapshot<'_> {
 }
 
 impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        let mut snaps = self.db.snapshots.lock().unwrap();
+        if let Some(pos) = snaps.iter().position(|&s| s == self.seqnum) {
+            snaps.swap_remove(pos);
+        }
+    }
+}
+
+/// A consistent read view restricted to a set of key spans (Pebble's
+/// `EventuallyFileOnlySnapshot`). Reads outside the registered spans are rejected. Created by
+/// [`DbInner::new_eventually_file_only_snapshot`]; pins its sequence number until dropped.
+pub struct EventuallyFileOnlySnapshot<'a> {
+    db: &'a DbInner,
+    seqnum: SeqNum,
+    spans: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl EventuallyFileOnlySnapshot<'_> {
+    /// The sequence number this snapshot reads at.
+    pub fn sequence_number(&self) -> SeqNum {
+        self.seqnum
+    }
+
+    /// The registered key spans this snapshot is scoped to.
+    pub fn spans(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.spans
+    }
+
+    fn covers(&self, key: &[u8]) -> bool {
+        let cmp = self.db.cmp.as_ref();
+        self.spans.iter().any(|(s, e)| {
+            cmp.compare(key, s) != std::cmp::Ordering::Less
+                && cmp.compare(key, e) == std::cmp::Ordering::Less
+        })
+    }
+
+    /// Looks up `key` as of the snapshot. Errors if `key` is outside the registered spans.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if !self.covers(key) {
+            return Err(Error::InvalidState(
+                "efos: key is outside the snapshot's registered spans".into(),
+            ));
+        }
+        self.db.get_at(key, self.seqnum)
+    }
+
+    /// Returns an iterator over `[start, end)`, which must lie within a single registered span.
+    pub fn iter_span(&self, start: &[u8], end: &[u8]) -> Result<DbIterator> {
+        let cmp = self.db.cmp.as_ref();
+        let within = self.spans.iter().any(|(s, e)| {
+            cmp.compare(start, s) != std::cmp::Ordering::Less
+                && cmp.compare(end, e) != std::cmp::Ordering::Greater
+        });
+        if !within {
+            return Err(Error::InvalidState(
+                "efos: iteration range is not within a registered span".into(),
+            ));
+        }
+        self.db.iter_at_with_options(
+            self.seqnum,
+            IterOptions {
+                lower_bound: Some(start.to_vec()),
+                upper_bound: Some(end.to_vec()),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+impl Drop for EventuallyFileOnlySnapshot<'_> {
     fn drop(&mut self) {
         let mut snaps = self.db.snapshots.lock().unwrap();
         if let Some(pos) = snaps.iter().position(|&s| s == self.seqnum) {
