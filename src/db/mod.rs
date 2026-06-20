@@ -1641,9 +1641,10 @@ impl DbInner {
         };
         let total_sstables = level_files.iter().sum();
         let total_sstable_bytes = level_bytes.iter().sum();
-        // Read amplification: every L0 file (they overlap) plus one per non-empty deeper level.
-        let read_amplification =
-            level_files[0] + level_files[1..].iter().filter(|&&n| n > 0).count();
+        // Read amplification: L0 sublevels (overlapping L0 files packed into non-overlapping
+        // layers) plus one per non-empty deeper level.
+        let l0_sublevels = l0_sublevel_count(&state.vs.current.levels[0], self.cmp.as_ref());
+        let read_amplification = l0_sublevels + level_files[1..].iter().filter(|&&n| n > 0).count();
         // Write amplification: total bytes written / bytes flushed.
         let write_amplification = if state.flush_bytes == 0 {
             0.0
@@ -1664,6 +1665,7 @@ impl DbInner {
             mem_table_bytes: u64::from(state.mem.size()),
             open_snapshots: self.snapshots.lock().unwrap().len(),
             obsolete_files_pending: self.delete_queue.lock().unwrap().items.len(),
+            l0_sublevels,
             read_amplification,
             write_amplification,
         }
@@ -1987,7 +1989,10 @@ pub struct Metrics {
     /// Obsolete files queued for paced deletion but not yet deleted (0 unless deletion
     /// pacing is enabled).
     pub obsolete_files_pending: usize,
-    /// Worst-case number of sstables a point read may consult: every L0 file plus one per
+    /// Number of L0 sublevels — overlapping L0 files packed into layers of non-overlapping
+    /// files (L0's contribution to read amplification).
+    pub l0_sublevels: usize,
+    /// Worst-case number of sstables a point read may consult: L0 sublevels plus one per
     /// non-empty deeper level (a read-amplification estimate).
     pub read_amplification: usize,
     /// Total bytes written across flushes and compactions divided by bytes flushed — the
@@ -2175,6 +2180,39 @@ fn create_wal(
 /// boundaries (Pebble's flush splitting), using `file_nums` in order; range tombstones / range
 /// keys force a single output file (fragmenting them across splits is not done here).
 #[allow(clippy::too_many_arguments)]
+/// Computes the number of **L0 sublevels** (Pebble's read-amplification measure for L0):
+/// L0 files can overlap, so they are greedily packed — newest first — into the fewest layers
+/// of mutually non-overlapping files. Within one sublevel a read touches at most one file, so
+/// the sublevel count is L0's contribution to read amplification.
+fn l0_sublevel_count(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> usize {
+    // Process newest-first so older versions settle into deeper sublevels.
+    let mut ordered: Vec<&Arc<FileMetadata>> = files.iter().collect();
+    ordered.sort_by_key(|f| std::cmp::Reverse(f.largest_seqnum));
+    // Each sublevel records the [smallest, largest] user-key spans it already holds.
+    let mut sublevels: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    for f in ordered {
+        let fs = encoded_user_key(&f.smallest).to_vec();
+        let fl = encoded_user_key(&f.largest).to_vec();
+        // Place in the first sublevel with no range overlap; else start a new one.
+        let mut placed = false;
+        for sub in &mut sublevels {
+            let overlaps = sub.iter().any(|(s, l)| {
+                cmp.compare(&fs, l) != std::cmp::Ordering::Greater
+                    && cmp.compare(s, &fl) != std::cmp::Ordering::Greater
+            });
+            if !overlaps {
+                sub.push((fs.clone(), fl.clone()));
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            sublevels.push(vec![(fs, fl)]);
+        }
+    }
+    sublevels.len()
+}
+
 /// Builds the sstable [`WriterOptions`] the engine uses, enabling value-block separation in a
 /// value-block-capable format when `value_block_threshold` is set.
 fn engine_writer_options(value_block_threshold: Option<usize>) -> WriterOptions {

@@ -99,9 +99,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   toward the bottom for elision; and **read-triggered compactions** — a read queue
   (`Options::read_compaction_threshold` wasted seeks) that compacts repeatedly-passed-through
   L1+ files down.)
-- Read/write-amplification scoring and explicit **L0 sublevels**. (**Deletion pacing** —
-  `Options::target_byte_deletion_rate`, a background pacer that spaces obsolete-file deletion
-  to avoid I/O bursts — is done.)
+- Read/write-amplification *scoring* (the picker still scores L0 by raw file count). (Done:
+  explicit **L0 sublevels** — overlapping L0 files packed into non-overlapping layers, surfaced
+  as `Metrics::l0_sublevels` and folded into `read_amplification`; **deletion pacing** —
+  `Options::target_byte_deletion_rate`, a background pacer spacing obsolete-file deletion.)
 
 ### Commit pipeline
 - True **group commit** (batch many committers through one WAL sync + memtable apply).

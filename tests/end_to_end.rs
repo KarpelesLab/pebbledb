@@ -1143,6 +1143,48 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn l0_sublevels_reflect_overlap() {
+    // Disjoint L0 files pack into one sublevel; overlapping ones each need their own.
+    let opts = || Options {
+        l0_compaction_threshold: 100, // keep L0 files from being compacted away
+        ..Default::default()
+    };
+
+    // Four flushes of disjoint single keys → 4 non-overlapping L0 files → 1 sublevel.
+    let dir = temp_dir("l0-disjoint");
+    let db = Db::open(&dir, opts()).unwrap();
+    for k in ["a", "b", "c", "d"] {
+        db.set(k.as_bytes(), b"v").unwrap();
+        db.flush().unwrap();
+    }
+    let m = db.metrics();
+    assert_eq!(
+        m.level_files[0], 4,
+        "expected 4 L0 files: {:?}",
+        m.level_files
+    );
+    assert_eq!(m.l0_sublevels, 1, "disjoint files pack into one sublevel");
+    assert_eq!(m.read_amplification, 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Four flushes overwriting the same key → 4 fully-overlapping L0 files → 4 sublevels.
+    let dir = temp_dir("l0-overlap");
+    let db = Db::open(&dir, opts()).unwrap();
+    for i in 0..4u32 {
+        db.set(b"same", format!("v{i}").as_bytes()).unwrap();
+        db.flush().unwrap();
+    }
+    let m = db.metrics();
+    assert_eq!(m.level_files[0], 4);
+    assert_eq!(m.l0_sublevels, 4, "overlapping files each need a sublevel");
+    assert_eq!(m.read_amplification, 4);
+    assert_eq!(db.get(b"same").unwrap(), Some(b"v3".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn value_separation_round_trips_large_values() {
     use pebbledb::DefaultComparer;
     use pebbledb::sstable::{Reader, TableFormat};
