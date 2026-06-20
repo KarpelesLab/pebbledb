@@ -652,6 +652,68 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn elision_only_compaction_drops_bottom_tombstones() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::sstable::Reader;
+
+    // Total point tombstones recorded across every sstable currently on disk.
+    let total_deletions = |dir: &std::path::Path| -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sst"))
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap();
+                let r = Reader::open(bytes, Arc::new(DefaultComparer)).unwrap();
+                r.properties().num_deletions
+            })
+            .sum()
+    };
+
+    let dir = temp_dir("elision");
+    let db = Db::open(&dir, Options::default()).unwrap();
+
+    // One sstable carrying a live key plus a point tombstone, moved to the bottom level.
+    db.set(b"a", b"v").unwrap();
+    db.delete(b"z").unwrap();
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap(); // single file, no overlap → moves down, tombstone kept
+    let f1 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.ends_with(".sst"))
+        .unwrap();
+    assert_eq!(
+        total_deletions(&dir),
+        1,
+        "bottom file should carry the tombstone"
+    );
+
+    // Writing another key triggers a flush whose maybe_compact runs the elision-only pass,
+    // rewriting the bottom file without its now-dead tombstone.
+    db.set(b"m", b"v").unwrap();
+    db.flush().unwrap();
+
+    assert!(
+        !dir.join(&f1).exists(),
+        "bottom file {f1} should be rewritten by elision-only compaction"
+    );
+    assert_eq!(
+        total_deletions(&dir),
+        0,
+        "the bottom-level tombstone should have been elided"
+    );
+    // Data is unchanged by the rewrite.
+    assert_eq!(db.get(b"a").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"m").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"z").unwrap(), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn delete_only_compaction_drops_shadowed_files() {
     let dir = temp_dir("delete-only");
     let db = Db::open(&dir, Options::default()).unwrap();

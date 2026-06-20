@@ -132,6 +132,8 @@ impl DbInner {
         // Opportunistically drop whole files shadowed by a covering range tombstone before
         // scoring levels — this is free (a MANIFEST edit) and shrinks the work below.
         self.delete_only_compact(state)?;
+        // Rewrite bottom-level files that carry now-droppable tombstones.
+        self.elision_only_compact(state)?;
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
             match self.pick_compaction(&state.vs.current) {
                 Some(c) => self.run_compaction(state, c)?,
@@ -219,6 +221,48 @@ impl DbInner {
         Ok(())
     }
 
+    /// Elision-only compaction (Pebble): rewrite a single bottom-level file that carries
+    /// now-droppable tombstones, physically removing point/range tombstones and the versions
+    /// they shadow. At the bottom level a tombstone deletes nothing below it, so it is dead
+    /// weight; rewriting reclaims that space. Reuses the normal compaction path with the
+    /// output level equal to the input (bottom) level, which both elides tombstones and
+    /// keeps every version an open snapshot can still observe (stripe logic).
+    ///
+    /// Conservative: skipped while any snapshot is open. With no snapshots every version sits
+    /// in the top stripe, so all tombstones are elided and the rewritten file carries none —
+    /// guaranteeing the rewrite cannot re-trigger itself.
+    fn elision_only_compact(&self, state: &mut State) -> Result<()> {
+        if !self.open_snapshots().is_empty() {
+            return Ok(());
+        }
+        let bottom = NUM_LEVELS - 1;
+        let version = state.vs.current.clone();
+        // Pick the first bottom file that actually carries tombstones to drop.
+        let mut target = None;
+        for f in &version.levels[bottom] {
+            let reader = self.open_reader(f.file_num)?;
+            let props = reader.properties();
+            if props.num_deletions > 0 || props.num_range_deletions > 0 {
+                target = Some(f.clone());
+                break;
+            }
+        }
+        let Some(file) = target else {
+            return Ok(());
+        };
+        self.log(&format!(
+            "elision-only compaction rewriting sstable {} at L{bottom}",
+            file.file_num
+        ));
+        let c = Compaction {
+            level: bottom,
+            output_level: bottom,
+            inputs: vec![file],
+            overlap: Vec::new(),
+        };
+        self.run_compaction(state, c)
+    }
+
     /// The compaction score of a level: how far over its trigger it is. A level with the
     /// highest score above 1.0 is the most in need of compaction. L0 is scored by file
     /// count; L1+ by total size against the level's byte budget.
@@ -276,8 +320,9 @@ impl DbInner {
         // Move compaction: a single input file that does not overlap any file in the output
         // level can be relevelled by a MANIFEST edit alone — no rewrite. (Pebble's move
         // compaction.) The file's sstable content is independent of its level, so its keys,
-        // tombstones, and range keys are all carried correctly by the move.
-        if c.inputs.len() == 1 && c.overlap.is_empty() {
+        // tombstones, and range keys are all carried correctly by the move. (An elision-only
+        // compaction, where the output level equals the input level, must instead rewrite.)
+        if c.inputs.len() == 1 && c.overlap.is_empty() && c.output_level != c.level {
             return self.run_move_compaction(state, c);
         }
         if let Some(l) = &self.listener {
