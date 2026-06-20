@@ -215,6 +215,7 @@ mod tests {
             largest: InternalKey::new(large.as_bytes().to_vec(), ls, InternalKeyKind::Set).encode(),
             smallest_seqnum: ss,
             largest_seqnum: ls,
+            blob_refs: Vec::new(),
         }
     }
 

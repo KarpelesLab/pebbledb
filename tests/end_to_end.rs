@@ -1659,6 +1659,66 @@ fn blob_files_separate_large_values_and_read_back() {
 }
 
 #[test]
+fn blob_sharing_preserves_blob_files_across_compaction() {
+    let dir = temp_dir("blob-share");
+    let big = |i: u32| vec![b'a' + (i % 26) as u8; 600];
+    let blob_names = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".blob"))
+            .collect()
+    };
+
+    let opts = || Options {
+        blob_value_threshold: Some(64),
+        mem_table_size: 16 * 1024,
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts()).unwrap();
+    // Two flushes -> two L0 sstables, each with its own blob file.
+    for i in 0..40u32 {
+        db.set(format!("k{i:03}").as_bytes(), &big(i)).unwrap();
+    }
+    db.flush().unwrap();
+    for i in 40..80u32 {
+        db.set(format!("k{i:03}").as_bytes(), &big(i)).unwrap();
+    }
+    db.flush().unwrap();
+
+    let blobs_before = blob_names(&dir);
+    assert!(!blobs_before.is_empty(), "flush wrote blob files");
+
+    // Compaction merges the sstables but PRESERVES references to the existing blob files
+    // (cross-sstable sharing) — the values are not rewritten — so the original blob files
+    // survive and no value rewrite occurs.
+    db.compact_range(None, None).unwrap();
+    let blobs_after = blob_names(&dir);
+    assert!(
+        blobs_before.iter().all(|b| blobs_after.contains(b)),
+        "compaction should preserve (share) the existing blob files; before={blobs_before:?} after={blobs_after:?}"
+    );
+
+    // Values resolve through the preserved blob files, after compaction and after reopen.
+    let check = |db: &Db| {
+        for i in 0..80u32 {
+            assert_eq!(
+                db.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(big(i)),
+                "value {i}"
+            );
+        }
+    };
+    check(&db);
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    check(&db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn disk_slow_events_are_routed_to_the_listener() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

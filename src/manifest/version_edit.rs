@@ -78,6 +78,10 @@ pub struct FileMetadata {
     pub smallest_seqnum: u64,
     /// The largest sequence number among the file's keys.
     pub largest_seqnum: u64,
+    /// Blob file numbers this sstable references (for blob-file GC). **In-memory only** — not
+    /// serialized to the MANIFEST; repopulated at open by scanning the sstable's metaindex.
+    /// Empty for tables that reference no blob files.
+    pub blob_refs: Vec<u64>,
 }
 
 /// A newly added file together with the level it was added to.
@@ -327,6 +331,8 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             largest,
             smallest_seqnum,
             largest_seqnum,
+            // Not serialized; the engine repopulates this from the sstable at open.
+            blob_refs: Vec::new(),
         },
     })
 }
@@ -395,6 +401,7 @@ mod tests {
             largest: InternalKey::new(large.as_bytes().to_vec(), ls, InternalKeyKind::Set).encode(),
             smallest_seqnum: ss,
             largest_seqnum: ls,
+            blob_refs: Vec::new(),
         }
     }
 

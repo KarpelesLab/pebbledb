@@ -529,31 +529,51 @@ impl DbInner {
     /// `Arc` is held only by the obsolete list, i.e. strong count == 1). Files still referenced
     /// by an in-flight read are kept and retried on the next call.
     fn collect_obsolete(&self) {
-        let ready: Vec<u64> = {
+        let (ready, candidate_blobs, live_blobs) = {
             let mut state = self.state.lock().unwrap();
             let mut ready = Vec::new();
+            // Blob files referenced by the sstables being removed are candidates for deletion.
+            let mut candidate_blobs: Vec<u64> = Vec::new();
             state.obsolete.retain(|(num, arc)| {
                 if Arc::strong_count(arc) == 1 {
                     ready.push(*num);
+                    candidate_blobs.extend(arc.blob_refs.iter().copied());
                     false
                 } else {
                     true
                 }
             });
-            ready
+            // A blob file is live while any current-version file — or any obsolete file still
+            // held by an in-flight read — references it. Computed under the lock so it reflects
+            // the version a concurrent compaction's just-applied output is already part of; a
+            // candidate is only ever a blob the removed sstables referenced, so a concurrent
+            // compaction's brand-new blob (referenced by no removed sstable) is never deleted.
+            let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for level in state.vs.current.levels.iter() {
+                for f in level {
+                    live.extend(f.blob_refs.iter().copied());
+                }
+            }
+            for (_, arc) in &state.obsolete {
+                live.extend(arc.blob_refs.iter().copied());
+            }
+            (ready, candidate_blobs, live)
         };
         for file_num in ready {
             self.cache.lock().unwrap().remove(&file_num);
             self.clean_file(&self.dir.join(filenames::table(file_num)));
-            // Drop the table's sibling blob file, if it separated any values, and evict it
-            // from the blob cache.
-            let blob_path = self.dir.join(filenames::blob(file_num));
-            if self.fs.exists(&blob_path) {
-                self.blob_store.evict(file_num);
-                self.clean_file(&blob_path);
-            }
             if let Some(l) = &self.listener {
                 l.on_table_deleted(file_num);
+            }
+        }
+        // Delete blob files the removed sstables referenced that no live file still needs.
+        for blob in candidate_blobs {
+            if !live_blobs.contains(&blob) {
+                let blob_path = self.dir.join(filenames::blob(blob));
+                if self.fs.exists(&blob_path) {
+                    self.blob_store.evict(blob);
+                    self.clean_file(&blob_path);
+                }
             }
         }
     }
@@ -776,6 +796,27 @@ impl DbInner {
                 VersionSet::new(cmp.clone())
             }
         };
+
+        // Repopulate in-memory blob references for recovered files: the MANIFEST does not
+        // persist them, so blob-file GC would otherwise think recovered tables reference no
+        // blob files and could delete blobs still in use. Only needed when blob files exist,
+        // so a store that never used blob separation pays nothing.
+        if !opts.read_only && names.iter().any(|n| n.ends_with(".blob")) {
+            for level in vs.current.levels.iter_mut() {
+                for f in level.iter_mut() {
+                    if !f.blob_refs.is_empty() {
+                        continue;
+                    }
+                    let bytes = fs.read(&dir.join(filenames::table(f.file_num)))?;
+                    let refs = Reader::open(bytes, cmp.clone())?.blob_refs().to_vec();
+                    if !refs.is_empty() {
+                        let mut meta = (**f).clone();
+                        meta.blob_refs = refs;
+                        *f = Arc::new(meta);
+                    }
+                }
+            }
+        }
 
         if opts.read_only {
             let state = State {
@@ -2710,6 +2751,7 @@ fn write_memtable_to_sstables(
             && w.estimated_size() >= target_file_size
         {
             let blob_bytes = w.take_blob_file()?;
+            let blob_refs = w.blob_refs().to_vec();
             let mut f = w.finish()?;
             f.sync_all()?;
             write_blob_file(fs, dir, file_num, blob_bytes.as_deref())?;
@@ -2720,6 +2762,7 @@ fn write_memtable_to_sstables(
                 largest: std::mem::take(&mut largest),
                 smallest_seqnum: smallest_seq.min(largest_seq),
                 largest_seqnum: largest_seq,
+                blob_refs,
             });
             let next = start_writer(&mut nfi)?;
             file_num = next.0;
@@ -2785,6 +2828,7 @@ fn write_memtable_to_sstables(
     }
 
     let blob_bytes = w.take_blob_file()?;
+    let blob_refs = w.blob_refs().to_vec();
     let mut file = w.finish()?;
     file.sync_all()?;
     write_blob_file(fs, dir, file_num, blob_bytes.as_deref())?;
@@ -2796,6 +2840,7 @@ fn write_memtable_to_sstables(
         largest,
         smallest_seqnum: smallest_seq.min(largest_seq),
         largest_seqnum: largest_seq,
+        blob_refs,
     });
     Ok(outputs)
 }

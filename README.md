@@ -15,8 +15,8 @@ lineage.
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
 > The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
-> provider into the engine, cross-sstable blob-file *sharing*, virtual sstables, and columnar
-> key-schema byte-parity — most of it gated on the Go interop CI) is catalogued in
+> provider into the engine, virtual sstables, and columnar key-schema byte-parity — most of it
+> gated on the Go interop CI) is catalogued in
 > [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
 
 ## Capabilities

@@ -133,16 +133,18 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   `Options::blob_value_threshold` set, flush writes the largest values to a sibling `<num>.blob`
   file (the `sstable::blob` module's writer/reader); the sstable stores a `KIND_BLOB`
   value-prefix + handle, reads resolve it through a `BlobResolver` against the blob file, and
-  and **blob-file rewrite during compaction** keeps large values out of the sstable across
+  **blob-file rewrite during compaction** keeps large values out of the sstable across
   compactions (each output writes its own blob file; inputs' blob files become obsolete with
   their sstables and are deleted; `checkpoint` copies blob files too).
   Ingest also honors blob separation (**ingest-with-blobs**): an ingested table's large values
-  are separated into a blob file as it is rewritten.
-  Remaining for full upstream parity (the **cross-sstable sharing** optimization): independent
-  blob file numbers with MANIFEST blob references and refcounting, so a compaction can rewrite
-  an sstable's keys while *preserving* references to an existing blob file (avoiding the value
-  rewrite entirely) — plus blob GC by reference. Byte-parity of the blob format is a
-  Go-interop-CI item.
+  are separated into a blob file as it is rewritten. Finally, **cross-sstable sharing** is done:
+  an sstable references blob files through a file-indexed list (recorded in its metaindex), so a
+  compaction *preserves* references to an existing blob file instead of rewriting the values
+  (`Writer::add_preserved_blob`), and blob files are reclaimed by **reference-based GC** — a blob
+  file is deleted only once no live or in-flight sstable references it (the in-memory
+  `FileMetadata::blob_refs`, repopulated from the metaindex at open). Byte-parity of the blob
+  format with upstream Pebble (and persisting blob refs in the MANIFEST rather than rescanning at
+  open) remains a Go-interop-CI item.
 
 ### Ingestion & maintenance
 - **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of

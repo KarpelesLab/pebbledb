@@ -319,7 +319,7 @@ impl<W: Write> Writer<W> {
         }
     }
 
-    /// The blob files this table references (for recording in [`FileMetadata`] blob refs).
+    /// The blob files this table references (for recording in the file's metadata blob refs).
     pub fn blob_refs(&self) -> &[u64] {
         &self.blob_refs
     }

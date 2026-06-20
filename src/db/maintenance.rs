@@ -254,6 +254,7 @@ impl DbInner {
         }
 
         let blob_bytes = w.take_blob_file()?;
+        let blob_refs = w.blob_refs().to_vec();
         let mut file = w.finish()?;
         file.sync_all()?;
         // Write the rewritten table's sibling blob file, if any large values were separated.
@@ -270,6 +271,7 @@ impl DbInner {
             largest,
             smallest_seqnum: seqnum,
             largest_seqnum: seqnum,
+            blob_refs,
         })
     }
 }

@@ -40,6 +40,12 @@ pub(crate) trait InternalIter {
     fn value(&self) -> &[u8];
     fn advance(&mut self) -> Result<()>;
     fn retreat(&mut self) -> Result<()>;
+    /// If the current entry's value is stored in a blob file, the `(blob_file_num, handle)`
+    /// reference — so a compaction can preserve it without rewriting the value. Default `None`
+    /// (memtable and other sources hold values inline).
+    fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
+        None
+    }
 }
 
 impl InternalIter for TableIter {
@@ -69,6 +75,9 @@ impl InternalIter for TableIter {
     }
     fn retreat(&mut self) -> Result<()> {
         TableIter::prev(self).map(|_| ())
+    }
+    fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
+        TableIter::blob_ref(self)
     }
 }
 
@@ -234,6 +243,11 @@ impl MergingIter {
 
     pub(crate) fn value(&self) -> &[u8] {
         self.sources[self.cur.expect("valid")].value()
+    }
+
+    /// The current entry's blob reference, if its value lives in a blob file.
+    pub(crate) fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
+        self.sources[self.cur.expect("valid")].blob_ref()
     }
 
     /// Advances past the current smallest key. Switches direction first if needed: every

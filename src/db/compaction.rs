@@ -643,7 +643,14 @@ impl DbInner {
 
         while merge.valid() {
             let ikey = merge.key().to_vec();
-            let value = merge.value().to_vec();
+            // A blob-referenced value can be carried over to the output without rewriting it
+            // (cross-sstable sharing); otherwise take the resolved value bytes.
+            let blob_ref = merge.blob_ref();
+            let value = if blob_ref.is_none() {
+                merge.value().to_vec()
+            } else {
+                Vec::new()
+            };
             merge.advance()?;
 
             let ukey = encoded_user_key(&ikey);
@@ -706,7 +713,10 @@ impl DbInner {
                 )?);
             }
             let b = builder.as_mut().unwrap();
-            b.add(&ikey, &value)?;
+            match blob_ref {
+                Some((blob_num, handle)) => b.add_preserved_blob(&ikey, blob_num, handle)?,
+                None => b.add(&ikey, &value)?,
+            }
             if b.writer.estimated_size() >= self.target_file_size_for(c.output_level) {
                 outputs.push(builder.take().unwrap().finish()?);
             }
@@ -922,6 +932,19 @@ impl OutputBuilder {
         Ok(())
     }
 
+    /// Adds a point entry whose value stays in the existing blob file `blob_num` (cross-sstable
+    /// blob sharing): the value is not rewritten, only the reference is carried over.
+    fn add_preserved_blob(
+        &mut self,
+        ikey: &[u8],
+        blob_num: u64,
+        handle: crate::sstable::blob::BlobHandle,
+    ) -> Result<()> {
+        self.writer.add_preserved_blob(ikey, blob_num, handle)?;
+        self.extend_bounds(ikey, encoded_trailer(ikey) >> 8);
+        Ok(())
+    }
+
     fn add_range_del(&mut self, start: &[u8], end: &[u8], seqnum: u64) -> Result<()> {
         use crate::base::internal_key::{InternalKey, InternalKeyKind};
         let start_ikey =
@@ -949,9 +972,10 @@ impl OutputBuilder {
 
     fn finish(mut self) -> Result<FileMetadata> {
         let blob_bytes = self.writer.take_blob_file()?;
+        let blob_refs = self.writer.blob_refs().to_vec();
         let mut file = self.writer.finish()?;
         file.sync_all()?;
-        // Write this output's sibling blob file, if blob rewrite separated any values.
+        // Write this output's sibling blob file, if blob rewrite separated any new values.
         if let Some(b) = &blob_bytes {
             let blob_path = self.path.with_file_name(filenames::blob(self.file_num));
             let mut bf = self.fs.create(&blob_path)?;
@@ -966,6 +990,7 @@ impl OutputBuilder {
             largest: self.largest.unwrap_or_default(),
             smallest_seqnum: self.smallest_seq.min(self.largest_seq),
             largest_seqnum: self.largest_seq,
+            blob_refs,
         })
     }
 }

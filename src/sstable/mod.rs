@@ -678,6 +678,7 @@ impl Reader {
             block_idx: None,
             data: None,
             cur_value: Vec::new(),
+            cur_blob_ref: None,
         })
     }
 
@@ -713,6 +714,7 @@ impl Reader {
             block_idx: None,
             data: None,
             cur_value: Vec::new(),
+            cur_blob_ref: None,
         })
     }
 }
@@ -731,6 +733,9 @@ pub struct TableIter {
     data: Option<BlockIter>,
     /// The current entry's resolved value (value prefixes/handles already applied).
     cur_value: Vec<u8>,
+    /// If the current entry's value is a blob reference, the `(blob_file_num, handle)` it
+    /// points at — used by compaction to preserve the reference without rewriting the value.
+    cur_blob_ref: Option<(u64, blob::BlobHandle)>,
 }
 
 impl TableIter {
@@ -752,14 +757,32 @@ impl TableIter {
         self.block_idx = None;
     }
 
-    /// Resolves and caches the current entry's value.
+    /// Resolves and caches the current entry's value, and records its blob reference (if any).
     fn refresh_value(&mut self) -> Result<()> {
-        if let Some(d) = self.data.as_ref()
-            && d.valid()
+        self.cur_blob_ref = None;
+        let raw = match self.data.as_ref() {
+            Some(d) if d.valid() => d.value().to_vec(),
+            _ => return Ok(()),
+        };
+        self.cur_value = self.reader.resolve_value(&raw)?;
+        if self.reader.prefixed_values
+            && !raw.is_empty()
+            && valblk::value_kind(raw[0]) == blob::KIND_BLOB
         {
-            self.cur_value = self.reader.resolve_value(d.value())?;
+            let (file_index, h) = blob::decode_ref(&raw[1..])?;
+            self.cur_blob_ref = self
+                .reader
+                .blob_refs
+                .get(file_index as usize)
+                .map(|&num| (num, h));
         }
         Ok(())
+    }
+
+    /// The current entry's blob reference `(blob_file_num, handle)`, if its value is stored in
+    /// a blob file.
+    pub fn blob_ref(&self) -> Option<(u64, blob::BlobHandle)> {
+        self.cur_blob_ref
     }
 
     /// Advances to the first entry and returns whether one exists.
