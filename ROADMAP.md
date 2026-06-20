@@ -167,7 +167,12 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 - Consistency checking (`level_checker`) over columnar tables.
 
 ### Tooling & testing
-- (Have: `sstable`/`wal`/`manifest` dump, `db get`/`scan`/`lsm`, `find`, and `bench`.)
+- A **libFuzzer** target (needs a `fuzz/` subcrate — out of the single-crate scope; pending a
+  decision). (Have: `sstable`/`wal`/`manifest` dump, `db get`/`scan`/`lsm`, `find`, and `bench`
+  CLIs; a seeded **metamorphic model test** covering points/deletes/range-deletes/indexed
+  batches/snapshots/flush/compact/reopen across six seeds; and a **data-driven test harness**
+  (`tests/datadriven.rs`) with inline-scripted cases. Porting Pebble's *own* `testdata` corpus
+  needs the Go fixtures and the interop CI.)
 - Port Pebble's **data-driven test corpus** and a **metamorphic** harness; add a
   **libFuzzer** target. (A seeded model test provides randomized coverage today.)
 
