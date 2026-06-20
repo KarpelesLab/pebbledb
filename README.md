@@ -60,6 +60,9 @@ lineage.
   pluggable `RemoteStorage` backend, with reads probing remote-then-local.
 - **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `scan` /
   `lsm`, `find`, and `bench`).
+- **Testing**: unit + end-to-end suites, a seeded metamorphic model test, a data-driven harness,
+  in-crate decoder-robustness fuzzing (`tests/fuzz_decoders.rs`), and an opt-in coverage-guided
+  `cargo-fuzz` subcrate (`fuzz/`, run with `cargo +nightly fuzz run <target>`).
 
 ## Usage
 

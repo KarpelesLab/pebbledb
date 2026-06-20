@@ -220,9 +220,14 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   (`tests/datadriven.rs`) with inline-scripted cases; and **decoder robustness fuzzing**
   (`tests/fuzz_decoders.rs`) that drives the batch/record/MANIFEST/sstable decoders with random
   and mutated-valid input — the in-crate, stable analogue of a libFuzzer corpus run over the
-  same entry points. A coverage-guided **`cargo-fuzz` target** would need a `fuzz/` subcrate
-  (the plan's "discuss before a sub-project"); porting Pebble's *own* `testdata` corpus needs
-  the Go fixtures and the interop CI.)
+  same entry points; and a coverage-guided **`cargo-fuzz` subcrate** (`fuzz/`, opt-in:
+  nightly + `cargo fuzz`) with targets `batch_decode`/`record_log`/`version_edit`/`sstable_reader`
+  over those same entry points. The `cargo-fuzz` run found and fixed two real
+  panics-on-corrupt-input in the block reader: a `usize` overflow on the block trailer offset
+  and unchecked entry/restart framing in `BlockIter` (now bounds-checked, returning a clean
+  error / invalid iterator instead of panicking). The `fuzz/` crate is a standalone workspace so
+  the single-crate, MSRV-1.88 main crate's build/test/clippy/doc never depend on it. Porting
+  Pebble's *own* `testdata` corpus still needs the Go fixtures and the interop CI.)
 
 ## CockroachDB boundary
 

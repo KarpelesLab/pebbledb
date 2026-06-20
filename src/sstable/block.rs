@@ -132,7 +132,9 @@ pub fn read_block(file: &[u8], handle: BlockHandle, checksum: ChecksumType) -> R
     let trailer_start = start
         .checked_add(len)
         .ok_or_else(|| Error::corruption("sstable: block handle overflow"))?;
-    let end = trailer_start + TRAILER_LEN;
+    let end = trailer_start
+        .checked_add(TRAILER_LEN)
+        .ok_or_else(|| Error::corruption("sstable: block handle overflow"))?;
     if end > file.len() {
         return Err(Error::corruption("sstable: block handle out of bounds"));
     }
@@ -247,30 +249,68 @@ impl BlockIter {
         get_u32_le(&self.block[self.restarts + i * 4..]).unwrap() as usize
     }
 
+    /// Marks the iterator exhausted/invalid (used on end-of-block or on a corrupt entry).
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.offset = self.restarts;
+    }
+
     /// Decodes the entry starting at `p`, using the current `key` as the prefix source,
     /// and positions the iterator on it.
+    ///
+    /// Robust against a corrupt block (e.g. one stored with checksum type `None`): any
+    /// malformed varint, out-of-range prefix length, or out-of-bounds key/value span leaves
+    /// the iterator invalid rather than panicking.
     fn decode_at(&mut self, p: usize) {
         if p >= self.restarts {
-            self.valid = false;
-            self.offset = self.restarts;
+            self.invalidate();
             return;
         }
         let mut q = p;
-        let (shared, n) = get_uvarint(&self.block[q..]).expect("entry shared");
+        let Some((shared, n)) = get_uvarint(&self.block[q..]) else {
+            self.invalidate();
+            return;
+        };
         q += n;
-        let (unshared, n) = get_uvarint(&self.block[q..]).expect("entry unshared");
+        let Some((unshared, n)) = get_uvarint(&self.block[q..]) else {
+            self.invalidate();
+            return;
+        };
         q += n;
-        let (value_len, n) = get_uvarint(&self.block[q..]).expect("entry value_len");
+        let Some((value_len, n)) = get_uvarint(&self.block[q..]) else {
+            self.invalidate();
+            return;
+        };
         q += n;
         let (shared, unshared, value_len) =
             (shared as usize, unshared as usize, value_len as usize);
 
+        // The key suffix and value must lie within the entry region [0, restarts), and the
+        // shared prefix cannot be longer than the previous key.
+        let key_end = match q.checked_add(unshared) {
+            Some(v) if v <= self.restarts => v,
+            _ => {
+                self.invalidate();
+                return;
+            }
+        };
+        let val_end = match key_end.checked_add(value_len) {
+            Some(v) if v <= self.restarts => v,
+            _ => {
+                self.invalidate();
+                return;
+            }
+        };
+        if shared > self.key.len() {
+            self.invalidate();
+            return;
+        }
+
         self.key.truncate(shared);
-        self.key.extend_from_slice(&self.block[q..q + unshared]);
-        q += unshared;
-        self.value = (q, q + value_len);
+        self.key.extend_from_slice(&self.block[q..key_end]);
+        self.value = (key_end, val_end);
         self.offset = p;
-        self.next_offset = q + value_len;
+        self.next_offset = val_end;
         self.valid = true;
     }
 
@@ -289,15 +329,30 @@ impl BlockIter {
     }
 
     /// Reads only the (full) key at restart point `i`, whose entry has `shared == 0`.
+    ///
+    /// Returns an empty slice if the restart offset or entry framing is corrupt, so binary
+    /// search over a malformed block cannot panic.
     fn key_at_restart(&self, i: usize) -> &[u8] {
         let mut q = self.restart_offset(i);
-        let (_shared, n) = get_uvarint(&self.block[q..]).expect("restart shared");
+        if q > self.restarts {
+            return &[];
+        }
+        let Some((_shared, n)) = get_uvarint(&self.block[q..]) else {
+            return &[];
+        };
         q += n;
-        let (unshared, n) = get_uvarint(&self.block[q..]).expect("restart unshared");
+        let Some((unshared, n)) = get_uvarint(&self.block[q..]) else {
+            return &[];
+        };
         q += n;
-        let (_value_len, n) = get_uvarint(&self.block[q..]).expect("restart value_len");
+        let Some((_value_len, n)) = get_uvarint(&self.block[q..]) else {
+            return &[];
+        };
         q += n;
-        &self.block[q..q + unshared as usize]
+        match q.checked_add(unshared as usize) {
+            Some(end) if end <= self.restarts => &self.block[q..end],
+            _ => &[],
+        }
     }
 
     /// Positions at the first entry whose key is `>= target` (an encoded internal key),

@@ -1,0 +1,50 @@
+# Coverage-guided libFuzzer targets for pebbledb's decoders (run with nightly + cargo-fuzz:
+# `cargo +nightly fuzz run <target>`). This is a standalone crate with its own `[workspace]`
+# so the parent crate's build, tests, clippy, rustdoc, and MSRV check never descend into it —
+# it deliberately requires the nightly toolchain and the libFuzzer runtime, which the
+# single-crate, MSRV-1.88 main crate does not. See fuzz/README.md.
+[package]
+name = "pebbledb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent: this crate is its own workspace root.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pebbledb]
+path = ".."
+
+[[bin]]
+name = "batch_decode"
+path = "fuzz_targets/batch_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_log"
+path = "fuzz_targets/record_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "version_edit"
+path = "fuzz_targets/version_edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sstable_reader"
+path = "fuzz_targets/sstable_reader.rs"
+test = false
+doc = false
+bench = false
