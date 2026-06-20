@@ -1053,6 +1053,51 @@ fn block_property_filter_skips_nonmatching_sstables() {
 }
 
 #[test]
+fn checkpoint_restricted_to_spans() {
+    use pebbledb::CheckpointOptions;
+
+    let src = temp_dir("ckpt-src");
+    let dst = temp_dir("ckpt-dst");
+    let db = Db::open(
+        &src,
+        Options {
+            mem_table_size: 16 * 1024, // several sstables across the key space
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..2000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 32]).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Checkpoint only the sstables overlapping [k00000, k00500).
+    db.checkpoint_with_options(
+        &dst,
+        &CheckpointOptions {
+            spans: vec![(b"k00000".to_vec(), b"k00500".to_vec())],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(db);
+
+    // The checkpoint opens as a self-contained database holding (at least) the requested span
+    // and not the far end of the key space.
+    let ck = Db::open_read_only(&dst, Options::default()).unwrap();
+    assert_eq!(ck.get(b"k00000").unwrap(), Some(vec![b'v'; 32]));
+    assert_eq!(ck.get(b"k00400").unwrap(), Some(vec![b'v'; 32]));
+    assert_eq!(
+        ck.get(b"k01999").unwrap(),
+        None,
+        "out-of-span data excluded"
+    );
+
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[test]
 fn flush_splitting_produces_multiple_l0_files() {
     // A large point-only memtable flushed with a small target file size splits into several
     // L0 sstables. A high L0 threshold keeps them at L0 so the split is observable.

@@ -113,7 +113,8 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   compacting), **download** (rewrite remote/external files to local), and flushable ingests.
   (`Db::excise`, `Db::ingest_and_excise`, external sstable `ingest`, `Db::compact`, and
   `EstimateDiskUsage` exist; excise currently reclaims via compaction.)
-- Checkpoint options (flush-WAL, restrict to spans). (Basic checkpoint exists.)
+- (Done: **checkpoint options** — `CheckpointOptions` with a flush toggle and
+  `RestrictToSpans`-style span restriction, via `Db::checkpoint_with_options`.)
 
 ### Remote / disaggregated storage
 - Wire the engine's sstable reads/writes onto the **`objstorage` provider** so shared

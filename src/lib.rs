@@ -64,8 +64,8 @@ pub use base::comparer::{Comparer, DefaultComparer};
 pub use base::merge::{ConcatMerger, Merger};
 pub use batch::Batch;
 pub use db::{
-    ArchiveCleaner, Cleaner, Db, DbIterator, DeleteCleaner, EventListener, FormatMajorVersion,
-    IndexedBatch, InternalScan, IterOptions, Logger, Metrics, Options, OptionsFile, Snapshot,
-    TableStats, new_external_iter,
+    ArchiveCleaner, CheckpointOptions, Cleaner, Db, DbIterator, DeleteCleaner, EventListener,
+    FormatMajorVersion, IndexedBatch, InternalScan, IterOptions, Logger, Metrics, Options,
+    OptionsFile, Snapshot, TableStats, new_external_iter,
 };
 pub use error::{Error, Result};

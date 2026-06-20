@@ -28,6 +28,7 @@ mod compaction;
 mod filenames;
 mod indexed_batch;
 mod maintenance;
+pub use maintenance::CheckpointOptions;
 mod merging_iter;
 mod options_file;
 

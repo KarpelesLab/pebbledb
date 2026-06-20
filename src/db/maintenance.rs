@@ -24,6 +24,27 @@ use crate::vfs::WritableFile;
 
 use super::{DbInner, filenames, update_marker};
 
+/// Options for [`Db::checkpoint_with_options`](DbInner::checkpoint_with_options), mirroring
+/// Pebble's `CheckpointOptions`.
+#[derive(Clone)]
+pub struct CheckpointOptions {
+    /// Flush the memtable before checkpointing so in-memory data is captured (default `true`).
+    /// When `false`, only data already in sstables is copied.
+    pub flush: bool,
+    /// If non-empty, only sstables overlapping one of these inclusive-start/exclusive-end
+    /// `[start, end)` key spans are copied (Pebble's `RestrictToSpans`).
+    pub spans: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Default for CheckpointOptions {
+    fn default() -> CheckpointOptions {
+        CheckpointOptions {
+            flush: true,
+            spans: Vec::new(),
+        }
+    }
+}
+
 impl DbInner {
     /// Writes a consistent, self-contained copy of the database into `dest`, which must
     /// not already be an open database. The active memtable is first flushed so all data
@@ -31,25 +52,50 @@ impl DbInner {
     /// (plus its marker) describing them is written. The result can be opened like any
     /// other database.
     pub fn checkpoint(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.checkpoint_with_options(dest, &CheckpointOptions::default())
+    }
+
+    /// Like [`checkpoint`](Self::checkpoint) but honoring [`CheckpointOptions`]: optionally
+    /// skipping the pre-checkpoint flush (capturing only already-durable data) and/or
+    /// restricting the copy to sstables overlapping a set of key spans (Pebble's
+    /// `RestrictToSpans`). A span-restricted checkpoint's MANIFEST lists only the copied
+    /// files, so it opens as a self-contained database over just those spans.
+    pub fn checkpoint_with_options(
+        &self,
+        dest: impl AsRef<Path>,
+        opts: &CheckpointOptions,
+    ) -> Result<()> {
         let dest = dest.as_ref();
         self.fs.create_dir_all(dest)?;
 
         // Make every live key durable in an sstable before snapshotting the version.
-        if !self.state.lock().unwrap().read_only {
+        if opts.flush && !self.state.lock().unwrap().read_only {
             self.flush()?;
         }
         let state = self.state.lock().unwrap();
-        let edit = state.vs.snapshot_edit();
+        let mut edit = state.vs.snapshot_edit();
 
-        // Copy each live sstable verbatim.
-        for level in state.vs.current.levels.iter() {
-            for f in level {
-                let name = filenames::table(f.file_num);
-                let bytes = self.fs.read(&self.dir.join(&name))?;
-                let mut w = self.fs.create(&dest.join(&name))?;
-                w.write_all(&bytes)?;
-                w.sync_all()?;
-            }
+        // Restrict to files overlapping one of the requested spans, if any.
+        if !opts.spans.is_empty() {
+            let cmp = self.cmp.as_ref();
+            edit.new_files.retain(|nf| {
+                let lo = encoded_user_key(&nf.meta.smallest);
+                let hi = encoded_user_key(&nf.meta.largest);
+                opts.spans.iter().any(|(start, end)| {
+                    // [lo, hi] intersects [start, end): hi >= start and lo < end.
+                    cmp.compare(hi, start) != std::cmp::Ordering::Less
+                        && cmp.compare(lo, end) == std::cmp::Ordering::Less
+                })
+            });
+        }
+
+        // Copy each retained sstable verbatim.
+        for nf in &edit.new_files {
+            let name = filenames::table(nf.meta.file_num);
+            let bytes = self.fs.read(&self.dir.join(&name))?;
+            let mut w = self.fs.create(&dest.join(&name))?;
+            w.write_all(&bytes)?;
+            w.sync_all()?;
         }
 
         // Write a fresh MANIFEST holding just the snapshot edit, and point a marker at it.
