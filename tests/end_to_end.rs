@@ -3135,9 +3135,21 @@ fn shared_objstorage_round_trips_and_survives_reopen() {
     };
     check(&db);
 
-    // Reopen with the same shared backend: reads resolve from it.
+    // download() rewrites the live shared sstables back to local storage.
+    let moved = db.download(b"", b"\xff\xff\xff\xff").unwrap();
+    assert!(moved >= 1, "download should move shared objects local");
+    assert!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|x| x == "sst")),
+        "sstables should now be on local disk"
+    );
+    check(&db);
+
+    // The live set is now fully local: reopening with NO remote backend still reads everything.
     drop(db);
-    let db = Db::open(&dir, opts()).unwrap();
+    let db = Db::open(&dir, Options::default()).unwrap();
     check(&db);
 
     let _ = std::fs::remove_dir_all(&dir);

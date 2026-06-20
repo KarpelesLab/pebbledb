@@ -204,6 +204,51 @@ impl DbInner {
         self.ingest(paths)
     }
 
+    /// Rewrites shared/remote sstables (and their blob files) overlapping the user-key range
+    /// `[start, end)` back to local storage (Pebble's `Download`), so that range no longer
+    /// depends on the shared backend. Returns the number of objects moved local; a no-op when
+    /// no remote backend is configured.
+    pub fn download(&self, start: &[u8], end: &[u8]) -> Result<usize> {
+        use std::cmp::Ordering;
+        use std::io::Write;
+        let Some(remote) = self.remote.clone() else {
+            return Ok(0);
+        };
+        // The physical files overlapping the range (a virtual sstable contributes its backing).
+        let phys: Vec<u64> = {
+            let state = self.state.lock().unwrap();
+            let cmp = self.cmp.as_ref();
+            let mut set = std::collections::BTreeSet::new();
+            for level in state.vs.current.levels.iter() {
+                for f in level {
+                    let fl = encoded_user_key(&f.largest);
+                    let fsm = encoded_user_key(&f.smallest);
+                    if cmp.compare(fl, start) != Ordering::Less
+                        && cmp.compare(fsm, end) == Ordering::Less
+                    {
+                        set.insert(f.physical_num());
+                    }
+                }
+            }
+            set.into_iter().collect()
+        };
+        let mut moved = 0;
+        for p in phys {
+            for name in [filenames::table(p), filenames::blob(p)] {
+                if remote.exists(&name) {
+                    let bytes = remote.get(&name)?;
+                    // Write local before deleting remote, so the object is always reachable.
+                    let mut w = self.fs.create(&self.dir.join(&name))?;
+                    w.write_all(&bytes)?;
+                    w.sync_all()?;
+                    remote.delete(&name)?;
+                    moved += 1;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
     /// Reads the external sstable at `src`, rewrites its point keys, range tombstones, and
     /// range keys into `<dir>/<file_num>.sst` with every entry stamped at `seqnum`, and
     /// returns the resulting file's metadata.

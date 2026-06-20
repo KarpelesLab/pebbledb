@@ -158,8 +158,9 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   the ingest sequence numbers and rotating the memtable atomically under one lock — so an
   ingested value correctly wins over an older, still-unflushed in-memory key (it had been
   shadowed before). The flushable-ingest *optimization* that queues the sstables instead of
-  forcing the flush is a further refinement.) Remaining: **download** (rewrite remote/external
-  files to local).
+  forcing the flush is a further refinement.) **Download** is done too: `Db::download(start,
+  end)` rewrites the live shared/remote sstables (and blob files) overlapping the range back to
+  local storage, so the range no longer depends on the shared backend.
 - (Done: **checkpoint options** — `CheckpointOptions` with a flush toggle and
   `RestrictToSpans`-style span restriction, via `Db::checkpoint_with_options`.)
 
