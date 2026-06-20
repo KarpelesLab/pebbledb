@@ -295,6 +295,19 @@ struct CommitSlot {
     cv: Condvar,
 }
 
+/// Group-commit queue plus its leadership flag, guarded by one mutex so that enqueueing a
+/// write and claiming/relinquishing leadership are atomic. This closes the lost-leader race:
+/// a writer either is picked up by the active leader's drain loop, or — because it observed
+/// `leader == false` under the same lock the leader clears it under — becomes the leader
+/// itself. No queued write can be stranded with no thread responsible for committing it.
+#[derive(Default)]
+struct CommitQueue {
+    /// Writes awaiting commit, each with its batch and completion slot.
+    items: Vec<(Batch, Arc<CommitSlot>)>,
+    /// Whether a leader is currently draining the queue.
+    leader: bool,
+}
+
 /// Queue of obsolete files awaiting paced deletion, plus a shutdown flag for the pacer.
 #[derive(Default)]
 struct DeleteQueue {
@@ -406,11 +419,8 @@ pub struct DbInner {
     delete_queue: Mutex<DeleteQueue>,
     /// Signals the deletion pacer that work was queued (or shutdown requested).
     delete_cv: Condvar,
-    /// Group-commit queue: writes awaiting commit, each with its batch and completion slot.
-    commit_q: Mutex<Vec<(Batch, Arc<CommitSlot>)>>,
-    /// Serializes the group-commit leader (the thread that flushes a batch of queued writes
-    /// through one WAL sync + memtable apply).
-    commit_leader: Mutex<()>,
+    /// Group-commit queue + leadership flag (see [`CommitQueue`]).
+    commit_q: Mutex<CommitQueue>,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -758,8 +768,7 @@ impl DbInner {
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
                 delete_queue: Mutex::new(DeleteQueue::default()),
                 delete_cv: Condvar::new(),
-                commit_q: Mutex::new(Vec::new()),
-                commit_leader: Mutex::new(()),
+                commit_q: Mutex::new(CommitQueue::default()),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -895,8 +904,7 @@ impl DbInner {
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
             delete_queue: Mutex::new(DeleteQueue::default()),
             delete_cv: Condvar::new(),
-            commit_q: Mutex::new(Vec::new()),
-            commit_leader: Mutex::new(()),
+            commit_q: Mutex::new(CommitQueue::default()),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
@@ -1127,42 +1135,57 @@ impl DbInner {
             result: Mutex::new(None),
             cv: Condvar::new(),
         });
-        self.commit_q
-            .lock()
-            .unwrap()
-            .push((batch, Arc::clone(&slot)));
 
-        loop {
-            // Already committed by a concurrent leader?
-            if let Some(r) = slot.result.lock().unwrap().take() {
-                return r;
+        // Enqueue and claim or decline leadership atomically under the queue lock.
+        let am_leader = {
+            let mut q = self.commit_q.lock().unwrap();
+            q.items.push((batch, Arc::clone(&slot)));
+            if q.leader {
+                false
+            } else {
+                q.leader = true;
+                true
             }
-            match self.commit_leader.try_lock() {
-                Ok(_leader) => {
-                    // We are the leader: drain and commit the whole queue.
-                    let group: Vec<(Batch, Arc<CommitSlot>)> =
-                        std::mem::take(&mut *self.commit_q.lock().unwrap());
-                    if group.is_empty() {
-                        continue; // another leader already took our batch; re-check our slot
-                    }
-                    let result = self.commit_group(&group);
-                    // Publish the (cloned) result to each waiter and wake it.
-                    for (_, s) in &group {
-                        *s.result.lock().unwrap() = Some(clone_commit_result(&result));
-                        s.cv.notify_all();
-                    }
-                    // The leader lock drops here; our slot is now populated and the loop returns.
+        };
+
+        if !am_leader {
+            // A leader is active. Because we pushed our slot before observing `leader == true`
+            // (both under the queue lock), the leader's drain loop is guaranteed to pick us up:
+            // it only clears `leader` after seeing an empty queue under that same lock. Wait for
+            // our result to be published.
+            let mut r = slot.result.lock().unwrap();
+            while r.is_none() {
+                r = slot.cv.wait(r).unwrap();
+            }
+            return r.take().unwrap();
+        }
+
+        // We are the leader: drain and commit the queue until it is empty, then relinquish
+        // leadership. Draining to empty (rather than committing a single snapshot) ensures any
+        // write that enqueues while we hold leadership is committed by us — it cannot be
+        // stranded, since a writer that sees `leader == true` becomes a follower we will drain.
+        loop {
+            let group = {
+                let mut q = self.commit_q.lock().unwrap();
+                if q.items.is_empty() {
+                    q.leader = false;
+                    break;
                 }
-                Err(_) => {
-                    // A leader is committing; wait until our batch's result is published.
-                    let mut r = slot.result.lock().unwrap();
-                    while r.is_none() {
-                        r = slot.cv.wait(r).unwrap();
-                    }
-                    return r.take().unwrap();
-                }
+                std::mem::take(&mut q.items)
+            };
+            let result = self.commit_group(&group);
+            for (_, s) in &group {
+                *s.result.lock().unwrap() = Some(clone_commit_result(&result));
+                s.cv.notify_all();
             }
         }
+
+        // Our own batch was committed in one of the iterations above.
+        slot.result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(Error::InvalidState("commit: result not published".into())))
     }
 
     /// Commits a group of queued batches under one state-lock acquisition and a single WAL
