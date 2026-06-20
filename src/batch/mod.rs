@@ -280,12 +280,12 @@ impl<'a> Iterator for BatchReader<'a> {
         if self.data.is_empty() {
             return None;
         }
-        let kind = InternalKeyKind::from_u8(self.data[0]);
+        let kind_byte = self.data[0];
+        let kind = InternalKeyKind::from_u8(kind_byte);
         if kind == InternalKeyKind::Invalid || kind.as_u8() > InternalKeyKind::MAX.as_u8() {
             self.data = &[];
             return Some(Err(Error::corruption(format!(
-                "batch: invalid key kind {:#x}",
-                self.data[0]
+                "batch: invalid key kind {kind_byte:#x}"
             ))));
         }
         let (rest, key) = match get_varstr(&self.data[1..]) {
