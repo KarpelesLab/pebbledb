@@ -15,9 +15,9 @@ lineage.
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
 > The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
-> provider into the engine, compaction-heuristic breadth, value separation / blob files,
-> columnar key-schema interop, etc.) is catalogued in [`ROADMAP.md`](ROADMAP.md). The public
-> API is **not** yet stable.
+> provider into the engine, separate blob files, virtual sstables, and columnar key-schema
+> byte-parity — most of it gated on the Go interop CI) is catalogued in
+> [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
 
 ## Capabilities
 
@@ -29,15 +29,17 @@ lineage.
   **range-key masking**, **block-property filters** that skip non-matching sstables, and
   `only_durable` (read only flushed data); `new_external_iter` reads sstables without
   ingesting them, and `scan_internal` exposes the raw internal keyspace.
-- **Engine**: WAL with multi-directory failover, a background flush/compaction worker,
-  **flush splitting**, and a full leveled compaction suite — score-based + manual
-  `compact_range`, **multilevel**, **move**, **delete-only**, **elision-only**,
-  **tombstone-density**, and **read-triggered** compactions — plus write stalls, a sharded
-  block cache, and `EstimateDiskUsage`.
+- **Engine**: WAL with multi-directory failover and **group commit** (concurrent writers
+  batched through one fsync), **flush splitting**, and a full leveled compaction suite —
+  score-based + manual `compact_range`, **multilevel**, **move**, **delete-only**,
+  **elision-only**, **tombstone-density**, and **read-triggered** compactions run by a
+  **concurrent compaction scheduler** (`Options::max_concurrent_compactions`) with paced
+  obsolete-file deletion — plus write stalls, a sharded block cache, and `EstimateDiskUsage`.
 - **Storage formats**: row-format sstables (every supported table-format version, two-level
-  indexes, bloom filters, value blocks, range-del/range-key blocks, block-property
-  collectors run over flush/compaction output via `Options::block_property_collectors`) and
-  the columnar (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
+  indexes, bloom filters, **value separation** into value blocks via
+  `Options::value_block_threshold`, range-del/range-key blocks, **table- and per-block**
+  property collectors/filters via `Options::block_property_collectors`) and the columnar
+  (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
 - **Operations**: `checkpoint` (with flush/span-restriction options), external sstable
   `ingest`, `Options` + `OPTIONS` file with a **comparer/merger name→impl registry**,
   tunable level budgets (`l1_max_bytes`), step-wise `FormatMajorVersion` migrations,
