@@ -1250,6 +1250,32 @@ fn excise_removes_and_reclaims_range() {
 }
 
 #[test]
+fn table_stats_aggregate_deletions() {
+    let dir = temp_dir("table-stats");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..200u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    for i in 0..30u32 {
+        db.delete(format!("k{i:03}").as_bytes()).unwrap();
+    }
+    db.delete_range(b"k100", b"k110").unwrap();
+    db.flush().unwrap();
+
+    let stats = db.table_stats().unwrap();
+    assert!(stats.tables >= 1);
+    assert!(stats.num_entries >= 200, "entries: {}", stats.num_entries);
+    assert!(
+        stats.num_deletions >= 30,
+        "deletions: {}",
+        stats.num_deletions
+    );
+    assert!(stats.num_range_deletions >= 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

@@ -1287,6 +1287,33 @@ impl DbInner {
         }
     }
 
+    /// Aggregates per-table statistics across all live sstables by reading each table's
+    /// properties block (Pebble collects these in the background to drive
+    /// tombstone-density and similar compaction heuristics). Reads go through the table
+    /// cache, so repeated calls are cheap.
+    pub fn table_stats(&self) -> Result<TableStats> {
+        let files: Vec<u64> = {
+            let state = self.state.lock().unwrap();
+            state
+                .vs
+                .current
+                .levels
+                .iter()
+                .flat_map(|lvl| lvl.iter().map(|f| f.file_num))
+                .collect()
+        };
+        let mut stats = TableStats::default();
+        for file_num in files {
+            let reader = self.open_reader(file_num)?;
+            let p = reader.properties();
+            stats.tables += 1;
+            stats.num_entries += p.num_entries;
+            stats.num_deletions += p.num_deletions;
+            stats.num_range_deletions += p.num_range_deletions;
+        }
+        Ok(stats)
+    }
+
     /// Returns a human-readable description of the LSM tree's current shape: one section
     /// per non-empty level listing each live sstable's file number, size, and user-key
     /// bounds (Pebble's LSM view, useful for debugging and tooling).
@@ -1389,6 +1416,19 @@ pub struct InternalScan {
     pub range_dels: Vec<RangeTombstone>,
     /// All range-key entries across the LSM.
     pub range_keys: Vec<RangeKeyEntry>,
+}
+
+/// Aggregate per-table statistics across all live sstables, from [`DbInner::table_stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableStats {
+    /// Number of live sstables examined.
+    pub tables: usize,
+    /// Total key/value entries across all tables.
+    pub num_entries: u64,
+    /// Total point + range deletions across all tables.
+    pub num_deletions: u64,
+    /// Total range deletions across all tables.
+    pub num_range_deletions: u64,
 }
 
 /// A point-in-time summary of the LSM tree's shape.
