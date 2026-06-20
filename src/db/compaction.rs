@@ -41,12 +41,15 @@ struct Compaction {
     output_level: usize,
     inputs: Vec<Arc<FileMetadata>>,
     overlap: Vec<Arc<FileMetadata>>,
+    /// Intermediate-level files (at `level + 1`) for a **multilevel** compaction whose output
+    /// goes to `level + 2`. Empty for an ordinary two-level compaction.
+    mid: Vec<Arc<FileMetadata>>,
 }
 
-/// The size budget for a level before it is compacted downward.
-fn level_budget(level: usize) -> u64 {
-    // L1 = 10 MiB, growing 10x per level.
-    let mut budget = 10u64 << 20;
+/// The size budget for a level before it is compacted downward: `l1_max_bytes` at L1,
+/// growing 10x per level (Pebble's `LBaseMaxBytes` shape).
+fn level_budget(l1_max_bytes: u64, level: usize) -> u64 {
+    let mut budget = l1_max_bytes.max(1);
     for _ in 1..level {
         budget = budget.saturating_mul(10);
     }
@@ -95,6 +98,7 @@ impl DbInner {
                     output_level: level + 1,
                     inputs,
                     overlap,
+                    mid: Vec::new(),
                 };
                 self.run_compaction(&mut state, c)?;
                 did_work = true;
@@ -188,6 +192,7 @@ impl DbInner {
                 output_level: level + 1,
                 inputs: vec![f],
                 overlap,
+                mid: Vec::new(),
             };
             self.run_compaction(state, c)?;
         }
@@ -236,6 +241,7 @@ impl DbInner {
                     output_level: level + 1,
                     inputs: vec![f.clone()],
                     overlap,
+                    mid: Vec::new(),
                 };
                 self.run_compaction(state, c)?;
                 return Ok(true);
@@ -360,6 +366,7 @@ impl DbInner {
             output_level: bottom,
             inputs: vec![file],
             overlap: Vec::new(),
+            mid: Vec::new(),
         };
         self.run_compaction(state, c)
     }
@@ -372,7 +379,7 @@ impl DbInner {
             version.levels[0].len() as f64 / self.l0_compaction_threshold as f64
         } else {
             let total: u64 = version.levels[level].iter().map(|f| f.size).sum();
-            total as f64 / level_budget(level) as f64
+            total as f64 / level_budget(self.l1_max_bytes, level) as f64
         }
     }
 
@@ -408,11 +415,37 @@ impl DbInner {
         };
         let (min, max) = key_range(self.cmp.as_ref(), &inputs)?;
         let overlap = overlapping(self.cmp.as_ref(), version, level + 1, &min, &max);
+
+        // Multilevel compaction (Pebble): when the output (`level+1`) and the level below it
+        // (`level+2`) both already hold overlapping data, a plain `level -> level+1`
+        // compaction would immediately invite a `level+1 -> level+2` one. Fold all three
+        // levels into a single compaction that writes straight to `level+2`, avoiding
+        // rewriting the intermediate data twice. Only done for a single-file `level` input
+        // (so the merged size stays bounded) and when it would not reach below the bottom.
+        if level + 2 < NUM_LEVELS && inputs.len() == 1 && !overlap.is_empty() {
+            // Combined key range of `level` + `level+1` inputs.
+            let mut combined = inputs.clone();
+            combined.extend(overlap.iter().cloned());
+            if let Some((cmin, cmax)) = key_range(self.cmp.as_ref(), &combined) {
+                let overlap2 = overlapping(self.cmp.as_ref(), version, level + 2, &cmin, &cmax);
+                if !overlap2.is_empty() {
+                    return Some(Compaction {
+                        level,
+                        output_level: level + 2,
+                        inputs,
+                        mid: overlap,      // the intermediate `level+1` files
+                        overlap: overlap2, // the `level+2` output-level files
+                    });
+                }
+            }
+        }
+
         Some(Compaction {
             level,
             output_level: level + 1,
             inputs,
             overlap,
+            mid: Vec::new(),
         })
     }
 
@@ -423,19 +456,34 @@ impl DbInner {
         // compaction.) The file's sstable content is independent of its level, so its keys,
         // tombstones, and range keys are all carried correctly by the move. (An elision-only
         // compaction, where the output level equals the input level, must instead rewrite.)
-        if c.inputs.len() == 1 && c.overlap.is_empty() && c.output_level != c.level {
+        if c.inputs.len() == 1
+            && c.overlap.is_empty()
+            && c.mid.is_empty()
+            && c.output_level != c.level
+        {
             return self.run_move_compaction(state, c);
         }
+        let input_count = c.inputs.len() + c.mid.len() + c.overlap.len();
+        if !c.mid.is_empty() {
+            self.log(&format!(
+                "multilevel compaction L{}+L{}+L{} -> L{}",
+                c.level,
+                c.level + 1,
+                c.output_level,
+                c.output_level
+            ));
+        }
         if let Some(l) = &self.listener {
-            l.on_compaction_begin(c.output_level, c.inputs.len() + c.overlap.len());
+            l.on_compaction_begin(c.output_level, input_count);
         }
         // Build a merging iterator over every input file and collect their range
         // tombstones, which must be carried to the output (otherwise the deletions
-        // would be lost).
+        // would be lost). For a multilevel compaction the intermediate (`mid`) files are
+        // merged too.
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
         let mut tombstones: Vec<RangeTombstone> = Vec::new();
         let mut range_keys: Vec<RangeKeyEntry> = Vec::new();
-        for f in c.inputs.iter().chain(c.overlap.iter()) {
+        for f in c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()) {
             let reader = self.open_reader(f.file_num)?;
             tombstones.extend_from_slice(reader.range_tombstones());
             range_keys.extend_from_slice(reader.range_keys());
@@ -566,6 +614,10 @@ impl DbInner {
         for f in &c.inputs {
             edit.deleted_files.push((c.level, f.file_num));
         }
+        // Intermediate-level files (multilevel) live at `level + 1`.
+        for f in &c.mid {
+            edit.deleted_files.push((c.level + 1, f.file_num));
+        }
         for f in &c.overlap {
             edit.deleted_files.push((c.output_level, f.file_num));
         }
@@ -584,11 +636,7 @@ impl DbInner {
         }
         state.compaction_count += 1;
         if let Some(l) = &self.listener {
-            l.on_compaction_end(
-                c.output_level,
-                c.inputs.len() + c.overlap.len(),
-                num_outputs,
-            );
+            l.on_compaction_end(c.output_level, input_count, num_outputs);
         }
 
         // Dispose of the obsolete input files (cache + on disk, via the cleaner).

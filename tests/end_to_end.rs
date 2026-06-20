@@ -1143,6 +1143,61 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn multilevel_compaction_folds_three_levels() {
+    use pebbledb::Logger;
+    use std::sync::Mutex;
+
+    // Count multilevel-compaction log lines.
+    struct CountLogger(Mutex<usize>);
+    impl Logger for CountLogger {
+        fn info(&self, msg: &str) {
+            if msg.contains("multilevel compaction") {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    let dir = temp_dir("multilevel");
+    let logger = Arc::new(CountLogger(Mutex::new(0)));
+    // Tiny level budgets push data down into L2/L3 quickly, so a single-file L1/L2 compaction
+    // finds overlap two levels down and folds all three levels together.
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 4 * 1024,
+            target_file_size: 1024,
+            l1_max_bytes: 1024,
+            logger: Some(logger.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A large keyspace with sizable values overflows the tiny budgets into L1, L2 and L3;
+    // several overwrite rounds keep producing overlapping files at the upper levels.
+    let value = |round: u32| format!("r{round:03}-{}", "x".repeat(40));
+    for round in 0..3u32 {
+        for k in 0..2000u32 {
+            db.set(format!("k{k:05}").as_bytes(), value(round).as_bytes())
+                .unwrap();
+        }
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    assert!(
+        *logger.0.lock().unwrap() >= 1,
+        "expected at least one multilevel compaction"
+    );
+    // Final values are correct after all the compaction churn.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(value(2).into_bytes()));
+    assert_eq!(db.get(b"k01999").unwrap(), Some(value(2).into_bytes()));
+    assert_eq!(collect(&db).len(), 2000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn flush_splitting_produces_multiple_l0_files() {
     // A large point-only memtable flushed with a small target file size splits into several
     // L0 sstables. A high L0 threshold keeps them at L0 so the split is observable.

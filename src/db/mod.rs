@@ -134,6 +134,9 @@ pub struct Options {
     /// (Pebble's allowed-seeks heuristic, which it derives from file size; here a fixed knob).
     /// `0` disables read-triggered compactions (default 1024).
     pub read_compaction_threshold: u32,
+    /// Size budget in bytes of the base level (L1) before it is compacted downward; deeper
+    /// levels grow 10x per level (Pebble's `LBaseMaxBytes`, default 10 MiB).
+    pub l1_max_bytes: u64,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -245,6 +248,7 @@ impl Default for Options {
             target_file_size: 2 << 20,
             tombstone_dense_compaction_threshold: 0.10,
             read_compaction_threshold: 1024,
+            l1_max_bytes: 10 << 20,
         }
     }
 }
@@ -326,6 +330,8 @@ pub struct DbInner {
     tombstone_dense_compaction_threshold: f64,
     /// Wasted-seek count that triggers a read-triggered compaction (0 disables).
     read_compaction_threshold: u32,
+    /// Base-level (L1) size budget in bytes; deeper levels grow 10x per level.
+    l1_max_bytes: u64,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -532,6 +538,7 @@ impl DbInner {
                 block_property_collectors: opts.block_property_collectors.clone(),
                 tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
                 read_compaction_threshold: opts.read_compaction_threshold,
+                l1_max_bytes: opts.l1_max_bytes.max(1),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -655,6 +662,7 @@ impl DbInner {
             block_property_collectors: opts.block_property_collectors.clone(),
             tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
             read_compaction_threshold: opts.read_compaction_threshold,
+            l1_max_bytes: opts.l1_max_bytes.max(1),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),

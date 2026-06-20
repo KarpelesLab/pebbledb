@@ -84,10 +84,13 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 
 ### Compaction
 - **Compaction scheduler**: multiple concurrent background compactions, prioritization.
-- **Multilevel** compaction. (**Flush splitting** — a point-only memtable is split into
-  multiple L0 sstables at `Options::target_file_size` boundaries on flush — is done. Done,
-  each driven by table stats / on-disk properties or read feedback: **move compactions** —
-  relevelling a single non-overlapping
+- (Done. **Multilevel compaction** — when a single-file `level → level+1` compaction's output
+  would also overlap `level+2`, all three levels are folded into one compaction writing
+  straight to `level+2`; the base-level budget is `Options::l1_max_bytes` (Pebble's
+  `LBaseMaxBytes`). **Flush splitting** — a point-only memtable is split into multiple L0
+  sstables at `Options::target_file_size` boundaries on flush. Plus, each driven by table
+  stats / on-disk properties or read feedback: **move compactions** — relevelling a single
+  non-overlapping
   file by a MANIFEST edit without rewriting; **delete-only compactions** — dropping files
   entirely shadowed by a covering range tombstone; **elision-only compactions** — rewriting a
   bottom file to drop its now-dead tombstones; **tombstone-density compactions** — pushing a
