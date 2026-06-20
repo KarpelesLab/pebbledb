@@ -34,7 +34,7 @@ mod options_file;
 
 pub use indexed_batch::IndexedBatch;
 use merging_iter::InternalIter;
-pub use merging_iter::{DbIterator, IterOptions};
+pub use merging_iter::{DbIterator, IterKeyType, IterOptions};
 pub use options_file::{FormatMajorVersion, OptionsFile};
 
 use std::collections::HashMap;

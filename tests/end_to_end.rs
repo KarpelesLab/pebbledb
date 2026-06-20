@@ -2480,6 +2480,103 @@ fn iterator_coalesces_range_keys() {
 }
 
 #[test]
+fn iter_key_type_points_only_suppresses_range_keys() {
+    use pebbledb::{IterKeyType, IterOptions};
+    let dir = temp_dir("keytype-points");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"a", b"1").unwrap();
+    db.set(b"m", b"2").unwrap();
+    db.range_key_set(b"b", b"p", b"@t", b"rk").unwrap();
+
+    // PointsOnly: point keys still iterate, but range keys are not surfaced.
+    let mut it = db
+        .iter_with_options(IterOptions {
+            key_type: IterKeyType::PointsOnly,
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    let mut pts = Vec::new();
+    while it.valid() {
+        pts.push(String::from_utf8_lossy(it.key()).into_owned());
+        assert!(
+            it.range_keys().is_empty(),
+            "PointsOnly must not surface range keys"
+        );
+        it.next().unwrap();
+    }
+    assert_eq!(pts, vec!["a", "m"]);
+
+    // The default (PointsAndRanges) still surfaces them at covered positions.
+    let mut it = db.iter().unwrap();
+    it.seek_ge(b"m").unwrap();
+    assert_eq!(it.range_keys().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn iter_key_type_ranges_only_walks_spans() {
+    use pebbledb::{IterKeyType, IterOptions};
+    let dir = temp_dir("keytype-ranges");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // Points are ignored entirely in RangesOnly mode.
+    db.set(b"a", b"1").unwrap();
+    db.set(b"c", b"2").unwrap();
+    db.set(b"q", b"3").unwrap();
+    // Two abutting range keys with the same key set defragment into one span [b, k);
+    // a separate span [p, t).
+    db.range_key_set(b"b", b"f", b"@1", b"x").unwrap();
+    db.range_key_set(b"f", b"k", b"@1", b"x").unwrap();
+    db.range_key_set(b"p", b"t", b"@2", b"y").unwrap();
+
+    let ranges_only = || {
+        db.iter_with_options(IterOptions {
+            key_type: IterKeyType::RangesOnly,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+
+    // Forward: the defragmented span starts, no point keys.
+    let mut it = ranges_only();
+    it.first().unwrap();
+    let mut starts = Vec::new();
+    while it.valid() {
+        starts.push(String::from_utf8_lossy(it.key()).into_owned());
+        it.next().unwrap();
+    }
+    assert_eq!(starts, vec!["b", "p"]);
+
+    // The active range keys are surfaced at each span start.
+    let mut it = ranges_only();
+    it.first().unwrap();
+    let eff = it.coalesced_range_keys();
+    assert_eq!(eff.len(), 1);
+    assert_eq!(eff[0].suffix, b"@1");
+    assert_eq!(eff[0].value, b"x");
+
+    // Reverse iteration yields the spans in the opposite order.
+    let mut it = ranges_only();
+    it.last().unwrap();
+    let mut rev = Vec::new();
+    while it.valid() {
+        rev.push(String::from_utf8_lossy(it.key()).into_owned());
+        it.prev().unwrap();
+    }
+    assert_eq!(rev, vec!["p", "b"]);
+
+    // seek_ge lands on the span covering or following the target.
+    let mut it = ranges_only();
+    it.seek_ge(b"g").unwrap(); // inside [b, k)
+    assert_eq!(it.key(), b"b");
+    it.seek_ge(b"l").unwrap(); // between spans → next is [p, t)
+    assert_eq!(it.key(), b"p");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn metrics_fields_and_begin_events() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

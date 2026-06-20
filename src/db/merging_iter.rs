@@ -282,9 +282,30 @@ impl MergingIter {
     }
 }
 
+/// Which kinds of keys an iterator surfaces (Pebble's `IterKeyType`).
+///
+/// Note: Pebble's default is [`PointsOnly`](IterKeyType::PointsOnly); pebbledb defaults to
+/// [`PointsAndRanges`](IterKeyType::PointsAndRanges) so that `range_keys()` is populated on a
+/// plain `db.iter()` without opting in. Set `key_type` explicitly for Pebble-exact behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IterKeyType {
+    /// Only point keys are produced; range keys are not surfaced (range-key *masking* and
+    /// range-*deletion* shadowing still apply — those affect point visibility, not surfacing).
+    PointsOnly,
+    /// Only range keys are produced: iteration walks the defragmented range-key spans, and
+    /// `key()` is each span's start bound. Point keys are skipped.
+    RangesOnly,
+    /// Both point keys and range keys: point-key positions with their covering range keys
+    /// surfaced via [`DbIterator::range_keys`].
+    #[default]
+    PointsAndRanges,
+}
+
 /// Bounds and key-type selection for a [`DbIterator`].
 #[derive(Clone, Default)]
 pub struct IterOptions {
+    /// Which key kinds to surface (points, ranges, or both). See [`IterKeyType`].
+    pub key_type: IterKeyType,
     /// Inclusive lower bound on user keys; keys below it are not produced.
     pub lower_bound: Option<Vec<u8>>,
     /// Exclusive upper bound on user keys; keys at or above it are not produced.
@@ -336,6 +357,13 @@ pub struct DbIterator {
     mask_suffix: Option<Vec<u8>>,
     /// When set, iteration is restricted to keys having this prefix.
     prefix: Option<Vec<u8>>,
+    /// Which key kinds this iterator surfaces.
+    key_type: IterKeyType,
+    /// Defragmented range-key spans `(start, end)` used by [`IterKeyType::RangesOnly`]
+    /// iteration; empty in the other modes.
+    fragments: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Current index into `fragments` for `RangesOnly` iteration.
+    frag_idx: usize,
 }
 
 impl DbIterator {
@@ -349,7 +377,7 @@ impl DbIterator {
         opts: IterOptions,
     ) -> Result<DbIterator> {
         let merge = MergingIter::new(sources, cmp.clone())?;
-        Ok(DbIterator {
+        let mut it = DbIterator {
             merge,
             snapshot,
             cmp,
@@ -364,7 +392,61 @@ impl DbIterator {
             upper_bound: opts.upper_bound,
             mask_suffix: opts.range_key_masking_suffix,
             prefix: None,
-        })
+            key_type: opts.key_type,
+            fragments: Vec::new(),
+            frag_idx: 0,
+        };
+        if it.key_type == IterKeyType::RangesOnly {
+            it.fragments = it.compute_fragments();
+        }
+        Ok(it)
+    }
+
+    /// Builds the defragmented range-key spans for [`IterKeyType::RangesOnly`] iteration:
+    /// fragments the visible range keys at every start/end boundary, drops sub-intervals with
+    /// no effective range key, then coalesces adjacent intervals that carry the identical set
+    /// of `(suffix, value)` pairs into one span. The result is sorted by start key.
+    fn compute_fragments(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use std::cmp::Ordering;
+        let visible: Vec<&crate::base::range_key::RangeKeyEntry> = self
+            .range_keys
+            .iter()
+            .filter(|e| e.seqnum <= self.snapshot)
+            .collect();
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        // Distinct boundary keys, sorted.
+        let mut bounds: Vec<Vec<u8>> = Vec::new();
+        for e in &visible {
+            bounds.push(e.start.clone());
+            if let Ok(end) = e.end() {
+                bounds.push(end);
+            }
+        }
+        bounds.sort_by(|a, b| self.cmp.compare(a, b));
+        bounds.dedup();
+
+        // One candidate fragment per [bound[i], bound[i+1]) that has an effective key set.
+        let mut frags: Vec<(Vec<u8>, Vec<u8>, Vec<crate::base::range_key::SuffixValue>)> =
+            Vec::new();
+        for w in bounds.windows(2) {
+            let (lo, hi) = (&w[0], &w[1]);
+            let coalesced = self.coalesce(self.covering_range_keys(lo));
+            if coalesced.is_empty() {
+                continue;
+            }
+            // Coalesce with the previous fragment if it abuts and carries the same key set.
+            if let Some(last) = frags.last_mut()
+                && self.cmp.compare(&last.1, lo) == Ordering::Equal
+                && last.2 == coalesced
+            {
+                last.1 = hi.clone();
+            } else {
+                frags.push((lo.clone(), hi.clone(), coalesced));
+            }
+        }
+        frags.into_iter().map(|(s, e, _)| (s, e)).collect()
     }
 
     /// The range-key entries covering the current position, newest first, visible at the
@@ -372,7 +454,7 @@ impl DbIterator {
     /// cover it. (Surfacing range keys alongside points; full `RANGEKEYSET`/`UNSET`/`DEL`
     /// coalescing and masking is layered on top of these raw entries.)
     pub fn range_keys(&self) -> Vec<crate::base::range_key::RangeKeyEntry> {
-        if !self.valid {
+        if !self.valid || self.key_type == IterKeyType::PointsOnly {
             return Vec::new();
         }
         self.covering_range_keys(&self.cur_key)
@@ -395,7 +477,7 @@ impl DbIterator {
     /// suffix and a `RANGEKEYDEL` removes everything older. (Pebble's range-key
     /// coalescing, on top of the raw entries from [`DbIterator::range_keys`].)
     pub fn coalesced_range_keys(&self) -> Vec<crate::base::range_key::SuffixValue> {
-        if !self.valid {
+        if !self.valid || self.key_type == IterKeyType::PointsOnly {
             return Vec::new();
         }
         self.coalesce(self.covering_range_keys(&self.cur_key))
@@ -540,6 +622,10 @@ impl DbIterator {
     /// Positions at the first visible key (honoring the lower bound).
     pub fn first(&mut self) -> Result<()> {
         self.prefix = None;
+        if self.key_type == IterKeyType::RangesOnly {
+            self.frag_seek_forward(0);
+            return Ok(());
+        }
         match &self.lower_bound {
             Some(lb) => {
                 let target = self.key_with_max_trailer(&lb.clone());
@@ -554,6 +640,10 @@ impl DbIterator {
     /// Positions at the last visible key (honoring the upper bound).
     pub fn last(&mut self) -> Result<()> {
         self.prefix = None;
+        if self.key_type == IterKeyType::RangesOnly {
+            self.frag_seek_reverse(self.fragments.len() as isize - 1);
+            return Ok(());
+        }
         match &self.upper_bound {
             Some(ub) => {
                 let target = self.key_with_max_trailer(&ub.clone());
@@ -568,6 +658,16 @@ impl DbIterator {
     /// Positions at the first visible key `>= target` (clamped to the lower bound).
     pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
         self.prefix = None;
+        if self.key_type == IterKeyType::RangesOnly {
+            // The first fragment that covers or follows `target` (its end is past `target`).
+            let i = self
+                .fragments
+                .iter()
+                .position(|(_, e)| self.cmp.compare(e, target) == std::cmp::Ordering::Greater)
+                .unwrap_or(self.fragments.len());
+            self.frag_seek_forward(i);
+            return Ok(());
+        }
         let key = if self.below_lower(target) {
             self.lower_bound.clone().unwrap()
         } else {
@@ -582,6 +682,17 @@ impl DbIterator {
     /// Positions at the last visible key `< target` (clamped to the upper bound).
     pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         self.prefix = None;
+        if self.key_type == IterKeyType::RangesOnly {
+            // The last fragment that starts strictly before `target`.
+            let i = self
+                .fragments
+                .iter()
+                .rposition(|(s, _)| self.cmp.compare(s, target) == std::cmp::Ordering::Less)
+                .map(|p| p as isize)
+                .unwrap_or(-1);
+            self.frag_seek_reverse(i);
+            return Ok(());
+        }
         let key = match &self.upper_bound {
             Some(ub) if self.cmp.compare(target, ub) == std::cmp::Ordering::Greater => ub.clone(),
             _ => target.to_vec(),
@@ -610,6 +721,10 @@ impl DbIterator {
         if !self.valid {
             return Ok(());
         }
+        if self.key_type == IterKeyType::RangesOnly {
+            self.frag_seek_forward(self.frag_idx + 1);
+            return Ok(());
+        }
         if self.dir == Dir::Reverse {
             // Reposition forward strictly past the current key, then collapse.
             let target = self.key_with_min_trailer(&self.cur_key.clone());
@@ -631,6 +746,10 @@ impl DbIterator {
     /// Steps back to the previous visible key.
     pub fn prev(&mut self) -> Result<()> {
         if !self.valid {
+            return Ok(());
+        }
+        if self.key_type == IterKeyType::RangesOnly {
+            self.frag_seek_reverse(self.frag_idx as isize - 1);
             return Ok(());
         }
         if self.dir == Dir::Forward {
@@ -775,5 +894,68 @@ impl DbIterator {
 
     fn prefix_ok(&self, ukey: &[u8]) -> bool {
         self.prefix.as_deref().is_none_or(|p| ukey.starts_with(p))
+    }
+
+    // --- RangesOnly fragment iteration --------------------------------------------------
+
+    /// Whether fragment `(s, e)` overlaps the iterator's key bounds (`end` is exclusive).
+    fn frag_in_bounds(&self, s: &[u8], e: &[u8]) -> bool {
+        use std::cmp::Ordering;
+        if let Some(lb) = &self.lower_bound
+            && self.cmp.compare(e, lb) != Ordering::Greater
+        {
+            return false; // span ends at or before the lower bound
+        }
+        if let Some(ub) = &self.upper_bound
+            && self.cmp.compare(s, ub) != Ordering::Less
+        {
+            return false; // span starts at or after the upper bound
+        }
+        true
+    }
+
+    /// The surfaced key for a fragment start: the start bound clamped up to the lower bound.
+    fn frag_key(&self, s: &[u8]) -> Vec<u8> {
+        match &self.lower_bound {
+            Some(lb) if self.cmp.compare(s, lb) == std::cmp::Ordering::Less => lb.clone(),
+            _ => s.to_vec(),
+        }
+    }
+
+    /// Positions at the first in-bounds fragment at index `>= from` (forward).
+    fn frag_seek_forward(&mut self, from: usize) {
+        let mut i = from;
+        while i < self.fragments.len() {
+            let (s, e) = (self.fragments[i].0.clone(), self.fragments[i].1.clone());
+            if self.frag_in_bounds(&s, &e) {
+                self.frag_idx = i;
+                self.cur_key = self.frag_key(&s);
+                self.cur_value = Vec::new();
+                self.valid = true;
+                self.dir = Dir::Forward;
+                return;
+            }
+            i += 1;
+        }
+        self.valid = false;
+    }
+
+    /// Positions at the last in-bounds fragment at index `<= from` (reverse).
+    fn frag_seek_reverse(&mut self, from: isize) {
+        let mut i = from;
+        while i >= 0 {
+            let idx = i as usize;
+            let (s, e) = (self.fragments[idx].0.clone(), self.fragments[idx].1.clone());
+            if self.frag_in_bounds(&s, &e) {
+                self.frag_idx = idx;
+                self.cur_key = self.frag_key(&s);
+                self.cur_value = Vec::new();
+                self.valid = true;
+                self.dir = Dir::Reverse;
+                return;
+            }
+            i -= 1;
+        }
+        self.valid = false;
     }
 }

@@ -26,7 +26,8 @@ lineage.
   including a **lazy `IndexedBatch::iter`** that layers pending writes over the committed view).
 - **Reads**: point `get`, snapshots (incl. an **EventuallyFileOnlySnapshot** scoped to key
   spans), a **bidirectional** iterator (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with
-  `IterOptions` bounds, `set_bounds`, `seek_prefix_ge`, range-key surfacing + coalescing,
+  `IterOptions` bounds, `set_bounds`, `seek_prefix_ge`, **key-type selection**
+  (`IterKeyType` points / ranges / both), range-key surfacing + coalescing,
   **range-key masking**, **block-property filters** that skip non-matching sstables, and
   `only_durable` (read only flushed data); `new_external_iter` reads sstables without
   ingesting them, and `scan_internal` exposes the raw internal keyspace.
