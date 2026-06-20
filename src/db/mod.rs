@@ -562,25 +562,43 @@ impl DbInner {
         if target <= *cur {
             return Ok(());
         }
-        let mut state = self.state.lock().unwrap();
-        if state.read_only {
+        if self.state.lock().unwrap().read_only {
             return Err(Error::InvalidState("db: opened read-only".into()));
         }
-        let options_num = state.vs.allocate_file_number();
-        let of = OptionsFile {
-            comparer_name: self.cmp.name().to_string(),
-            merger_name: self.merger.as_ref().map(|m| m.name().to_string()),
-            format_major_version: target,
-        };
-        {
-            let mut f = self
-                .fs
-                .create(&self.dir.join(filenames::options(options_num)))?;
-            f.write_all(of.encode().as_bytes())?;
-            f.sync_all()?;
+        // Ratchet one version at a time, running each version's migration and persisting a
+        // fresh OPTIONS file after each step, so an interrupted upgrade leaves the store at
+        // a well-defined intermediate version (Pebble's format-major-version migrations).
+        while *cur < target {
+            let next = FormatMajorVersion(cur.as_u32() + 1);
+            self.run_format_migration(next)?;
+            let options_num = self.state.lock().unwrap().vs.allocate_file_number();
+            let of = OptionsFile {
+                comparer_name: self.cmp.name().to_string(),
+                merger_name: self.merger.as_ref().map(|m| m.name().to_string()),
+                format_major_version: next,
+            };
+            {
+                let mut f = self
+                    .fs
+                    .create(&self.dir.join(filenames::options(options_num)))?;
+                f.write_all(of.encode().as_bytes())?;
+                f.sync_all()?;
+            }
+            self.fs.sync_dir(&self.dir)?;
+            *cur = next;
+            self.log(&format!(
+                "ratcheted format major version to {}",
+                next.as_u32()
+            ));
         }
-        self.fs.sync_dir(&self.dir)?;
-        *cur = target;
+        Ok(())
+    }
+
+    /// Runs the on-disk migration required to move *to* format major version `v`. Most
+    /// versions need no data migration in this engine (the formats are already supported);
+    /// the per-version hook exists so future versions that require rewriting on-disk state
+    /// have a defined place to do it.
+    fn run_format_migration(&self, _v: FormatMajorVersion) -> Result<()> {
         Ok(())
     }
 

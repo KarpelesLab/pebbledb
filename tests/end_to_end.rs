@@ -1184,6 +1184,37 @@ fn write_stall_engages_when_flush_falls_behind() {
 }
 
 #[test]
+fn format_ratchet_runs_stepwise_migrations() {
+    use pebbledb::{FormatMajorVersion, Logger};
+    use std::sync::Mutex;
+
+    struct CountLogger(Mutex<usize>);
+    impl Logger for CountLogger {
+        fn info(&self, msg: &str) {
+            if msg.contains("ratcheted format major version") {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    let dir = temp_dir("fmv-migrate");
+    let logger = Arc::new(CountLogger(Mutex::new(0)));
+    let opts = Options {
+        format_major_version: FormatMajorVersion::MOST_COMPATIBLE, // = 1
+        logger: Some(logger.clone()),
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    db.ratchet_format_major_version(FormatMajorVersion::VALUE_BLOCKS) // = 9
+        .unwrap();
+    assert_eq!(db.format_major_version(), FormatMajorVersion::VALUE_BLOCKS);
+    // One migration step per intermediate version (1 -> 9 == 8 steps).
+    assert_eq!(*logger.0.lock().unwrap(), 8);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
