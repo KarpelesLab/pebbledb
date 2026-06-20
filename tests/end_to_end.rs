@@ -1318,6 +1318,36 @@ fn ingest_and_excise_replaces_a_range() {
 }
 
 #[test]
+fn l0_compaction_threshold_is_configurable() {
+    // A high L0 threshold lets many L0 files accumulate without compaction (the default
+    // of 4 would have drained them), proving the tunable is wired through.
+    let dir = temp_dir("l0-threshold");
+    let opts = Options {
+        mem_table_size: 4 * 1024,
+        l0_compaction_threshold: 100,
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    for i in 0..400u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]).unwrap();
+        if i % 20 == 19 {
+            db.flush().unwrap(); // force an L0 file
+        }
+    }
+    let m = db.metrics();
+    assert!(
+        m.level_files[0] > 4,
+        "high L0 threshold should let L0 accumulate, got {:?}",
+        m.level_files
+    );
+    // Data is still correct.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(db.get(b"k00399").unwrap(), Some(vec![b'v'; 64]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

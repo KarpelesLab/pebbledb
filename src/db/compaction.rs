@@ -32,10 +32,6 @@ use crate::vfs::{Fs, WritableFile};
 use super::merging_iter::{InternalIter, MergingIter};
 use super::{DbInner, State, filenames};
 
-/// Number of L0 files that triggers an L0 -> L1 compaction.
-const L0_COMPACTION_THRESHOLD: usize = 4;
-/// Target size of an output sstable before it is split.
-const TARGET_FILE_SIZE: u64 = 2 << 20;
 /// Safety cap on compactions per `maybe_compact` call.
 const MAX_COMPACTIONS_PER_CALL: usize = 100;
 
@@ -145,9 +141,9 @@ impl DbInner {
     /// The compaction score of a level: how far over its trigger it is. A level with the
     /// highest score above 1.0 is the most in need of compaction. L0 is scored by file
     /// count; L1+ by total size against the level's byte budget.
-    fn level_score(version: &Version, level: usize) -> f64 {
+    fn level_score(&self, version: &Version, level: usize) -> f64 {
         if level == 0 {
-            version.levels[0].len() as f64 / L0_COMPACTION_THRESHOLD as f64
+            version.levels[0].len() as f64 / self.l0_compaction_threshold as f64
         } else {
             let total: u64 = version.levels[level].iter().map(|f| f.size).sum();
             total as f64 / level_budget(level) as f64
@@ -165,7 +161,7 @@ impl DbInner {
             if version.levels[level].is_empty() {
                 continue;
             }
-            let score = Self::level_score(version, level);
+            let score = self.level_score(version, level);
             if score >= best_score {
                 best_score = score;
                 best_level = Some(level);
@@ -306,7 +302,7 @@ impl DbInner {
             }
             let b = builder.as_mut().unwrap();
             b.add(&ikey, &value)?;
-            if b.writer.estimated_size() >= TARGET_FILE_SIZE {
+            if b.writer.estimated_size() >= self.target_file_size {
                 outputs.push(builder.take().unwrap().finish()?);
             }
         }

@@ -99,6 +99,11 @@ pub struct Options {
     /// until the background worker catches up (default 4). Bounds memory when writes
     /// outrun flushing. Minimum 1.
     pub mem_table_stop_writes_threshold: usize,
+    /// Number of L0 sstables that triggers an L0→L1 compaction (default 4).
+    pub l0_compaction_threshold: usize,
+    /// Target size in bytes of an output sstable before it is split during compaction
+    /// (default 2 MiB).
+    pub target_file_size: u64,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -191,6 +196,8 @@ impl Default for Options {
             logger: None,
             cleaner: Arc::new(DeleteCleaner),
             mem_table_stop_writes_threshold: 4,
+            l0_compaction_threshold: 4,
+            target_file_size: 2 << 20,
         }
     }
 }
@@ -261,6 +268,10 @@ pub struct DbInner {
     cleaner: Arc<dyn Cleaner>,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
+    /// L0 file count that triggers an L0→L1 compaction.
+    l0_compaction_threshold: usize,
+    /// Target output-sstable size before splitting during compaction.
+    target_file_size: u64,
 }
 
 impl DbInner {
@@ -439,6 +450,8 @@ impl DbInner {
                 logger: opts.logger.clone(),
                 cleaner: opts.cleaner.clone(),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
+                l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
+                target_file_size: opts.target_file_size.max(1),
             });
         }
 
@@ -539,6 +552,8 @@ impl DbInner {
             logger: opts.logger.clone(),
             cleaner: opts.cleaner.clone(),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
+            l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
+            target_file_size: opts.target_file_size.max(1),
         })
     }
 
