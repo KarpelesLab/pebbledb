@@ -129,11 +129,92 @@ impl DbInner {
 
     /// Picks and runs compactions until none are needed (or a safety cap is hit).
     pub(super) fn maybe_compact(&self, state: &mut State) -> Result<()> {
+        // Opportunistically drop whole files shadowed by a covering range tombstone before
+        // scoring levels — this is free (a MANIFEST edit) and shrinks the work below.
+        self.delete_only_compact(state)?;
         for _ in 0..MAX_COMPACTIONS_PER_CALL {
             match self.pick_compaction(&state.vs.current) {
                 Some(c) => self.run_compaction(state, c)?,
                 None => break,
             }
+        }
+        Ok(())
+    }
+
+    /// Delete-only compaction (Pebble): drop files that are entirely shadowed by a covering
+    /// range tombstone, via a MANIFEST edit alone — no rewrite. A file in a level strictly
+    /// deeper than a range tombstone qualifies when its whole key range lies within the
+    /// tombstone's `[start, end)` span and *every* version it holds predates the tombstone
+    /// (`largest_seqnum < tombstone.seqnum`), so the tombstone deletes all of it.
+    ///
+    /// Conservative: skipped entirely while any snapshot is open, since a snapshot at a
+    /// sequence number between the file's versions and the tombstone could still observe the
+    /// pre-deletion state.
+    fn delete_only_compact(&self, state: &mut State) -> Result<()> {
+        if !self.open_snapshots().is_empty() {
+            return Ok(());
+        }
+        let version = state.vs.current.clone();
+        // Every range tombstone in the LSM, tagged with the level it lives in.
+        let mut tombstones: Vec<(usize, Vec<u8>, Vec<u8>, u64)> = Vec::new();
+        for (level, files) in version.levels.iter().enumerate() {
+            for f in files {
+                let reader = self.open_reader(f.file_num)?;
+                for t in reader.range_tombstones() {
+                    tombstones.push((level, t.start.clone(), t.end.clone(), t.seqnum));
+                }
+            }
+        }
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        // Files in strictly deeper levels fully contained in a tombstone span and older than it.
+        let mut to_drop: Vec<(usize, u64)> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (tlevel, start, end, seq) in &tombstones {
+            for (dlevel, files) in version.levels.iter().enumerate().skip(tlevel + 1) {
+                for f in files {
+                    if f.largest_seqnum >= *seq || seen.contains(&f.file_num) {
+                        continue;
+                    }
+                    let fs = encoded_user_key(&f.smallest);
+                    let fl = encoded_user_key(&f.largest);
+                    // [fs, fl] ⊆ [start, end): start <= fs and fl < end.
+                    let contained = self.cmp.compare(start, fs) != std::cmp::Ordering::Greater
+                        && self.cmp.compare(fl, end) == std::cmp::Ordering::Less;
+                    if contained {
+                        to_drop.push((dlevel, f.file_num));
+                        seen.insert(f.file_num);
+                    }
+                }
+            }
+        }
+        if to_drop.is_empty() {
+            return Ok(());
+        }
+        let mut edit = VersionEdit {
+            next_file_number: Some(state.vs.next_file_number),
+            last_sequence: Some(state.vs.last_sequence),
+            ..Default::default()
+        };
+        for (level, file_num) in &to_drop {
+            edit.deleted_files.push((*level, *file_num));
+        }
+        state.vs.apply(&edit)?;
+        if let Some(mw) = state.manifest.as_mut() {
+            mw.write_record(&edit.encode())?;
+            mw.sync_all()?;
+        }
+        state.compaction_count += 1;
+        for (_, file_num) in &to_drop {
+            self.cache.lock().unwrap().remove(file_num);
+            self.clean_file(&self.dir.join(filenames::table(*file_num)));
+            if let Some(l) = &self.listener {
+                l.on_table_deleted(*file_num);
+            }
+            self.log(&format!(
+                "delete-only compaction dropped sstable {file_num}"
+            ));
         }
         Ok(())
     }

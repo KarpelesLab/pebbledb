@@ -652,6 +652,46 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn delete_only_compaction_drops_shadowed_files() {
+    let dir = temp_dir("delete-only");
+    let db = Db::open(&dir, Options::default()).unwrap();
+
+    // File A: 100 keys pushed to the bottom level (a single non-overlapping file → moves).
+    for i in 0..100u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    db.compact_range(None, None).unwrap();
+
+    // Exactly one sstable exists now — that's A. Capture its filename.
+    let ssts: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sst"))
+        .collect();
+    assert_eq!(ssts.len(), 1, "expected one sstable (A): {ssts:?}");
+    let a_name = ssts.into_iter().next().unwrap();
+    assert!(db.get(b"k050").unwrap().is_some());
+
+    // A covering range tombstone (newer than A) plus a survivor key outside the span. The
+    // flush runs maybe_compact, whose delete-only pass should drop A entirely.
+    db.set(b"zzz", b"v").unwrap();
+    db.delete_range(b"k000", b"k999").unwrap();
+    db.flush().unwrap();
+
+    // A's file is gone from disk (dropped, not rewritten); its keys read as deleted; the
+    // out-of-range survivor remains.
+    assert!(
+        !dir.join(&a_name).exists(),
+        "file A ({a_name}) should be dropped by delete-only compaction"
+    );
+    assert_eq!(db.get(b"k050").unwrap(), None);
+    assert_eq!(db.get(b"zzz").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn move_compaction_relevels_without_rewriting() {
     let dir = temp_dir("move-compact");
     let db = Db::open(&dir, Options::default()).unwrap();
