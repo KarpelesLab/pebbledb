@@ -54,6 +54,7 @@ pub mod db;
 mod error;
 pub mod manifest;
 pub mod memtable;
+pub mod objstorage;
 pub mod record;
 pub mod sstable;
 pub mod vfs;
