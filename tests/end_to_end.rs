@@ -1024,6 +1024,43 @@ fn scan_internal_exposes_all_versions_and_tombstones() {
 }
 
 #[test]
+fn iterator_set_bounds_reuses_iterator() {
+    let dir = temp_dir("set-bounds");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..100u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+
+    let collect_range = |it: &mut pebbledb::DbIterator| {
+        it.first().unwrap();
+        let mut ks = Vec::new();
+        while it.valid() {
+            ks.push(String::from_utf8_lossy(it.key()).into_owned());
+            it.next().unwrap();
+        }
+        ks
+    };
+
+    let mut it = db
+        .iter_with_options(IterOptions {
+            lower_bound: Some(b"k010".to_vec()),
+            upper_bound: Some(b"k020".to_vec()),
+        })
+        .unwrap();
+    let first = collect_range(&mut it);
+    assert_eq!(first.first().unwrap(), "k010");
+    assert_eq!(first.last().unwrap(), "k019");
+
+    // Re-bound the same iterator to a different window and re-scan.
+    it.set_bounds(Some(b"k050".to_vec()), Some(b"k053".to_vec()));
+    let second = collect_range(&mut it);
+    assert_eq!(second, vec!["k050", "k051", "k052"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

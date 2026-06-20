@@ -368,6 +368,17 @@ impl DbIterator {
         self.valid
     }
 
+    /// Replaces the iterator's key bounds (inclusive lower, exclusive upper). This
+    /// invalidates the current position (Pebble's `SetBounds` semantics): the caller must
+    /// re-seek with [`first`](Self::first) / [`last`](Self::last) / [`seek_ge`](Self::seek_ge)
+    /// before reading again. Reusing an iterator with new bounds avoids rebuilding the
+    /// underlying merge.
+    pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
+        self.lower_bound = lower;
+        self.upper_bound = upper;
+        self.valid = false;
+    }
+
     /// The current user key.
     pub fn key(&self) -> &[u8] {
         debug_assert!(self.valid);
