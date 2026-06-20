@@ -95,6 +95,10 @@ pub struct Options {
     /// How obsolete files are disposed of (default: delete). Use [`ArchiveCleaner`] to
     /// retain them.
     pub cleaner: Arc<dyn Cleaner>,
+    /// Maximum number of immutable memtables awaiting flush before writes stall (block)
+    /// until the background worker catches up (default 4). Bounds memory when writes
+    /// outrun flushing. Minimum 1.
+    pub mem_table_stop_writes_threshold: usize,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -106,6 +110,10 @@ pub trait EventListener: Send + Sync {
     fn on_flush_end(&self, _file_num: u64, _bytes: u64) {}
     /// Called when a compaction begins (with its output level and input-file count).
     fn on_compaction_begin(&self, _output_level: usize, _input_files: usize) {}
+    /// Called when writes begin to stall (the immutable-memtable limit was reached).
+    fn on_write_stall_begin(&self, _reason: &str) {}
+    /// Called when a write stall ends.
+    fn on_write_stall_end(&self) {}
     /// Called after a compaction completes.
     fn on_compaction_end(&self, _output_level: usize, _input_files: usize, _output_files: usize) {}
     /// Called when an sstable is created (by flush, compaction, or ingestion).
@@ -182,6 +190,7 @@ impl Default for Options {
             wal_failover_dir: None,
             logger: None,
             cleaner: Arc::new(DeleteCleaner),
+            mem_table_stop_writes_threshold: 4,
         }
     }
 }
@@ -250,6 +259,8 @@ pub struct DbInner {
     logger: Option<Arc<dyn Logger>>,
     /// How obsolete files are disposed of.
     cleaner: Arc<dyn Cleaner>,
+    /// Immutable-memtable count at which writes stall.
+    mem_stop_threshold: usize,
 }
 
 impl DbInner {
@@ -427,6 +438,7 @@ impl DbInner {
                 format_major_version: Mutex::new(format_major_version),
                 logger: opts.logger.clone(),
                 cleaner: opts.cleaner.clone(),
+                mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             });
         }
 
@@ -526,6 +538,7 @@ impl DbInner {
             format_major_version: Mutex::new(format_major_version),
             logger: opts.logger.clone(),
             cleaner: opts.cleaner.clone(),
+            mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
         })
     }
 
@@ -715,6 +728,23 @@ impl DbInner {
         let mut state = self.state.lock().unwrap();
         if state.read_only {
             return Err(Error::InvalidState("db: opened read-only".into()));
+        }
+
+        // Write stall: if too many immutable memtables are awaiting flush, block until the
+        // background worker drains the queue below the threshold. Bounds memory when writes
+        // outrun flushing.
+        let mut stalled = false;
+        while state.imm.len() >= self.mem_stop_threshold {
+            if !stalled {
+                stalled = true;
+                if let Some(l) = &self.listener {
+                    l.on_write_stall_begin("too many immutable memtables");
+                }
+            }
+            state = self.drained_cv.wait(state).unwrap();
+        }
+        if stalled && let Some(l) = &self.listener {
+            l.on_write_stall_end();
         }
 
         // Rotate once the memtable has used half its arena, leaving the rest as headroom

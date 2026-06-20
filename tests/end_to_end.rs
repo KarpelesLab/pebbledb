@@ -1140,6 +1140,50 @@ fn metrics_fields_and_begin_events() {
 }
 
 #[test]
+fn write_stall_engages_when_flush_falls_behind() {
+    use pebbledb::EventListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // A listener that slows down flushes and counts write-stall begins.
+    #[derive(Default)]
+    struct Slow {
+        stalls: AtomicUsize,
+    }
+    impl EventListener for Slow {
+        fn on_flush_begin(&self) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fn on_write_stall_begin(&self, _reason: &str) {
+            self.stalls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = temp_dir("write-stall");
+    let slow = Arc::new(Slow::default());
+    let opts = Options {
+        mem_table_size: 4 * 1024,           // rotate often
+        mem_table_stop_writes_threshold: 2, // stall after 2 immutables
+        event_listener: Some(slow.clone()),
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    // Write faster than the (deliberately slow) flush can drain.
+    for i in 0..2000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]).unwrap();
+    }
+    // Everything is still correct despite stalling.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(db.get(b"k01999").unwrap(), Some(vec![b'v'; 64]));
+    assert!(
+        slow.stalls.load(Ordering::SeqCst) >= 1,
+        "expected the write stall to engage at least once"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {
