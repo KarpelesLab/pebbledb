@@ -622,6 +622,7 @@ impl DbInner {
             edit.deleted_files.push((c.output_level, f.file_num));
         }
         let num_outputs = outputs.len();
+        let output_bytes: u64 = outputs.iter().map(|m| m.size).sum();
         for meta in outputs {
             edit.new_files.push(NewFileEntry {
                 level: c.output_level,
@@ -635,6 +636,7 @@ impl DbInner {
             mw.sync_all()?;
         }
         state.compaction_count += 1;
+        state.compaction_bytes += output_bytes;
         if let Some(l) = &self.listener {
             l.on_compaction_end(c.output_level, input_count, num_outputs);
         }

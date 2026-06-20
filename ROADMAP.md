@@ -153,8 +153,9 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   WAL/MANIFEST create-delete, format upgrade, background-error, and **disk-slow** routed from
   the health-checking vfs via `Options::disk_slow_threshold`; plus `Db::validate_sstables` to
   drive table validation.)
-- Further **`Metrics`** breadth (per-op latencies, amplification). (Have: core `Metrics`,
-  the LSM view, a `Logger`, the `Cleaner`, and memtable-count write stalls.)
+- Further **`Metrics`** breadth (per-op latencies). (Have: core `Metrics` incl. **read- and
+  write-amplification**, the LSM view, a `Logger`, the `Cleaner`, and memtable-count write
+  stalls.)
 
 ### Columnar (key schema)
 - Wire `colblk.DefaultKeySchema` (the schema a general Pebble KV store uses) into the

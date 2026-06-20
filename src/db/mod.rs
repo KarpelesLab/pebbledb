@@ -300,6 +300,10 @@ struct State {
     flush_count: u64,
     /// Number of compactions performed this session.
     compaction_count: u64,
+    /// Total bytes written by flushes this session (the denominator of write amplification).
+    flush_bytes: u64,
+    /// Total bytes written by compactions this session.
+    compaction_bytes: u64,
     /// Per-file count of "wasted" read seeks: reads that passed through the file (it
     /// overlapped the key by range but held no version of it) before finding the key in a
     /// deeper level. Drives read-triggered compaction.
@@ -624,6 +628,8 @@ impl DbInner {
                 shutdown: false,
                 flush_count: 0,
                 compaction_count: 0,
+                flush_bytes: 0,
+                compaction_bytes: 0,
                 read_miss: std::collections::HashMap::new(),
                 read_queue: Vec::new(),
             };
@@ -751,6 +757,8 @@ impl DbInner {
             shutdown: false,
             flush_count: 0,
             compaction_count: 0,
+            flush_bytes: 0,
+            compaction_bytes: 0,
             read_miss: std::collections::HashMap::new(),
             read_queue: Vec::new(),
         };
@@ -1200,6 +1208,7 @@ impl DbInner {
         state.imm.remove(0);
         let popped_wal = state.imm_wals.remove(0);
         state.flush_count += 1;
+        state.flush_bytes += flushed_bytes;
         if popped_wal != 0 {
             // The WAL may live in any configured directory (failover); clean from each.
             for dir in &self.wal_dirs {
@@ -1620,6 +1629,15 @@ impl DbInner {
         };
         let total_sstables = level_files.iter().sum();
         let total_sstable_bytes = level_bytes.iter().sum();
+        // Read amplification: every L0 file (they overlap) plus one per non-empty deeper level.
+        let read_amplification =
+            level_files[0] + level_files[1..].iter().filter(|&&n| n > 0).count();
+        // Write amplification: total bytes written / bytes flushed.
+        let write_amplification = if state.flush_bytes == 0 {
+            0.0
+        } else {
+            (state.flush_bytes + state.compaction_bytes) as f64 / state.flush_bytes as f64
+        };
         Metrics {
             level_files,
             level_bytes,
@@ -1634,6 +1652,8 @@ impl DbInner {
             mem_table_bytes: u64::from(state.mem.size()),
             open_snapshots: self.snapshots.lock().unwrap().len(),
             obsolete_files_pending: self.delete_queue.lock().unwrap().items.len(),
+            read_amplification,
+            write_amplification,
         }
     }
 
@@ -1955,6 +1975,13 @@ pub struct Metrics {
     /// Obsolete files queued for paced deletion but not yet deleted (0 unless deletion
     /// pacing is enabled).
     pub obsolete_files_pending: usize,
+    /// Worst-case number of sstables a point read may consult: every L0 file plus one per
+    /// non-empty deeper level (a read-amplification estimate).
+    pub read_amplification: usize,
+    /// Total bytes written across flushes and compactions divided by bytes flushed — the
+    /// write-amplification factor (`1.0` when nothing has been compacted; `0.0` before any
+    /// flush).
+    pub write_amplification: f64,
 }
 
 /// Creates an iterator over a set of sstables **without** ingesting them into a database,

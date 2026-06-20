@@ -2074,6 +2074,17 @@ fn metrics_fields_and_begin_events() {
     );
     assert!(m.total_sstable_bytes > 0);
     assert_eq!(m.open_snapshots, 0);
+    // Amplification metrics are populated after flushes + compactions.
+    assert!(
+        m.read_amplification >= 1,
+        "read-amp: {}",
+        m.read_amplification
+    );
+    assert!(
+        m.write_amplification >= 1.0,
+        "write-amp should be >= 1 after a compaction: {}",
+        m.write_amplification
+    );
     let _snap = db.snapshot();
     assert_eq!(db.metrics().open_snapshots, 1);
 
