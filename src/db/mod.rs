@@ -137,6 +137,11 @@ pub struct Options {
     /// Size budget in bytes of the base level (L1) before it is compacted downward; deeper
     /// levels grow 10x per level (Pebble's `LBaseMaxBytes`, default 10 MiB).
     pub l1_max_bytes: u64,
+    /// Rate in bytes/second at which obsolete files are deleted (Pebble's
+    /// `TargetByteDeletionRate`). When non-zero, deletions are handed to a background pacer
+    /// thread that spaces them out to avoid disk-I/O bursts; `0` (default) deletes inline and
+    /// immediately.
+    pub target_byte_deletion_rate: u64,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -249,8 +254,16 @@ impl Default for Options {
             tombstone_dense_compaction_threshold: 0.10,
             read_compaction_threshold: 1024,
             l1_max_bytes: 10 << 20,
+            target_byte_deletion_rate: 0,
         }
     }
+}
+
+/// Queue of obsolete files awaiting paced deletion, plus a shutdown flag for the pacer.
+#[derive(Default)]
+struct DeleteQueue {
+    items: Vec<(PathBuf, u64)>,
+    shutdown: bool,
 }
 
 /// Mutable database state guarded by a single mutex.
@@ -332,6 +345,12 @@ pub struct DbInner {
     read_compaction_threshold: u32,
     /// Base-level (L1) size budget in bytes; deeper levels grow 10x per level.
     l1_max_bytes: u64,
+    /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
+    target_byte_deletion_rate: u64,
+    /// Queue of obsolete files awaiting paced deletion (only used when the rate is non-zero).
+    delete_queue: Mutex<DeleteQueue>,
+    /// Signals the deletion pacer that work was queued (or shutdown requested).
+    delete_cv: Condvar,
     /// Immutable-memtable count at which writes stall.
     mem_stop_threshold: usize,
     /// L0 file count that triggers an L0→L1 compaction.
@@ -348,9 +367,58 @@ impl DbInner {
         }
     }
 
-    /// Disposes of the obsolete file at `path` via the configured [`Cleaner`].
+    /// Disposes of the obsolete file at `path` via the configured [`Cleaner`]. With deletion
+    /// pacing enabled (`target_byte_deletion_rate > 0`) the file is handed to the background
+    /// pacer thread instead of being cleaned inline.
     fn clean_file(&self, path: &Path) {
-        let _ = self.cleaner.clean(self.fs.as_ref(), path);
+        if self.target_byte_deletion_rate == 0 {
+            let _ = self.cleaner.clean(self.fs.as_ref(), path);
+            return;
+        }
+        let size = self.fs.size(path).unwrap_or(0);
+        self.delete_queue
+            .lock()
+            .unwrap()
+            .items
+            .push((path.to_path_buf(), size));
+        self.delete_cv.notify_one();
+    }
+
+    /// The background deletion pacer: cleans queued obsolete files, sleeping between them so
+    /// the byte-deletion rate stays under `target_byte_deletion_rate`. On shutdown it drains
+    /// whatever remains immediately (unpaced) so nothing is left dangling.
+    fn deleter_loop(&self) {
+        loop {
+            let (path, size) = {
+                let mut q = self.delete_queue.lock().unwrap();
+                while q.items.is_empty() && !q.shutdown {
+                    q = self.delete_cv.wait(q).unwrap();
+                }
+                if q.shutdown {
+                    // Drain everything immediately, then exit.
+                    let drained = std::mem::take(&mut q.items);
+                    drop(q);
+                    for (path, _) in drained {
+                        let _ = self.cleaner.clean(self.fs.as_ref(), &path);
+                    }
+                    return;
+                }
+                q.items.remove(0)
+            };
+            let _ = self.cleaner.clean(self.fs.as_ref(), &path);
+            // Pace the next deletion proportionally to the bytes just reclaimed, but wake
+            // immediately if shutdown is requested or more work arrives.
+            let secs = (size as f64 / self.target_byte_deletion_rate as f64).min(60.0);
+            if secs > 0.0 {
+                let q = self.delete_queue.lock().unwrap();
+                if !q.shutdown {
+                    let _ = self
+                        .delete_cv
+                        .wait_timeout(q, std::time::Duration::from_secs_f64(secs))
+                        .unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -361,6 +429,8 @@ impl DbInner {
 pub struct Db {
     inner: Arc<DbInner>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// The deletion-pacing thread, present only when `target_byte_deletion_rate > 0`.
+    deleter: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::ops::Deref for Db {
@@ -382,6 +452,15 @@ impl Drop for Db {
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+        // Stop the deletion pacer (it drains any queued files before exiting).
+        if let Some(h) = self.deleter.take() {
+            {
+                let mut q = self.inner.delete_queue.lock().unwrap();
+                q.shutdown = true;
+            }
+            self.inner.delete_cv.notify_all();
+            let _ = h.join();
+        }
     }
 }
 
@@ -390,13 +469,25 @@ impl Db {
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let inner = Arc::new(DbInner::open_inner(dir, opts)?);
         // Spawn the background flush/compaction worker for writable databases.
-        let worker = if inner.state.lock().unwrap().read_only {
+        let read_only = inner.state.lock().unwrap().read_only;
+        let worker = if read_only {
             None
         } else {
             let w = Arc::clone(&inner);
             Some(std::thread::spawn(move || w.background_loop()))
         };
-        Ok(Db { inner, worker })
+        // Spawn the deletion pacer only when pacing is enabled on a writable database.
+        let deleter = if !read_only && inner.target_byte_deletion_rate > 0 {
+            let d = Arc::clone(&inner);
+            Some(std::thread::spawn(move || d.deleter_loop()))
+        } else {
+            None
+        };
+        Ok(Db {
+            inner,
+            worker,
+            deleter,
+        })
     }
 
     /// Opens the database in `dir` read-only.
@@ -539,6 +630,9 @@ impl DbInner {
                 tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
                 read_compaction_threshold: opts.read_compaction_threshold,
                 l1_max_bytes: opts.l1_max_bytes.max(1),
+                target_byte_deletion_rate: opts.target_byte_deletion_rate,
+                delete_queue: Mutex::new(DeleteQueue::default()),
+                delete_cv: Condvar::new(),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
@@ -663,6 +757,9 @@ impl DbInner {
             tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
             read_compaction_threshold: opts.read_compaction_threshold,
             l1_max_bytes: opts.l1_max_bytes.max(1),
+            target_byte_deletion_rate: opts.target_byte_deletion_rate,
+            delete_queue: Mutex::new(DeleteQueue::default()),
+            delete_cv: Condvar::new(),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
@@ -1508,6 +1605,7 @@ impl DbInner {
             imm_count: state.imm.len(),
             mem_table_bytes: u64::from(state.mem.size()),
             open_snapshots: self.snapshots.lock().unwrap().len(),
+            obsolete_files_pending: self.delete_queue.lock().unwrap().items.len(),
         }
     }
 
@@ -1779,6 +1877,9 @@ pub struct Metrics {
     pub mem_table_bytes: u64,
     /// Number of currently-open snapshots.
     pub open_snapshots: usize,
+    /// Obsolete files queued for paced deletion but not yet deleted (0 unless deletion
+    /// pacing is enabled).
+    pub obsolete_files_pending: usize,
 }
 
 /// Creates an iterator over a set of sstables **without** ingesting them into a database,

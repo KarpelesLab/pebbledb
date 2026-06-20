@@ -1143,6 +1143,44 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn deletion_pacing_defers_obsolete_file_removal() {
+    let dir = temp_dir("delete-pacing");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 16 * 1024,
+            // 1 byte/sec: after the pacer deletes one file it sleeps for ~its size in seconds,
+            // so the rest of a compaction's obsolete inputs stay queued.
+            target_byte_deletion_rate: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..2000u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]).unwrap();
+    }
+    db.flush().unwrap();
+    // A full compaction obsoletes many input files, which are handed to the pacer.
+    db.compact_range(None, None).unwrap();
+
+    let m = db.metrics();
+    assert!(
+        m.obsolete_files_pending > 0,
+        "paced deletions should leave obsolete files queued, got {}",
+        m.obsolete_files_pending
+    );
+    // Reads are unaffected — they use the live version, not the obsolete inputs.
+    assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(db.get(b"k01999").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(collect(&db).len(), 2000);
+
+    // Dropping the database drains the queue (the pacer cleans the rest before exiting).
+    drop(db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn multilevel_compaction_folds_three_levels() {
     use pebbledb::Logger;
     use std::sync::Mutex;
