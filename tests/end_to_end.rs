@@ -952,6 +952,36 @@ fn single_delete_delete_sized_and_log_data() {
 }
 
 #[test]
+fn iterator_surfaces_range_keys_at_position() {
+    let dir = temp_dir("iter-rangekeys");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.set(b"a", b"1").unwrap();
+    db.set(b"m", b"2").unwrap();
+    db.set(b"z", b"3").unwrap();
+    // A range key covering [b, p) at suffix "@t".
+    db.range_key_set(b"b", b"p", b"@t", b"rkval").unwrap();
+
+    let mut it = db.iter().unwrap();
+    it.first().unwrap();
+    while it.valid() {
+        let rks = it.range_keys();
+        match it.key() {
+            b"a" => assert!(rks.is_empty(), "a is before the range key"),
+            b"m" => {
+                assert_eq!(rks.len(), 1, "m is covered by the range key");
+                assert_eq!(rks[0].start, b"b");
+                assert_eq!(rks[0].end().unwrap(), b"p");
+            }
+            b"z" => assert!(rks.is_empty(), "z is after the range key"),
+            other => panic!("unexpected key {other:?}"),
+        }
+        it.next().unwrap();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_only_open_after_writes() {
     let dir = temp_dir("readonly");
     {

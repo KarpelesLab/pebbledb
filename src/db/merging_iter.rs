@@ -306,6 +306,9 @@ pub struct DbIterator {
     dir: Dir,
     /// All range tombstones visible at the snapshot, across every source.
     range_tombstones: Vec<RangeTombstone>,
+    /// All range-key entries visible at the snapshot, across every source. Surfaced at the
+    /// current position via [`DbIterator::range_keys`].
+    range_keys: Vec<crate::base::range_key::RangeKeyEntry>,
     /// Optional merge operator used to resolve merge operands.
     merger: Option<Arc<dyn crate::base::merge::Merger>>,
     lower_bound: Option<Vec<u8>>,
@@ -320,6 +323,7 @@ impl DbIterator {
         snapshot: SeqNum,
         cmp: Arc<dyn Comparer>,
         range_tombstones: Vec<RangeTombstone>,
+        range_keys: Vec<crate::base::range_key::RangeKeyEntry>,
         merger: Option<Arc<dyn crate::base::merge::Merger>>,
         opts: IterOptions,
     ) -> Result<DbIterator> {
@@ -330,6 +334,7 @@ impl DbIterator {
             cmp,
             merger,
             range_tombstones,
+            range_keys,
             cur_key: Vec::new(),
             cur_value: Vec::new(),
             valid: false,
@@ -338,6 +343,24 @@ impl DbIterator {
             upper_bound: opts.upper_bound,
             prefix: None,
         })
+    }
+
+    /// The range-key entries covering the current position, newest first, visible at the
+    /// iterator's snapshot. Empty when not positioned at a valid key or when no range keys
+    /// cover it. (Surfacing range keys alongside points; full `RANGEKEYSET`/`UNSET`/`DEL`
+    /// coalescing and masking is layered on top of these raw entries.)
+    pub fn range_keys(&self) -> Vec<crate::base::range_key::RangeKeyEntry> {
+        if !self.valid {
+            return Vec::new();
+        }
+        self.range_keys
+            .iter()
+            .filter(|e| {
+                e.seqnum <= self.snapshot
+                    && e.covers(self.cmp.as_ref(), &self.cur_key).unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Whether the iterator is positioned at a valid key.

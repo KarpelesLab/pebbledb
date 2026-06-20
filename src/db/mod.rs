@@ -1047,15 +1047,18 @@ impl DbInner {
 
         let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
         let mut tombstones = mem.range_tombstones();
+        let mut range_keys = mem.range_keys();
         sources.push(Box::new(mem.scan()));
         for m in imm.iter().rev() {
             tombstones.extend(m.range_tombstones());
+            range_keys.extend(m.range_keys());
             sources.push(Box::new(m.scan()));
         }
         for level in version.levels.iter() {
             for f in level {
                 let reader = self.open_reader(f.file_num)?;
                 tombstones.extend_from_slice(reader.range_tombstones());
+                range_keys.extend_from_slice(reader.range_keys());
                 sources.push(Box::new(reader.iter()?));
             }
         }
@@ -1064,6 +1067,7 @@ impl DbInner {
             snapshot,
             self.cmp.clone(),
             tombstones,
+            range_keys,
             self.merger.clone(),
             opts,
         )
@@ -1247,10 +1251,12 @@ pub fn new_external_iter(opts: &Options, paths: &[impl AsRef<Path>]) -> Result<D
     let cmp = opts.comparer.clone();
     let mut sources: Vec<Box<dyn InternalIter>> = Vec::new();
     let mut tombstones = Vec::new();
+    let mut range_keys = Vec::new();
     for path in paths {
         let bytes = opts.fs.read(path.as_ref())?;
         let reader = Arc::new(Reader::open(bytes, cmp.clone())?);
         tombstones.extend_from_slice(reader.range_tombstones());
+        range_keys.extend_from_slice(reader.range_keys());
         sources.push(Box::new(reader.iter()?));
     }
     DbIterator::with_options(
@@ -1258,6 +1264,7 @@ pub fn new_external_iter(opts: &Options, paths: &[impl AsRef<Path>]) -> Result<D
         SeqNum::MAX,
         cmp,
         tombstones,
+        range_keys,
         opts.merger.clone(),
         IterOptions::default(),
     )
