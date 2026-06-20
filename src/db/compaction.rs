@@ -192,6 +192,13 @@ impl DbInner {
 
     /// Executes a compaction: merges the inputs, writes outputs, and records the edit.
     fn run_compaction(&self, state: &mut State, c: Compaction) -> Result<()> {
+        // Move compaction: a single input file that does not overlap any file in the output
+        // level can be relevelled by a MANIFEST edit alone — no rewrite. (Pebble's move
+        // compaction.) The file's sstable content is independent of its level, so its keys,
+        // tombstones, and range keys are all carried correctly by the move.
+        if c.inputs.len() == 1 && c.overlap.is_empty() {
+            return self.run_move_compaction(state, c);
+        }
         if let Some(l) = &self.listener {
             l.on_compaction_begin(c.output_level, c.inputs.len() + c.overlap.len());
         }
@@ -364,6 +371,43 @@ impl DbInner {
             if let Some(l) = &self.listener {
                 l.on_table_deleted(*file_num);
             }
+        }
+        Ok(())
+    }
+
+    /// Relevels a single non-overlapping file from `c.level` to `c.output_level` via a
+    /// MANIFEST edit, without rewriting it (Pebble's move compaction). The file keeps its
+    /// number and stays in place on disk; only its level changes.
+    fn run_move_compaction(&self, state: &mut State, c: Compaction) -> Result<()> {
+        if let Some(l) = &self.listener {
+            l.on_compaction_begin(c.output_level, c.inputs.len());
+        }
+        let meta = c.inputs[0].as_ref().clone();
+        let file_num = meta.file_num;
+        let mut edit = VersionEdit {
+            next_file_number: Some(state.vs.next_file_number),
+            last_sequence: Some(state.vs.last_sequence),
+            ..Default::default()
+        };
+        edit.deleted_files.push((c.level, file_num));
+        edit.new_files.push(NewFileEntry {
+            level: c.output_level,
+            meta,
+        });
+
+        state.vs.apply(&edit)?;
+        if let Some(mw) = state.manifest.as_mut() {
+            mw.write_record(&edit.encode())?;
+            mw.sync_all()?;
+        }
+        state.compaction_count += 1;
+        // No file is removed from disk: the moved sstable is reused at its new level.
+        self.log(&format!(
+            "moved sstable {file_num} from L{} to L{}",
+            c.level, c.output_level
+        ));
+        if let Some(l) = &self.listener {
+            l.on_compaction_end(c.output_level, c.inputs.len(), 1);
         }
         Ok(())
     }

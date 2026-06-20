@@ -652,6 +652,50 @@ fn range_key_masking_hides_older_point_versions() {
 }
 
 #[test]
+fn move_compaction_relevels_without_rewriting() {
+    let dir = temp_dir("move-compact");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..50u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+
+    let sst_names = |dir: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sst"))
+            .collect();
+        v.sort();
+        v
+    };
+    let before = sst_names(&dir);
+    assert_eq!(before.len(), 1, "one L0 sstable expected: {before:?}");
+
+    // Compact down: with a single non-overlapping file, each level step is a move, so the
+    // very same sstable file (same number/name) is reused at its new level — not rewritten.
+    db.compact_range(None, None).unwrap();
+    let after = sst_names(&dir);
+    assert_eq!(
+        after, before,
+        "move must preserve the sstable file: {before:?} -> {after:?}"
+    );
+
+    // Data survives the moves, and now lives below L0.
+    assert_eq!(db.get(b"k025").unwrap(), Some(b"v".to_vec()));
+    let m = db.metrics();
+    assert_eq!(
+        m.level_files[0], 0,
+        "L0 should be empty after move: {:?}",
+        m.level_files
+    );
+    assert_eq!(m.level_files[1..].iter().sum::<usize>(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn only_durable_iterator_excludes_memtable() {
     let dir = temp_dir("durable");
     let db = Db::open(&dir, Options::default()).unwrap();
