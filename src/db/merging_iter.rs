@@ -375,7 +375,7 @@ impl DbIterator {
 
         // Covering entries, newest sequence number first.
         let mut covering = self.range_keys();
-        covering.sort_by(|a, b| b.seqnum.cmp(&a.seqnum));
+        covering.sort_by_key(|e| std::cmp::Reverse(e.seqnum));
 
         let mut decided: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         let mut set: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
