@@ -642,6 +642,156 @@ impl<'a> DataBlockReader<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Schema-driven columnar data block
+//
+// Like `DataBlockBuilder`, but the user-key column is replaced by however many key columns
+// the pluggable `KeySchema` defines (for `DefaultKeySchema`: a PrefixBytes prefix column +
+// a Bytes suffix column). After the schema's key columns come the trailer (uint) and value
+// (raw bytes) columns, exactly as in the plain data block. This is the columnar key-schema
+// encoding path; cross-implementation byte parity with upstream Pebble is a CI concern (see
+// `crate::sstable::keyschema`).
+// ---------------------------------------------------------------------------
+
+use super::keyschema::KeySchema;
+
+/// Builds a columnar data block whose key columns are defined by a [`KeySchema`].
+///
+/// Rows are added as `(user_key, trailer, value)`; on [`finish`](SchemaDataBlockBuilder::finish)
+/// the user keys are handed to the schema, which lays them out across its key columns, after
+/// which the trailer and value columns follow.
+pub struct SchemaDataBlockBuilder<'s> {
+    schema: &'s dyn KeySchema,
+    user_keys: Vec<Vec<u8>>,
+    trailers: Vec<u64>,
+    values: Vec<Vec<u8>>,
+}
+
+impl<'s> SchemaDataBlockBuilder<'s> {
+    /// Creates an empty builder bound to `schema`.
+    pub fn new(schema: &'s dyn KeySchema) -> SchemaDataBlockBuilder<'s> {
+        SchemaDataBlockBuilder {
+            schema,
+            user_keys: Vec::new(),
+            trailers: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+
+    /// Appends one row: the user key, the internal-key trailer, and the value.
+    pub fn add(&mut self, user_key: &[u8], trailer: u64, value: &[u8]) {
+        self.user_keys.push(user_key.to_vec());
+        self.trailers.push(trailer);
+        self.values.push(value.to_vec());
+    }
+
+    /// Number of rows added so far.
+    pub fn rows(&self) -> usize {
+        self.trailers.len()
+    }
+
+    /// Serializes the block: a header, the schema's key columns, the trailer and value
+    /// columns, and the trailing padding byte.
+    pub fn finish(&self) -> Vec<u8> {
+        let rows = self.trailers.len();
+        let key_cols = self.schema.columns();
+        let num_columns = key_cols.len() + 2; // + trailer + value
+
+        let mut buf = Vec::new();
+        buf.push(DATA_BLOCK_VERSION);
+        buf.extend_from_slice(&(num_columns as u16).to_le_bytes());
+        buf.extend_from_slice(&(rows as u32).to_le_bytes());
+        let headers_at = buf.len();
+        buf.resize(headers_at + num_columns * COLUMN_HEADER_LEN, 0);
+
+        // Key columns, via the schema.
+        let key_refs: Vec<&[u8]> = self.user_keys.iter().map(|k| k.as_slice()).collect();
+        let key_col_offsets = self.schema.encode_keys(&key_refs, &mut buf);
+        debug_assert_eq!(key_col_offsets.len(), key_cols.len());
+
+        // Trailer and value columns.
+        let trailer_off = buf.len();
+        encode_uint_column(&self.trailers, trailer_off, &mut buf);
+        let value_off = buf.len();
+        let val_refs: Vec<&[u8]> = self.values.iter().map(|v| v.as_slice()).collect();
+        encode_raw_bytes(&val_refs, value_off, &mut buf);
+
+        buf.push(0); // trailing padding byte
+
+        // Backfill the column headers: schema key columns, then trailer, then value.
+        let mut write_header = |i: usize, data_type: DataType, off: usize| {
+            let h = headers_at + i * COLUMN_HEADER_LEN;
+            buf[h] = match data_type {
+                DataType::Invalid => 0,
+                DataType::Bool => 1,
+                DataType::Uint => 2,
+                DataType::Bytes => 3,
+                DataType::PrefixBytes => 4,
+            };
+            buf[h + 1..h + 5].copy_from_slice(&(off as u32).to_le_bytes());
+        };
+        for (i, (col, &off)) in key_cols.iter().zip(key_col_offsets.iter()).enumerate() {
+            write_header(i, col.data_type, off);
+        }
+        write_header(key_cols.len(), DataType::Uint, trailer_off);
+        write_header(key_cols.len() + 1, DataType::Bytes, value_off);
+        buf
+    }
+}
+
+/// Reads a schema-driven columnar data block produced by [`SchemaDataBlockBuilder`].
+pub struct SchemaDataBlockReader<'a, 's> {
+    block: &'a [u8],
+    schema: &'s dyn KeySchema,
+    header: BlockHeader,
+}
+
+impl<'a, 's> SchemaDataBlockReader<'a, 's> {
+    /// Parses the block header and validates the column count against the schema.
+    pub fn new(
+        block: &'a [u8],
+        schema: &'s dyn KeySchema,
+    ) -> Result<SchemaDataBlockReader<'a, 's>> {
+        let header = BlockHeader::parse(block)?;
+        let expected = schema.columns().len() + 2;
+        if header.columns.len() != expected {
+            return Err(Error::corruption(
+                "colblk: unexpected schema data-block column count",
+            ));
+        }
+        Ok(SchemaDataBlockReader {
+            block,
+            schema,
+            header,
+        })
+    }
+
+    /// The number of rows in the block.
+    pub fn rows(&self) -> usize {
+        self.header.rows as usize
+    }
+
+    /// Decodes all rows as `(user_key, trailer, value)`.
+    pub fn decode_all(&self) -> Result<Vec<DataBlockRow>> {
+        let rows = self.rows();
+        let num_key_cols = self.schema.columns().len();
+        let key_offsets: Vec<usize> = self.header.columns[..num_key_cols]
+            .iter()
+            .map(|c| c.page_offset as usize)
+            .collect();
+        let trailer_off = self.header.columns[num_key_cols].page_offset as usize;
+        let value_off = self.header.columns[num_key_cols + 1].page_offset as usize;
+
+        let keys = self.schema.decode_keys(self.block, &key_offsets, rows)?;
+        let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
+        let (values, _) = decode_raw_bytes(self.block, value_off, rows)?;
+
+        Ok((0..rows)
+            .map(|i| (keys[i].clone(), trailers[i], values[i].to_vec()))
+            .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Columnar index block
 //
 // Maps each data block's separator key to its block handle. Columns: separator key (raw
