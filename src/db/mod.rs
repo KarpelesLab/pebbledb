@@ -146,6 +146,11 @@ pub struct Options {
     /// taking at least this long to [`EventListener::on_disk_slow`]. `None` (default) leaves
     /// the filesystem unwrapped.
     pub disk_slow_threshold: Option<std::time::Duration>,
+    /// Enables **value separation** in sstables written by flush and compaction: point values
+    /// at least this many bytes are stored out-of-line in the table's value blocks rather than
+    /// inline in data blocks (Pebble's value blocks). `None` (default) keeps all values inline.
+    /// Enabling it writes tables in a value-block-capable format (Pebble v3).
+    pub value_block_threshold: Option<usize>,
 }
 
 /// A listener notified of background-style events (flushes and compactions). All methods
@@ -267,6 +272,7 @@ impl Default for Options {
             l1_max_bytes: 10 << 20,
             target_byte_deletion_rate: 0,
             disk_slow_threshold: None,
+            value_block_threshold: None,
         }
     }
 }
@@ -361,6 +367,8 @@ pub struct DbInner {
     read_compaction_threshold: u32,
     /// Base-level (L1) size budget in bytes; deeper levels grow 10x per level.
     l1_max_bytes: u64,
+    /// Minimum value size for out-of-line value-block storage; `None` keeps values inline.
+    value_block_threshold: Option<usize>,
     /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
     target_byte_deletion_rate: u64,
     /// Queue of obsolete files awaiting paced deletion (only used when the rate is non-zero).
@@ -664,6 +672,7 @@ impl DbInner {
                 tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
                 read_compaction_threshold: opts.read_compaction_threshold,
                 l1_max_bytes: opts.l1_max_bytes.max(1),
+                value_block_threshold: opts.value_block_threshold,
                 target_byte_deletion_rate: opts.target_byte_deletion_rate,
                 delete_queue: Mutex::new(DeleteQueue::default()),
                 delete_cv: Condvar::new(),
@@ -707,6 +716,7 @@ impl DbInner {
                 &mem,
                 &opts.block_property_collectors,
                 opts.target_file_size,
+                opts.value_block_threshold,
             )?;
             let edit = VersionEdit {
                 next_file_number: Some(vs.next_file_number),
@@ -793,6 +803,7 @@ impl DbInner {
             tombstone_dense_compaction_threshold: opts.tombstone_dense_compaction_threshold,
             read_compaction_threshold: opts.read_compaction_threshold,
             l1_max_bytes: opts.l1_max_bytes.max(1),
+            value_block_threshold: opts.value_block_threshold,
             target_byte_deletion_rate: opts.target_byte_deletion_rate,
             delete_queue: Mutex::new(DeleteQueue::default()),
             delete_cv: Condvar::new(),
@@ -1181,6 +1192,7 @@ impl DbInner {
             &mem,
             &self.block_property_collectors,
             self.target_file_size,
+            self.value_block_threshold,
         )?;
         let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
         let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
@@ -2163,6 +2175,18 @@ fn create_wal(
 /// boundaries (Pebble's flush splitting), using `file_nums` in order; range tombstones / range
 /// keys force a single output file (fragmenting them across splits is not done here).
 #[allow(clippy::too_many_arguments)]
+/// Builds the sstable [`WriterOptions`] the engine uses, enabling value-block separation in a
+/// value-block-capable format when `value_block_threshold` is set.
+fn engine_writer_options(value_block_threshold: Option<usize>) -> WriterOptions {
+    let mut o = WriterOptions::default();
+    if let Some(t) = value_block_threshold {
+        o.table_format = crate::sstable::TableFormat::Pebble(3);
+        o.value_block_threshold = Some(t);
+    }
+    o
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_memtable_to_sstables(
     fs: &dyn Fs,
     dir: &Path,
@@ -2171,6 +2195,7 @@ fn write_memtable_to_sstables(
     mem: &Arc<MemTable>,
     collectors: &[BlockPropertyCollectorFactory],
     target_file_size: u64,
+    value_block_threshold: Option<usize>,
 ) -> Result<Vec<FileMetadata>> {
     let has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
     let mut outputs: Vec<FileMetadata> = Vec::new();
@@ -2183,7 +2208,11 @@ fn write_memtable_to_sstables(
         })?;
         *nfi += 1;
         let path = dir.join(filenames::table(file_num));
-        let mut w = Writer::new(fs.create(&path)?, cmp.clone(), WriterOptions::default());
+        let mut w = Writer::new(
+            fs.create(&path)?,
+            cmp.clone(),
+            engine_writer_options(value_block_threshold),
+        );
         for factory in collectors {
             w.add_block_property_collector(factory());
         }

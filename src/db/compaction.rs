@@ -26,7 +26,7 @@ use crate::base::internal_key::{InternalKeyKind, encoded_trailer, encoded_user_k
 use crate::base::range_del::RangeTombstone;
 use crate::base::range_key::RangeKeyEntry;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEdit};
-use crate::sstable::{Writer, WriterOptions};
+use crate::sstable::Writer;
 use crate::vfs::{Fs, WritableFile};
 
 use super::merging_iter::{InternalIter, MergingIter};
@@ -735,7 +735,7 @@ impl OutputBuilder {
         let mut writer = Writer::new(
             db.fs.create(&path)?,
             db.cmp.clone(),
-            WriterOptions::default(),
+            super::engine_writer_options(db.value_block_threshold),
         );
         for factory in &db.block_property_collectors {
             writer.add_block_property_collector(factory());

@@ -1143,6 +1143,74 @@ fn checkpoint_restricted_to_spans() {
 }
 
 #[test]
+fn value_separation_round_trips_large_values() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::sstable::{Reader, TableFormat};
+
+    let dir = temp_dir("value-sep");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 64 * 1024,
+            // Values >= 64 bytes are stored out-of-line in value blocks.
+            value_block_threshold: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A mix of small (inline) and large (separated) values.
+    for i in 0..200u32 {
+        let v = if i % 2 == 0 {
+            vec![b'B'; 500]
+        } else {
+            vec![b's'; 8]
+        };
+        db.set(format!("k{i:04}").as_bytes(), &v).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // The engine wrote tables in the value-block-capable format (Pebble v3).
+    let mut saw_v3 = false;
+    for e in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "sst") {
+            let bytes = std::fs::read(&p).unwrap();
+            let r = Reader::open(bytes, Arc::new(DefaultComparer)).unwrap();
+            if r.format() == TableFormat::Pebble(3) {
+                saw_v3 = true;
+            }
+        }
+    }
+    assert!(
+        saw_v3,
+        "value separation should write the value-block format"
+    );
+
+    // Every value reads back correctly through flush + compaction.
+    for i in 0..200u32 {
+        let want = if i % 2 == 0 {
+            vec![b'B'; 500]
+        } else {
+            vec![b's'; 8]
+        };
+        assert_eq!(
+            db.get(format!("k{i:04}").as_bytes()).unwrap(),
+            Some(want),
+            "value mismatch at {i}"
+        );
+    }
+    // Survives reopen too.
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"k0000").unwrap(), Some(vec![b'B'; 500]));
+    assert_eq!(db.get(b"k0001").unwrap(), Some(vec![b's'; 8]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn disk_slow_events_are_routed_to_the_listener() {
     use pebbledb::EventListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
