@@ -1649,6 +1649,31 @@ impl DbInner {
 
     /// Returns an iterator with bounds over the view as visible at `snapshot`.
     pub fn iter_at_with_options(&self, snapshot: SeqNum, opts: IterOptions) -> Result<DbIterator> {
+        let (sources, tombstones, range_keys) = self.collect_iter_sources(&opts)?;
+        DbIterator::with_options(
+            sources,
+            snapshot,
+            self.cmp.clone(),
+            tombstones,
+            range_keys,
+            self.merger.clone(),
+            opts,
+        )
+    }
+
+    /// Collects the merge sources (newest first), range tombstones, and range keys for an
+    /// iterator over the current LSM, honoring `only_durable` and block-property filters.
+    /// Shared by [`iter_at_with_options`](Self::iter_at_with_options) and the indexed-batch
+    /// iterator, which prepends its own (newest) source.
+    #[allow(clippy::type_complexity)]
+    fn collect_iter_sources(
+        &self,
+        opts: &IterOptions,
+    ) -> Result<(
+        Vec<Box<dyn InternalIter>>,
+        Vec<RangeTombstone>,
+        Vec<RangeKeyEntry>,
+    )> {
         let (mem, imm, version) = {
             let state = self.state.lock().unwrap();
             (
@@ -1693,12 +1718,42 @@ impl DbInner {
                 }
             }
         }
+        Ok((sources, tombstones, range_keys))
+    }
+
+    /// Returns a lazy iterator over the database **as if `batch` were already applied** on top
+    /// of the current committed view (Pebble's indexed-batch iterator). The batch's point ops,
+    /// range deletions, and range keys are layered above committed data by materializing them
+    /// into a private memtable at sequence numbers just above the committed snapshot, then
+    /// merged through the normal collapse / range-tombstone / range-key / masking machinery —
+    /// so a batch `Set` shadows a committed value, a batch `delete_range` hides committed keys
+    /// in its span, and batch `merge` operands fold over the committed base. Unlike
+    /// [`IndexedBatch::scan`](crate::IndexedBatch::scan), nothing is materialized eagerly.
+    pub(crate) fn iter_with_batch(&self, batch: &Batch, opts: IterOptions) -> Result<DbIterator> {
+        // Snapshot the committed view, then place the batch just above it.
+        let base = self.state.lock().unwrap().vs.last_sequence;
+        let mut staged = batch.clone();
+        staged.set_seqnum(base + 1);
+        let count = u64::from(staged.count());
+        let bmem = Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size.max(1)));
+        bmem.apply(&staged)?;
+
+        let (mut sources, mut tombstones, mut range_keys) = self.collect_iter_sources(&opts)?;
+        // The batch is the newest source; its entries (seqnums > base) win over committed ones.
+        let mut batch_sources: Vec<Box<dyn InternalIter>> = vec![Box::new(bmem.scan())];
+        batch_sources.append(&mut sources);
+        let mut batch_tombstones = bmem.range_tombstones();
+        batch_tombstones.append(&mut tombstones);
+        let mut batch_range_keys = bmem.range_keys();
+        batch_range_keys.append(&mut range_keys);
+
+        // The snapshot must cover every staged seqnum so all batch ops are visible.
         DbIterator::with_options(
-            sources,
-            snapshot,
+            batch_sources,
+            base + count,
             self.cmp.clone(),
-            tombstones,
-            range_keys,
+            batch_tombstones,
+            batch_range_keys,
             self.merger.clone(),
             opts,
         )

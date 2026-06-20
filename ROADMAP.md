@@ -64,9 +64,11 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 `Snapshot::iter_with_options`, a `Logger`, and the `Cleaner` (delete/archive)._
 
 ### Batches & the write API
-- For indexed batches: a lazy batch iterator merged into `DbIterator` (today `get`/`scan`
-  provide read-your-own-writes) and large batches handled as flushables. (`Batch::reset`
-  for reuse is done.)
+- Large batches handled as flushables. (The **lazy indexed-batch iterator** is done:
+  `IndexedBatch::iter` / `iter_with_options` return a real `DbIterator` that layers the batch's
+  pending point ops, range deletions, and range keys over the committed view through the normal
+  iteration machinery — nothing materialized eagerly, unlike `scan`. `get`/`scan`
+  read-your-own-writes and `Batch::reset` for reuse are also done.)
 
 ### Iterators
 - Remaining **`IterOptions`**: key-type selection (point / range / both). (`SetBounds`,

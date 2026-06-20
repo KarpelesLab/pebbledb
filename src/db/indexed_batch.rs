@@ -142,6 +142,25 @@ impl IndexedBatch {
             .unwrap_or(-1)
     }
 
+    /// Returns a lazy [`DbIterator`](crate::DbIterator) over the database as if this batch were
+    /// already applied — the iterator form of read-your-own-writes. The batch's pending point
+    /// ops, range deletions, and range keys are layered above the committed view and merged
+    /// through the normal iteration machinery. Unlike [`scan`](Self::scan), nothing is
+    /// materialized eagerly, so it is suitable for large databases.
+    pub fn iter(&self, db: &Db) -> Result<crate::DbIterator> {
+        self.iter_with_options(db, crate::IterOptions::default())
+    }
+
+    /// Like [`iter`](Self::iter), with explicit [`IterOptions`](crate::IterOptions) (bounds,
+    /// masking, filters).
+    pub fn iter_with_options(
+        &self,
+        db: &Db,
+        opts: crate::IterOptions,
+    ) -> Result<crate::DbIterator> {
+        db.iter_with_batch(&self.batch, opts)
+    }
+
     /// Reads `key` as visible through the batch: the batch's pending write if any (a later
     /// `delete_range` or point op wins), otherwise the committed database value.
     pub fn get(&self, db: &Db, key: &[u8]) -> Result<Option<Vec<u8>>> {

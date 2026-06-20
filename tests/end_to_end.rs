@@ -2188,6 +2188,81 @@ fn indexed_batch_merges_over_committed_value() {
 }
 
 #[test]
+fn indexed_batch_iterator_merges_lazily_over_committed() {
+    use pebbledb::ConcatMerger;
+    let dir = temp_dir("indexed-batch-iter");
+    let opts = Options {
+        merger: Some(Arc::new(ConcatMerger)),
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+    db.set(b"a", b"committed-a").unwrap();
+    db.set(b"b", b"committed-b").unwrap();
+    db.set(b"m", b"base").unwrap();
+    db.set(b"old", b"present").unwrap();
+
+    let mut ib = db.indexed_batch();
+    ib.set(b"b", b"batch-b"); // overrides committed
+    ib.set(b"c", b"batch-c"); // new key not in db
+    ib.delete(b"a"); // hides committed
+    ib.merge(b"m", b"+x"); // folds over committed base via the merger
+    ib.delete_range(b"old", b"oldz"); // range-deletes a committed key
+
+    // Forward iteration over the lazy iterator reflects the merged view, in sorted order,
+    // without materializing it.
+    let mut it = ib.iter(&db).unwrap();
+    it.first().unwrap();
+    let mut fwd = Vec::new();
+    while it.valid() {
+        fwd.push((
+            String::from_utf8_lossy(it.key()).into_owned(),
+            String::from_utf8_lossy(it.value()).into_owned(),
+        ));
+        it.next().unwrap();
+    }
+    assert_eq!(
+        fwd,
+        vec![
+            ("b".into(), "batch-b".into()),
+            ("c".into(), "batch-c".into()),
+            ("m".into(), "base+x".into()),
+        ]
+    );
+
+    // Reverse iteration yields the same set in the opposite order.
+    it.last().unwrap();
+    let mut rev = Vec::new();
+    while it.valid() {
+        rev.push(String::from_utf8_lossy(it.key()).into_owned());
+        it.prev().unwrap();
+    }
+    assert_eq!(rev, vec!["m", "c", "b"]);
+
+    // Bounds apply through IterOptions.
+    let mut it = ib
+        .iter_with_options(
+            &db,
+            pebbledb::IterOptions {
+                lower_bound: Some(b"c".to_vec()),
+                upper_bound: Some(b"n".to_vec()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    it.first().unwrap();
+    let mut bounded = Vec::new();
+    while it.valid() {
+        bounded.push(String::from_utf8_lossy(it.key()).into_owned());
+        it.next().unwrap();
+    }
+    assert_eq!(bounded, vec!["c", "m"]);
+
+    // The DB is unchanged until commit.
+    assert_eq!(db.get(b"a").unwrap(), Some(b"committed-a".to_vec()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn external_iter_merges_sstables_without_ingesting() {
     use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
     use pebbledb::new_external_iter;
