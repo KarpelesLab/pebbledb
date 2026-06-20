@@ -203,7 +203,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   keys into a `PrefixBytes` prefix column + a suffix column via the comparer's `split`, wired
   into the columnar writer/reader (`ColumnarWriter`/`ColumnarReader`) with round-trip tests.
   The exact `cockroachkvs`/upstream schema-name string and byte-parity are interop-CI nuances.)
-- Consistency checking (`level_checker`) over columnar tables.
+- (Done: **consistency checking** — `Db::check_consistency` (Pebble's `level_checker`) validates
+  the version's invariants: per-file `smallest <= largest` and ordered seqnum bounds, L1+ files
+  sorted and non-overlapping by user key, no file number at two levels, every file (a virtual
+  sstable's physical backing) opens, and a physical file's point keys lie within its bounds.)
 
 ### Tooling & testing
 - (Have: `sstable`/`wal`/`manifest` dump, `db get`/`scan`/`lsm`, `find`, and `bench` CLIs; a

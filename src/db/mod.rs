@@ -2335,6 +2335,79 @@ impl DbInner {
         scan().is_ok()
     }
 
+    /// Checks the LSM's structural invariants over the current version (Pebble's level
+    /// consistency check / `level_checker`), returning an error describing the first
+    /// violation found: every file's smallest key is `<=` its largest and its sequence-number
+    /// bounds are ordered; within each of L1..L6 the files are sorted and non-overlapping by
+    /// user key; no file number appears at more than one level; each file — the physical
+    /// backing file for a virtual sstable — opens; and a physical file's actual point keys lie
+    /// within its recorded `[smallest, largest]` bounds. Returns `Ok(())` when the tree is
+    /// well-formed.
+    pub fn check_consistency(&self) -> Result<()> {
+        use std::cmp::Ordering;
+        let version = self.state.lock().unwrap().vs.current.clone();
+        let cmp = self.cmp.as_ref();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (level, files) in version.levels.iter().enumerate() {
+            for (i, f) in files.iter().enumerate() {
+                if !seen.insert(f.file_num) {
+                    return Err(Error::Corruption(format!(
+                        "consistency: file {} appears at more than one level",
+                        f.file_num
+                    )));
+                }
+                if compare_encoded(cmp, &f.smallest, &f.largest) == Ordering::Greater {
+                    return Err(Error::Corruption(format!(
+                        "consistency: L{level} file {} has smallest > largest",
+                        f.file_num
+                    )));
+                }
+                if f.largest_seqnum < f.smallest_seqnum {
+                    return Err(Error::Corruption(format!(
+                        "consistency: L{level} file {} has largest_seqnum < smallest_seqnum",
+                        f.file_num
+                    )));
+                }
+                // L1+ files partition the key space: sorted and non-overlapping by user key.
+                if level > 0 && i > 0 {
+                    let prev = &files[i - 1];
+                    if cmp.compare(
+                        encoded_user_key(&prev.largest),
+                        encoded_user_key(&f.smallest),
+                    ) != Ordering::Less
+                    {
+                        return Err(Error::Corruption(format!(
+                            "consistency: L{level} files {} and {} overlap or are out of order",
+                            prev.file_num, f.file_num
+                        )));
+                    }
+                }
+                // The file (its physical backing, for a virtual sstable) must open. A physical
+                // file's point keys must fall within its recorded bounds.
+                let reader = self.open_reader(f.physical_num())?;
+                if f.backing.is_none() {
+                    let mut it = reader.iter()?;
+                    it.first()?;
+                    if it.valid() && compare_encoded(cmp, it.key(), &f.smallest) == Ordering::Less {
+                        return Err(Error::Corruption(format!(
+                            "consistency: file {} has a point key below its smallest bound",
+                            f.file_num
+                        )));
+                    }
+                    it.last()?;
+                    if it.valid() && compare_encoded(cmp, it.key(), &f.largest) == Ordering::Greater
+                    {
+                        return Err(Error::Corruption(format!(
+                            "consistency: file {} has a point key above its largest bound",
+                            f.file_num
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a human-readable description of the LSM tree's current shape: one section
     /// per non-empty level listing each live sstable's file number, size, and user-key
     /// bounds (Pebble's LSM view, useful for debugging and tooling).

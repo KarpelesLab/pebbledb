@@ -3089,6 +3089,45 @@ fn excise_removes_and_reclaims_range() {
 }
 
 #[test]
+fn check_consistency_passes_for_a_well_formed_lsm() {
+    let dir = temp_dir("consistency");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 16 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Build a multi-level tree with point keys, tombstones, and range keys.
+    for i in 0..1500u32 {
+        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 24]).unwrap();
+    }
+    db.flush().unwrap();
+    for i in (0..1500u32).step_by(7) {
+        db.delete(format!("k{i:05}").as_bytes()).unwrap();
+    }
+    db.range_key_set(b"k00100", b"k00200", b"@t", b"rk")
+        .unwrap();
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+    db.check_consistency()
+        .expect("well-formed after compaction");
+
+    // After an excise (which introduces virtual sstables) the tree is still consistent.
+    db.excise(b"k00500", b"k01000").unwrap();
+    db.check_consistency()
+        .expect("well-formed after excise / virtual sstables");
+
+    // And after reopen.
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    db.check_consistency().expect("well-formed after reopen");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn excise_uses_virtual_sstables_without_rewriting() {
     let dir = temp_dir("excise-virtual");
     let ssts = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
