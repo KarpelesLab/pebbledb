@@ -1053,6 +1053,59 @@ fn block_property_filter_skips_nonmatching_sstables() {
 }
 
 #[test]
+fn flush_splitting_produces_multiple_l0_files() {
+    // A large point-only memtable flushed with a small target file size splits into several
+    // L0 sstables. A high L0 threshold keeps them at L0 so the split is observable.
+    let dir = temp_dir("flush-split");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 8 << 20,    // hold everything in one memtable
+            target_file_size: 4 * 1024, // small, to force splits
+            l0_compaction_threshold: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for i in 0..4000u32 {
+        // Distinct values limit compression so the output exceeds several target sizes.
+        let v = format!("value-{i:08}-{i:08}-{i:08}");
+        db.set(format!("k{i:06}").as_bytes(), v.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+
+    let sst_count = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
+        .count();
+    assert!(
+        sst_count >= 2,
+        "a large memtable should split into multiple L0 files, got {sst_count}"
+    );
+    let m = db.metrics();
+    assert_eq!(
+        m.level_files[0], sst_count,
+        "all split files should be at L0: {:?}",
+        m.level_files
+    );
+
+    // The split output reads back correctly across file boundaries.
+    assert_eq!(
+        db.get(b"k000000").unwrap(),
+        Some(b"value-00000000-00000000-00000000".to_vec())
+    );
+    assert_eq!(
+        db.get(b"k003999").unwrap(),
+        Some(b"value-00003999-00003999-00003999".to_vec())
+    );
+    assert_eq!(collect(&db).len(), 4000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn manual_compact_range_drains_upper_levels() {
     let dir = temp_dir("compact-range");
     let opts = Options {

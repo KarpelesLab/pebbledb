@@ -561,19 +561,24 @@ impl DbInner {
         // strand that data: the older WALs holding it become obsolete and are skipped on
         // the next open.
         if !mem.is_empty() {
+            // Recovery flush goes to a single file (no split needed here).
             let file_num = vs.allocate_file_number();
-            let meta = write_memtable_to_sstable(
+            let metas = write_memtable_to_sstables(
                 fs.as_ref(),
                 &dir,
                 &cmp,
-                file_num,
+                &[file_num],
                 &mem,
                 &opts.block_property_collectors,
+                opts.target_file_size,
             )?;
             let edit = VersionEdit {
                 next_file_number: Some(vs.next_file_number),
                 last_sequence: Some(vs.last_sequence),
-                new_files: vec![NewFileEntry { level: 0, meta }],
+                new_files: metas
+                    .into_iter()
+                    .map(|meta| NewFileEntry { level: 0, meta })
+                    .collect(),
                 ..Default::default()
             };
             vs.apply(&edit)?;
@@ -1007,29 +1012,37 @@ impl DbInner {
     fn flush_one(&self) -> Result<bool> {
         let _flushing = self.flush_lock.lock().unwrap();
 
-        let (mem, file_num) = {
+        let (mem, file_nums) = {
             let mut state = self.state.lock().unwrap();
             if state.imm.is_empty() {
                 return Ok(false);
             }
             let mem = Arc::clone(&state.imm[0]);
-            let file_num = state.vs.allocate_file_number();
-            (mem, file_num)
+            // Pre-allocate enough file numbers for flush splitting: the output (compressed) is
+            // no larger than the arena, so ceil(arena / target) + 1 is a safe upper bound.
+            // Unused numbers simply leave gaps.
+            let n = ((mem.size() as u64).div_ceil(self.target_file_size).max(1) + 1) as usize;
+            let file_nums: Vec<u64> = (0..n).map(|_| state.vs.allocate_file_number()).collect();
+            (mem, file_nums)
         };
         if let Some(l) = &self.listener {
             l.on_flush_begin();
         }
 
-        // Write the sstable without holding the state lock.
-        let meta = write_memtable_to_sstable(
+        // Write the sstable(s) without holding the state lock, splitting large point-only
+        // memtables at the target file size.
+        let metas = write_memtable_to_sstables(
             self.fs.as_ref(),
             &self.dir,
             &self.cmp,
-            file_num,
+            &file_nums,
             &mem,
             &self.block_property_collectors,
+            self.target_file_size,
         )?;
-        let flushed_bytes = meta.size;
+        let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
+        let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
+        let created: Vec<u64> = metas.iter().map(|m| m.file_num).collect();
 
         let mut state = self.state.lock().unwrap();
         // The new oldest un-flushed WAL once this immutable is removed.
@@ -1038,7 +1051,10 @@ impl DbInner {
             log_number: Some(new_log),
             next_file_number: Some(state.vs.next_file_number),
             last_sequence: Some(state.vs.last_sequence),
-            new_files: vec![NewFileEntry { level: 0, meta }],
+            new_files: metas
+                .into_iter()
+                .map(|meta| NewFileEntry { level: 0, meta })
+                .collect(),
             ..Default::default()
         };
         state.vs.apply(&edit)?;
@@ -1064,14 +1080,16 @@ impl DbInner {
         drop(state);
 
         self.log(&format!(
-            "flushed memtable to sstable {file_num} ({flushed_bytes} bytes)"
+            "flushed memtable to {} sstable(s) starting at {first_file_num} ({flushed_bytes} bytes)",
+            created.len()
         ));
         if let Some(l) = &self.listener {
-            l.on_table_created(file_num);
-        }
-
-        if let Some(l) = &self.listener {
-            l.on_flush_end(file_num, flushed_bytes);
+            for file_num in &created {
+                l.on_table_created(*file_num);
+            }
+            // One flush event per memtable flush (matching `flush_count`), carrying the total
+            // bytes written across any split output files.
+            l.on_flush_end(first_file_num, flushed_bytes);
         }
         self.drained_cv.notify_all();
         Ok(true)
@@ -1835,29 +1853,47 @@ fn create_wal(
         .unwrap_or_else(|| Error::InvalidState("db: no WAL directory available".into())))
 }
 
-/// Writes every entry of `mem` (in internal-key order) to `<dir>/<file_num>.sst`, and
-/// returns the file's metadata.
-fn write_memtable_to_sstable(
+/// Writes every entry of `mem` (in internal-key order) to one or more sstables under `dir`,
+/// returning their metadata. When the memtable holds only point keys (no range tombstones or
+/// range keys), the point output is **split** into multiple files at `target_file_size`
+/// boundaries (Pebble's flush splitting), using `file_nums` in order; range tombstones / range
+/// keys force a single output file (fragmenting them across splits is not done here).
+#[allow(clippy::too_many_arguments)]
+fn write_memtable_to_sstables(
     fs: &dyn Fs,
     dir: &Path,
     cmp: &Arc<dyn Comparer>,
-    file_num: u64,
+    file_nums: &[u64],
     mem: &Arc<MemTable>,
     collectors: &[BlockPropertyCollectorFactory],
-) -> Result<FileMetadata> {
-    let path = dir.join(filenames::table(file_num));
-    let file = fs.create(&path)?;
-    let mut w = Writer::new(file, cmp.clone(), WriterOptions::default());
-    for factory in collectors {
-        w.add_block_property_collector(factory());
-    }
+    target_file_size: u64,
+) -> Result<Vec<FileMetadata>> {
+    let has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
+    let mut outputs: Vec<FileMetadata> = Vec::new();
+    let mut nfi = 0usize;
 
-    let mut it = mem.iter();
-    it.first();
+    type StartedWriter = (u64, PathBuf, Writer<Box<dyn WritableFile>>);
+    let start_writer = |nfi: &mut usize| -> Result<StartedWriter> {
+        let file_num = *file_nums.get(*nfi).ok_or_else(|| {
+            Error::InvalidState("flush: ran out of preallocated file numbers".into())
+        })?;
+        *nfi += 1;
+        let path = dir.join(filenames::table(file_num));
+        let mut w = Writer::new(fs.create(&path)?, cmp.clone(), WriterOptions::default());
+        for factory in collectors {
+            w.add_block_property_collector(factory());
+        }
+        Ok((file_num, path, w))
+    };
+
+    let (mut file_num, mut path, mut w) = start_writer(&mut nfi)?;
     let mut smallest: Option<Vec<u8>> = None;
     let mut largest: Vec<u8> = Vec::new();
     let mut smallest_seq = u64::MAX;
     let mut largest_seq = 0u64;
+
+    let mut it = mem.iter();
+    it.first();
     let mut key_buf = Vec::new();
     while it.valid() {
         key_buf.clear();
@@ -1872,7 +1908,35 @@ fn write_memtable_to_sstable(
         let seq = it.trailer() >> 8;
         smallest_seq = smallest_seq.min(seq);
         largest_seq = largest_seq.max(seq);
+        let written_user = encoded_user_key(&key_buf).to_vec();
         it.next();
+
+        // Split on a user-key boundary once the target size is reached, provided this is a
+        // point-only memtable and more preallocated file numbers remain. Never split between
+        // two internal versions of the same user key.
+        if !has_spans
+            && nfi < file_nums.len()
+            && it.valid()
+            && it.user_key() != written_user.as_slice()
+            && w.estimated_size() >= target_file_size
+        {
+            let mut f = w.finish()?;
+            f.sync_all()?;
+            outputs.push(FileMetadata {
+                file_num,
+                size: fs.size(&path)?,
+                smallest: smallest.take().unwrap_or_default(),
+                largest: std::mem::take(&mut largest),
+                smallest_seqnum: smallest_seq.min(largest_seq),
+                largest_seqnum: largest_seq,
+            });
+            let next = start_writer(&mut nfi)?;
+            file_num = next.0;
+            path = next.1;
+            w = next.2;
+            smallest_seq = u64::MAX;
+            largest_seq = 0;
+        }
     }
 
     // Write the memtable's range tombstones, in start-key order, into the range-del
@@ -1932,14 +1996,15 @@ fn write_memtable_to_sstable(
     let mut file = w.finish()?;
     file.sync_all()?;
 
-    Ok(FileMetadata {
+    outputs.push(FileMetadata {
         file_num,
         size: fs.size(&path)?,
         smallest: smallest.unwrap_or_default(),
         largest,
         smallest_seqnum: smallest_seq.min(largest_seq),
         largest_seqnum: largest_seq,
-    })
+    });
+    Ok(outputs)
 }
 
 /// Writes a new `manifest` marker pointing at `value`, with an `iter` one greater than
