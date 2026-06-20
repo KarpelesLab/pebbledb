@@ -199,8 +199,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
   stalls.)
 
 ### Columnar (key schema)
-- Wire `colblk.DefaultKeySchema` (the schema a general Pebble KV store uses) into the
-  columnar writer/reader so v5+ tables round-trip against Pebble. See interop steps below.
+- (Done in-crate: a `KeySchema` trait + `DefaultKeySchema` (`sstable::keyschema`) that splits
+  keys into a `PrefixBytes` prefix column + a suffix column via the comparer's `split`, wired
+  into the columnar writer/reader (`ColumnarWriter`/`ColumnarReader`) with round-trip tests.
+  The exact `cockroachkvs`/upstream schema-name string and byte-parity are interop-CI nuances.)
 - Consistency checking (`level_checker`) over columnar tables.
 
 ### Tooling & testing
