@@ -14,9 +14,10 @@ lineage.
 > external-sstable ingestion, an `OPTIONS` file with format-major-version ratcheting, a
 > `vfs` (`DiskFs` / `MemFs`) with OS directory locking, and multi-directory WAL failover —
 > with the sstable / record-log / MANIFEST formats reproduced for binary compatibility.
-> The remaining work toward full upstream parity (block-property filters, the disaggregated
-> `objstorage` provider, compaction-heuristic breadth, columnar key-schema interop, etc.)
-> is catalogued in [`ROADMAP.md`](ROADMAP.md). The public API is **not** yet stable.
+> The remaining work toward full upstream parity (wiring the disaggregated `objstorage`
+> provider into the engine, compaction-heuristic breadth, value separation / blob files,
+> columnar key-schema interop, etc.) is catalogued in [`ROADMAP.md`](ROADMAP.md). The public
+> API is **not** yet stable.
 
 ## Capabilities
 
@@ -24,22 +25,25 @@ lineage.
   atomic `Batch`es, and **indexed batches** (read-your-own-writes via `Db::indexed_batch`).
 - **Reads**: point `get`, snapshots, a **bidirectional** iterator
   (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with `IterOptions` bounds, `set_bounds`,
-  `seek_prefix_ge`, and range-key surfacing + coalescing; `new_external_iter` reads sstables
-  without ingesting them, and `scan_internal` exposes the raw internal keyspace.
+  `seek_prefix_ge`, range-key surfacing + coalescing, **range-key masking**, and
+  **block-property filters** that skip non-matching sstables; `new_external_iter` reads
+  sstables without ingesting them, and `scan_internal` exposes the raw internal keyspace.
 - **Engine**: WAL with multi-directory failover, a background flush/compaction worker,
   score-based + manual `compact_range`, write stalls, a sharded block cache, and
   `EstimateDiskUsage`.
 - **Storage formats**: row-format sstables (every supported table-format version, two-level
   indexes, bloom filters, value blocks, range-del/range-key blocks, block-property
-  collectors/filters) and the columnar (v5–v8) block codecs; CRC32C / xxHash64 checksums;
-  Snappy / Zstd compression.
-- **Operations**: `checkpoint`, external sstable `ingest`, `Options` + `OPTIONS` file,
-  step-wise `FormatMajorVersion` migrations, `Metrics`, an `lsm_view`, an `EventListener`,
-  a `Logger`, and a `Cleaner` (delete or archive obsolete files).
+  collectors run over flush/compaction output via `Options::block_property_collectors`) and
+  the columnar (v5–v8) block codecs; CRC32C / xxHash64 checksums; Snappy / Zstd compression.
+- **Operations**: `checkpoint`, external sstable `ingest`, `Options` + `OPTIONS` file with a
+  **comparer/merger name→impl registry**, step-wise `FormatMajorVersion` migrations,
+  `Metrics`, an `lsm_view`, an `EventListener` (flush/compaction, table, WAL/MANIFEST
+  create-delete, format upgrade, write-stall, background-error), a `Logger`, and a `Cleaner`
+  (delete or archive obsolete files).
 - **Filesystem & objects**: an `Fs` trait with `DiskFs`, in-memory `MemFs`, and a
   disk-health-checking wrapper; an `objstorage` provider for local + shared/remote objects.
 - **Tooling**: a `pebbledb` CLI (`sstable` / `wal` / `manifest` dump, `db get` / `scan` /
-  `lsm`).
+  `lsm`, `find`, and `bench`).
 
 ## Usage
 
