@@ -159,6 +159,15 @@ pub struct Reader<R> {
     pos: usize,
     /// Whether any block has been loaded yet.
     started: bool,
+    /// When set, a malformed chunk (bad encoding/checksum, overflow, or a non-zero "zeroed"
+    /// chunk) is treated as a clean end-of-log rather than a corruption error. This is the
+    /// best-effort crash-recovery mode for the *active* WAL: a process that crashes mid-write
+    /// leaves a torn trailing record, and a **recycled** WAL leaves arbitrary stale bytes
+    /// after its last record (the file is reused without truncation, and the writer cannot
+    /// seek back to zero the tail). Both must stop cleanly at the last complete record. Only
+    /// use this on the newest WAL — older, fully-synced logs are read strictly so genuine
+    /// mid-file corruption is still surfaced.
+    tolerate_tail: bool,
 }
 
 impl<R: Read> Reader<R> {
@@ -172,7 +181,17 @@ impl<R: Read> Reader<R> {
             block_len: 0,
             pos: 0,
             started: false,
+            tolerate_tail: false,
         }
+    }
+
+    /// Enables best-effort tail tolerance: a malformed chunk (bad encoding/checksum, overflow,
+    /// or a non-zero "zeroed" chunk) at a record boundary is treated as a clean end-of-log
+    /// rather than a corruption error. Use for the active WAL during crash recovery and for
+    /// recycled WALs, whose reused files carry a stale tail past the last fresh record.
+    pub fn tolerant(mut self) -> Self {
+        self.tolerate_tail = true;
+        self
     }
 
     /// Reads the next block from the underlying reader into `block`, returning whether
@@ -207,7 +226,7 @@ impl<R: Read> Reader<R> {
             // header are zero-padding.
             if !self.started || self.block_len - self.pos < LEGACY_HEADER_SIZE {
                 if !self.fill_block()? {
-                    if fragmented {
+                    if fragmented && !self.tolerate_tail {
                         return Err(Error::corruption("record: truncated record at EOF"));
                     }
                     return Ok(None);
@@ -225,10 +244,15 @@ impl<R: Read> Reader<R> {
                 // writer zero-pads a block when the next chunk does not fit). The rest
                 // of the block must be all zeroes.
                 if self.block[p..self.block_len].iter().any(|&b| b != 0) {
+                    // Stale (recycled) or torn bytes after the last record: a clean stop in
+                    // tolerant mode, otherwise corruption.
+                    if self.tolerate_tail {
+                        return Ok(None);
+                    }
                     return Err(Error::corruption("record: non-zero data in zeroed chunk"));
                 }
                 if !self.fill_block()? {
-                    if fragmented {
+                    if fragmented && !self.tolerate_tail {
                         return Err(Error::corruption("record: truncated record at EOF"));
                     }
                     return Ok(None);
@@ -236,20 +260,32 @@ impl<R: Read> Reader<R> {
                 continue;
             }
 
-            let kind = decode_encoding(enc).ok_or_else(|| {
-                Error::corruption(format!("record: invalid chunk encoding {enc}"))
-            })?;
+            let Some(kind) = decode_encoding(enc) else {
+                // An unrecognized chunk encoding: in tolerant mode this is the stale/torn tail
+                // of a recycled or crash-truncated WAL, so stop cleanly.
+                if self.tolerate_tail {
+                    return Ok(None);
+                }
+                return Err(Error::corruption(format!(
+                    "record: invalid chunk encoding {enc}"
+                )));
+            };
             let header_size = kind.header_size;
 
             if self.block_len - p < header_size + length {
+                if self.tolerate_tail {
+                    return Ok(None);
+                }
                 return Err(Error::corruption("record: chunk overflows block"));
             }
 
             if has_log_num(header_size) {
                 let log_num = u32::from_le_bytes(self.block[p + 7..p + 11].try_into().unwrap());
                 if log_num != self.log_num {
-                    // A chunk from an older use of this recycled file: treat as EOF.
-                    if fragmented {
+                    // A chunk from an older use of this recycled file: treat as EOF. (Mid-record,
+                    // this is only an error in strict mode; tolerant recovery drops the torn
+                    // trailing record.)
+                    if fragmented && !self.tolerate_tail {
                         return Err(Error::corruption("record: log number mismatch mid-record"));
                     }
                     return Ok(None);
@@ -259,6 +295,11 @@ impl<R: Read> Reader<R> {
             // The checksum covers the type byte through the end of the data payload.
             let crc_input = &self.block[p + 6..p + header_size + length];
             if masked_crc32c(crc_input) != checksum {
+                // A bad checksum at the tail of the active/recycled WAL is a torn or stale
+                // trailing record: stop cleanly in tolerant mode.
+                if self.tolerate_tail {
+                    return Ok(None);
+                }
                 return Err(Error::corruption("record: checksum mismatch"));
             }
 
@@ -564,6 +605,65 @@ mod tests {
         // Opening with a different log number treats the stale chunk as end-of-file.
         let mut r = Reader::new(Cursor::new(buf), 6);
         assert!(r.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn tolerant_reader_stops_at_recycled_garbage_tail() {
+        // Simulate a recycled file: a previous life wrote a large record with log number 5,
+        // then it is reused for log number 6 which writes a single short record over the start.
+        // The bytes past the new record are the stale middle of the old record (arbitrary
+        // payload, not a valid header).
+        let mut old = Writer::with_log_num(Vec::new(), 5);
+        old.write_record(&vec![0x41u8; 5000]).unwrap();
+        let old_bytes = old.finish().unwrap();
+
+        let mut new = Writer::with_log_num(Vec::new(), 6);
+        new.write_record(b"fresh").unwrap();
+        let new_bytes = new.finish().unwrap();
+
+        let mut recycled = new_bytes.clone();
+        recycled.extend_from_slice(&old_bytes[new_bytes.len()..]);
+
+        // Strict reading trips over the stale tail; tolerant reading stops cleanly after the
+        // one fresh record.
+        let mut strict = Reader::new(Cursor::new(recycled.clone()), 6);
+        assert_eq!(
+            strict.read_record().unwrap().as_deref(),
+            Some(b"fresh".as_slice())
+        );
+        assert!(strict.read_record().is_err());
+
+        let mut tol = Reader::new(Cursor::new(recycled), 6).tolerant();
+        assert_eq!(
+            tol.read_record().unwrap().as_deref(),
+            Some(b"fresh".as_slice())
+        );
+        assert!(tol.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn tolerant_reader_drops_torn_trailing_record() {
+        // A crash mid-write leaves a torn trailing record. Tolerant recovery keeps every
+        // complete record before the tear and stops cleanly.
+        let mut w = Writer::with_log_num(Vec::new(), 9);
+        w.write_record(b"first").unwrap();
+        w.write_record(b"second-record-that-will-be-torn").unwrap();
+        let mut buf = w.finish().unwrap();
+        buf.truncate(buf.len() - 5); // tear the tail of the second record
+
+        let mut strict = Reader::new(Cursor::new(buf.clone()), 9);
+        assert_eq!(
+            strict.read_record().unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert!(strict.read_record().is_err());
+
+        let mut tol = Reader::new(Cursor::new(buf), 9).tolerant();
+        assert_eq!(
+            tol.read_record().unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert!(tol.read_record().unwrap().is_none());
     }
 
     #[test]

@@ -147,7 +147,10 @@ configurable compaction tunables (`l0_compaction_threshold`, `target_file_size`)
 
 ### WAL
 - The full `pebble/wal` failover **manager** (have: multi-directory write-failover +
-  recovery), the **sync queue**, and WAL **recycling**.
+  recovery). (Done: **WAL recycling** — `Options::wal_recycle_limit` retains flushed WAL files
+  and reuses them in place for new logs, reading recycled/torn tails tolerantly during
+  recovery; and the **sync queue**, provided by group commit — concurrent committers are
+  batched through a single WAL `fsync`.)
 
 ### vfs
 - Syncing-FS guarantees and the remaining vfs surface. (Have: `DiskFs`, `MemFs`, directory

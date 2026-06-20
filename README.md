@@ -31,8 +31,10 @@ lineage.
   **range-key masking**, **block-property filters** that skip non-matching sstables, and
   `only_durable` (read only flushed data); `new_external_iter` reads sstables without
   ingesting them, and `scan_internal` exposes the raw internal keyspace.
-- **Engine**: WAL with multi-directory failover and **group commit** (concurrent writers
-  batched through one fsync), **flush splitting**, and a full leveled compaction suite —
+- **Engine**: WAL with multi-directory failover, **group commit** (concurrent writers
+  batched through one fsync), and optional **WAL recycling** (`Options::wal_recycle_limit`,
+  reusing log files in place with tolerant tail recovery); **flush splitting**, and a full
+  leveled compaction suite —
   score-based + manual `compact_range`, **multilevel**, **move**, **delete-only**,
   **elision-only**, **tombstone-density**, and **read-triggered** compactions run by a
   **concurrent compaction scheduler** (`Options::max_concurrent_compactions`) with paced

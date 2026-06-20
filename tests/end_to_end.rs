@@ -1989,6 +1989,56 @@ mod fault {
 }
 
 #[test]
+fn wal_recycling_reuses_files_and_recovers() {
+    let dir = temp_dir("wal-recycle");
+    let opts = || Options {
+        wal_recycle_limit: 2,
+        mem_table_size: 4 * 1024, // tiny → frequent rotations, flushes, and recycling
+        ..Default::default()
+    };
+    {
+        let db = Db::open(&dir, opts()).unwrap();
+        // A large first wave forces many rotations + flushes: obsolete WAL files go into the
+        // recycle pool and are reused in place for later WALs.
+        for i in 0..300u32 {
+            db.set(
+                format!("k{i:04}").as_bytes(),
+                format!("value-{i}-xxxxxxxxxxxxxxxx").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        // A second wave lands in (now recycled) WALs and is intentionally left un-flushed.
+        for i in 300..360u32 {
+            db.set(
+                format!("k{i:04}").as_bytes(),
+                format!("value-{i}-yy").as_bytes(),
+            )
+            .unwrap();
+        }
+        // Drop without an explicit flush: the second wave survives only in the WAL(s).
+    }
+
+    // Reopen: recovery replays the un-flushed WALs — recycled files included — stopping cleanly
+    // at each stale tail. Every key must be present with the right value.
+    let db = Db::open(&dir, opts()).unwrap();
+    for i in 0..360u32 {
+        let want = if i < 300 {
+            format!("value-{i}-xxxxxxxxxxxxxxxx")
+        } else {
+            format!("value-{i}-yy")
+        };
+        assert_eq!(
+            db.get(format!("k{i:04}").as_bytes()).unwrap(),
+            Some(want.into_bytes()),
+            "key k{i:04} missing or wrong after recycle + recover"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn wal_failover_to_secondary_directory() {
     use std::sync::atomic::Ordering;
 

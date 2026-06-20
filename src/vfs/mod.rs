@@ -52,6 +52,15 @@ pub trait DirLock: Send + Sync {}
 pub trait Fs: Send + Sync {
     /// Creates (or truncates) the file at `path` for writing.
     fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>>;
+    /// Reopens `path` for writing **without truncating**, positioned at offset 0, so bytes
+    /// past what is rewritten survive. Used for WAL recycling: an obsolete log file is reused
+    /// in place (keeping its already-allocated blocks) and the recyclable record format's
+    /// per-record log number lets recovery stop at the stale tail. The default truncates
+    /// (equivalent to [`create`](Fs::create)) — correct but without the recycling benefit;
+    /// back-ends override it to preserve the tail.
+    fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+        self.create(path)
+    }
     /// Reads the entire contents of `path`.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     /// Removes the file at `path`.
@@ -85,6 +94,17 @@ pub struct DiskFs;
 impl Fs for DiskFs {
     fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
         Ok(Box::new(std::fs::File::create(path)?))
+    }
+    fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+        // Open for writing without truncating, positioned at the start: writes overwrite from
+        // offset 0 and any trailing bytes from the file's previous life remain on disk.
+        Ok(Box::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .create(true)
+                .open(path)?,
+        ))
     }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -217,19 +237,26 @@ impl MemFs {
     }
 }
 
-/// A handle that appends to an in-memory file on each write.
+/// A handle that writes to an in-memory file, overwriting in place from its current offset
+/// (growing the file as needed). A fresh [`create`](MemFs::create) handle starts at offset 0
+/// over an emptied file (so it behaves as an appender); a [`reuse`](MemFs::reuse) handle
+/// starts at offset 0 over the *existing* bytes, so anything past what is rewritten survives.
 struct MemWritable {
     tree: Tree,
     path: PathBuf,
+    pos: usize,
 }
 
 impl Write for MemWritable {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut st = self.tree.lock().unwrap();
-        st.files
-            .entry(self.path.clone())
-            .or_default()
-            .extend_from_slice(buf);
+        let f = st.files.entry(self.path.clone()).or_default();
+        let end = self.pos + buf.len();
+        if f.len() < end {
+            f.resize(end, 0);
+        }
+        f[self.pos..end].copy_from_slice(buf);
+        self.pos = end;
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -270,6 +297,17 @@ impl Fs for MemFs {
         Ok(Box::new(MemWritable {
             tree: Arc::clone(&self.tree),
             path: path.to_path_buf(),
+            pos: 0,
+        }))
+    }
+    fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+        // Keep any existing bytes; overwrite from offset 0 (the stale tail survives).
+        let mut st = self.tree.lock().unwrap();
+        st.files.entry(path.to_path_buf()).or_default();
+        Ok(Box::new(MemWritable {
+            tree: Arc::clone(&self.tree),
+            path: path.to_path_buf(),
+            pos: 0,
         }))
     }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
@@ -443,6 +481,15 @@ impl WritableFile for HealthCheckedWritable {
 impl Fs for DiskHealthCheckingFs {
     fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
         let inner = self.timed("create", path, || self.inner.create(path))?;
+        Ok(Box::new(HealthCheckedWritable {
+            inner,
+            path: path.to_path_buf(),
+            threshold: self.threshold,
+            on_slow: Arc::clone(&self.on_slow),
+        }))
+    }
+    fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+        let inner = self.timed("reuse", path, || self.inner.reuse(path))?;
         Ok(Box::new(HealthCheckedWritable {
             inner,
             path: path.to_path_buf(),

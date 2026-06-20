@@ -111,6 +111,14 @@ pub struct Options {
     /// (e.g. a stalled or failing disk). On failure the current batch is re-logged here and
     /// subsequent WALs are created here; recovery scans every configured WAL directory.
     pub wal_failover_dir: Option<PathBuf>,
+    /// Number of obsolete WAL files to keep for **recycling** rather than deleting (default
+    /// `0`, disabled). When non-zero and a single WAL directory is configured, a flushed WAL's
+    /// file is retained (up to this many) and reused in place for the next WAL — its
+    /// already-allocated blocks are overwritten instead of creating and allocating a fresh
+    /// file, cutting per-rotation filesystem overhead (Pebble's WAL recycling). Recovery reads
+    /// recycled logs tolerantly, stopping at the stale tail left by the previous use. Recycling
+    /// is skipped when a failover directory is configured.
+    pub wal_recycle_limit: usize,
     /// Optional sink for informational/error log messages.
     pub logger: Option<Arc<dyn Logger>>,
     /// How obsolete files are disposed of (default: delete). Use [`ArchiveCleaner`] to
@@ -260,6 +268,7 @@ impl Default for Options {
             create_if_missing: true,
             read_only: false,
             wal_sync: true,
+            wal_recycle_limit: 0,
             event_listener: None,
             merger: None,
             comparers: Vec::new(),
@@ -324,6 +333,9 @@ struct State {
     /// data, removed once that memtable is flushed.
     imm: Vec<Arc<MemTable>>,
     imm_wals: Vec<u64>,
+    /// File numbers of flushed WALs retained for recycling (see [`Options::wal_recycle_limit`]).
+    /// Their files remain on disk and are reused in place for future WALs.
+    wal_recycle: Vec<u64>,
     wal: Option<record::Writer<Box<dyn WritableFile>>>,
     wal_number: u64,
     /// Index into [`DbInner::wal_dirs`] of the directory the active WAL lives in. Advances
@@ -366,6 +378,8 @@ pub struct DbInner {
     cmp: Arc<dyn Comparer>,
     mem_table_size: usize,
     wal_sync: bool,
+    /// Number of obsolete WAL files to retain for recycling (see [`Options::wal_recycle_limit`]).
+    wal_recycle_limit: usize,
     state: Mutex<State>,
     /// Serializes flush execution between the background worker and an explicit
     /// [`flush`](DbInner::flush), so a memtable is never flushed twice.
@@ -697,8 +711,9 @@ impl DbInner {
             Some(manifest_name) => {
                 let bytes = fs.read(&dir.join(&manifest_name))?;
                 let vs = VersionSet::load(&bytes, cmp.clone())?;
-                // Recover the un-flushed WALs across every WAL directory.
-                recover_wals(fs.as_ref(), &wal_dirs, &mem, vs)?
+                // Recover the un-flushed WALs across every WAL directory. Recycled WALs are read
+                // tolerantly so recovery stops at the stale tail left by a previous use.
+                recover_wals(fs.as_ref(), &wal_dirs, &mem, vs, opts.wal_recycle_limit > 0)?
             }
             None => {
                 if !opts.create_if_missing {
@@ -716,6 +731,7 @@ impl DbInner {
                 mem,
                 imm: Vec::new(),
                 imm_wals: Vec::new(),
+                wal_recycle: Vec::new(),
                 wal: None,
                 wal_number: 0,
                 wal_dir_idx: 0,
@@ -737,6 +753,7 @@ impl DbInner {
                 wal_dirs,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
+                wal_recycle_limit: opts.wal_recycle_limit,
                 state: Mutex::new(state),
                 flush_lock: Mutex::new(()),
                 work_cv: Condvar::new(),
@@ -852,6 +869,7 @@ impl DbInner {
             mem,
             imm: Vec::new(),
             imm_wals: Vec::new(),
+            wal_recycle: Vec::new(),
             wal: Some(wal),
             wal_number,
             wal_dir_idx,
@@ -873,6 +891,7 @@ impl DbInner {
             wal_dirs,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
+            wal_recycle_limit: opts.wal_recycle_limit,
             state: Mutex::new(state),
             flush_lock: Mutex::new(()),
             work_cv: Condvar::new(),
@@ -1307,6 +1326,44 @@ impl DbInner {
 
     /// Rotates the current memtable into the immutable queue and opens a fresh WAL for the
     /// new active memtable. Cheap: no sstable is written. A no-op if the memtable is empty.
+    /// Opens the writer for a new WAL numbered `new_wal`, reusing a pooled obsolete WAL file
+    /// in place when recycling is enabled (single directory, a number available). On any
+    /// recycling error it falls back to creating a fresh file.
+    fn create_or_recycle_wal(
+        &self,
+        state: &mut State,
+        new_wal: u64,
+    ) -> Result<(record::Writer<Box<dyn WritableFile>>, usize)> {
+        if self.wal_recycle_limit > 0
+            && self.wal_dirs.len() == 1
+            && let Some(old) = state.wal_recycle.pop()
+        {
+            let dir = &self.wal_dirs[0];
+            let from = dir.join(wal_filename(old));
+            let to = dir.join(wal_filename(new_wal));
+            // Rename the obsolete file to the new number and reopen it without truncation so its
+            // already-allocated blocks are reused; the stale tail is handled by tolerant recovery.
+            match self.fs.rename(&from, &to).and_then(|_| self.fs.reuse(&to)) {
+                Ok(file) => {
+                    if let Some(l) = &self.listener {
+                        l.on_wal_created(new_wal);
+                    }
+                    return Ok((record::Writer::with_log_num(file, new_wal as u32), 0));
+                }
+                Err(_) => {
+                    // Recycling failed; drop the stale files and fall through to a fresh WAL.
+                    self.clean_file(&from);
+                    self.clean_file(&to);
+                }
+            }
+        }
+        let r = create_wal(self.fs.as_ref(), &self.wal_dirs, state.wal_dir_idx, new_wal)?;
+        if let Some(l) = &self.listener {
+            l.on_wal_created(new_wal);
+        }
+        Ok(r)
+    }
+
     fn rotate_memtable(&self, state: &mut State) -> Result<()> {
         if state.mem.is_empty() {
             return Ok(());
@@ -1322,12 +1379,8 @@ impl DbInner {
         let new_wal = state.vs.allocate_file_number();
         // Keep the active WAL directory across rotation (don't fall back to the primary if
         // we've already failed over to a secondary).
-        let (wal, dir_idx) =
-            create_wal(self.fs.as_ref(), &self.wal_dirs, state.wal_dir_idx, new_wal)?;
+        let (wal, dir_idx) = self.create_or_recycle_wal(state, new_wal)?;
         state.wal_dir_idx = dir_idx;
-        if let Some(l) = &self.listener {
-            l.on_wal_created(new_wal);
-        }
         let old_mem = std::mem::replace(
             &mut state.mem,
             Arc::new(MemTable::new(self.cmp.clone(), self.mem_table_size)),
@@ -1407,12 +1460,24 @@ impl DbInner {
         state.flush_count += 1;
         state.flush_bytes += flushed_bytes;
         if popped_wal != 0 {
-            // The WAL may live in any configured directory (failover); clean from each.
-            for dir in &self.wal_dirs {
-                self.clean_file(&dir.join(wal_filename(popped_wal)));
-            }
-            if let Some(l) = &self.listener {
-                l.on_wal_deleted(popped_wal);
+            // Recycling: with a single WAL directory and room in the pool, keep the file on
+            // disk and remember its number so the next rotation can reuse it in place rather
+            // than create and allocate a fresh file. Otherwise delete it. (Failover configs use
+            // multiple directories and don't track which one holds each WAL, so recycling is
+            // skipped there.)
+            if self.wal_recycle_limit > 0
+                && self.wal_dirs.len() == 1
+                && state.wal_recycle.len() < self.wal_recycle_limit
+            {
+                state.wal_recycle.push(popped_wal);
+            } else {
+                // The WAL may live in any configured directory (failover); clean from each.
+                for dir in &self.wal_dirs {
+                    self.clean_file(&dir.join(wal_filename(popped_wal)));
+                }
+                if let Some(l) = &self.listener {
+                    l.on_wal_deleted(popped_wal);
+                }
             }
         }
         drop(state);
@@ -2323,6 +2388,7 @@ fn recover_wals(
     wal_dirs: &[PathBuf],
     mem: &Arc<MemTable>,
     mut vs: VersionSet,
+    tolerant: bool,
 ) -> Result<VersionSet> {
     let min_unflushed = vs.log_number;
     // Collect un-flushed WALs from every WAL directory, keyed by number. WAL numbers are
@@ -2346,7 +2412,13 @@ fn recover_wals(
     let mut last_seq = vs.last_sequence;
     for (num, path) in logs {
         let bytes = fs.read(&path)?;
+        // With recycling, every WAL file may carry a stale tail from a previous use; read
+        // tolerantly so recovery stops cleanly at the last complete record (the recyclable
+        // record format's per-record log number marks where the stale tail begins).
         let mut reader = record::Reader::new(std::io::Cursor::new(bytes), num as u32);
+        if tolerant {
+            reader = reader.tolerant();
+        }
         while let Some(rec) = reader.read_record()? {
             let batch = Batch::from_bytes(rec)?;
             if batch.is_empty() {
