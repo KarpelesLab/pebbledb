@@ -54,10 +54,11 @@ _Done so far: indexed batches (read-your-own-writes), `single_delete` / `delete_
 `log_data`, `new_external_iter`, `ScanInternal`, iterator `set_bounds`, range-key surfacing
 **and `RANGEKEYSET`/`UNSET`/`DEL` coalescing** during iteration, the table-level
 block-property collector/filter mechanism, the disk-health-checking vfs, the `objstorage`
-provider (local + shared/remote), `EstimateDiskUsage`, richer `Metrics`, the LSM view (+
-`db lsm` CLI), flush/compaction **begin** + table/ingest `EventListener` events, **write
-stalls** with stall events, step-wise **format-major-version migrations**, a `Logger`, and
-the `Cleaner` (delete/archive)._
+provider (local + shared/remote), `EstimateDiskUsage`, `Db::table_stats`, richer `Metrics`,
+the LSM view (+ `db lsm` CLI), flush/compaction **begin** + table/ingest `EventListener`
+events, **write stalls** with stall events, step-wise **format-major-version migrations**,
+`Db::excise` / `ingest_and_excise` / `compact`, a `Logger`, and the `Cleaner`
+(delete/archive)._
 
 ### Batches & the write API
 - For indexed batches: a lazy batch iterator merged into `DbIterator` (today `get`/`scan`
@@ -80,9 +81,8 @@ the `Cleaner` (delete/archive)._
 - **Compaction scheduler**: multiple concurrent background compactions, prioritization.
 - **Read-triggered compactions** (`read_compaction_queue`), **delete-only compactions**,
   **elision-only** and **tombstone-density** compactions, **move** compactions,
-  **multilevel** compaction, and flush splitting.
-- **Table stats**: background collection (tombstone/range-key counts, point-deletion bytes)
-  feeding the above heuristics.
+  **multilevel** compaction, and flush splitting. (Table stats — `Db::table_stats`,
+  aggregate tombstone/range-key/entry counts — are available to drive these.)
 - Read/write-amplification scoring, explicit **L0 sublevels**, and **deletion pacing**.
 
 ### Commit pipeline
@@ -97,10 +97,11 @@ the `Cleaner` (delete/archive)._
   carried through the MANIFEST. (Basic blob-file read + ingestion exist.)
 
 ### Ingestion & maintenance
-- **Excise** + **virtual sstables**, **`IngestAndExcise`**, **external-file ingestion**,
-  **download** (rewrite remote/external files to local), and flushable ingests.
-- Checkpoint options (flush-WAL, restrict to spans). (Basic checkpoint + `EstimateDiskUsage`
-  exist.)
+- **Virtual sstables** (so excise/ingest-and-excise rewrite only boundary files instead of
+  compacting), **download** (rewrite remote/external files to local), and flushable ingests.
+  (`Db::excise`, `Db::ingest_and_excise`, external sstable `ingest`, `Db::compact`, and
+  `EstimateDiskUsage` exist; excise currently reclaims via compaction.)
+- Checkpoint options (flush-WAL, restrict to spans). (Basic checkpoint exists.)
 
 ### Remote / disaggregated storage
 - Wire the engine's sstable reads/writes onto the **`objstorage` provider** so shared
