@@ -1259,6 +1259,47 @@ impl DbInner {
         }
     }
 
+    /// Returns a human-readable description of the LSM tree's current shape: one section
+    /// per non-empty level listing each live sstable's file number, size, and user-key
+    /// bounds (Pebble's LSM view, useful for debugging and tooling).
+    pub fn lsm_view(&self) -> String {
+        use std::fmt::Write as _;
+        let state = self.state.lock().unwrap();
+        let esc = |b: &[u8]| -> String {
+            b.iter()
+                .flat_map(|&c| {
+                    if (0x20..0x7f).contains(&c) {
+                        vec![c as char]
+                    } else {
+                        format!("\\x{c:02x}").chars().collect()
+                    }
+                })
+                .collect()
+        };
+        let mut out = String::new();
+        for (lvl, files) in state.vs.current.levels.iter().enumerate() {
+            if files.is_empty() {
+                continue;
+            }
+            let bytes: u64 = files.iter().map(|f| f.size).sum();
+            let _ = writeln!(out, "L{lvl}: {} files, {bytes} bytes", files.len());
+            for f in files {
+                let _ = writeln!(
+                    out,
+                    "  {:06}.sst  {} bytes  [{} .. {}]",
+                    f.file_num,
+                    f.size,
+                    esc(encoded_user_key(&f.smallest)),
+                    esc(encoded_user_key(&f.largest)),
+                );
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(empty)\n");
+        }
+        out
+    }
+
     /// Captures a read snapshot at the current sequence number. Reads through the
     /// returned [`Snapshot`] see a consistent view even as later writes are applied, and
     /// compaction retains every version the snapshot can observe until it is dropped.

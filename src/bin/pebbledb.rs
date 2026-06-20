@@ -45,6 +45,7 @@ fn run(args: &[&str]) -> Result<(), String> {
         ["manifest", "dump", file] => dump_manifest(file),
         ["db", "get", dir, key] => db_get(dir, key),
         ["db", "scan", dir] => db_scan(dir),
+        ["db", "lsm", dir] => db_lsm(dir),
         ["help" | "-h" | "--help"] | [] => {
             print_usage();
             Ok(())
@@ -63,7 +64,8 @@ fn print_usage() {
          pebbledb wal dump      <file.log>\n  \
          pebbledb manifest dump <MANIFEST>\n  \
          pebbledb db get        <dir> <key>\n  \
-         pebbledb db scan       <dir>"
+         pebbledb db scan       <dir>\n  \
+         pebbledb db lsm        <dir>"
     );
 }
 
@@ -244,5 +246,11 @@ fn db_scan(dir: &str) -> Result<(), String> {
         it.next().map_err(|e| format!("advance: {e}"))?;
     }
     println!("# {n} keys");
+    Ok(())
+}
+
+fn db_lsm(dir: &str) -> Result<(), String> {
+    let db = open_ro(dir)?;
+    print!("{}", db.lsm_view());
     Ok(())
 }

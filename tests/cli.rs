@@ -92,6 +92,24 @@ fn wal_dump_runs() {
 }
 
 #[test]
+fn db_lsm_runs() {
+    let dir = temp_dir("lsm");
+    {
+        let db = Db::open(&dir, Options::default()).unwrap();
+        for i in 0..50u32 {
+            db.set(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let (ok, out) = run(&["db", "lsm", dir.to_str().unwrap()]);
+    assert!(ok, "db lsm failed: {out}");
+    assert!(out.contains("files"), "{out}");
+    assert!(out.contains(".sst"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn manifest_dump_runs() {
     let dir = temp_dir("manifest");
     {
