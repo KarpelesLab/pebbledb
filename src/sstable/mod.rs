@@ -723,6 +723,10 @@ impl Reader {
 /// A bidirectional, seekable iterator over all entries of an sstable. Data-block handles
 /// are resolved up front (flattening any two-level index); blocks are loaded on demand as
 /// the cursor crosses block boundaries in either direction.
+///
+/// `Clone` produces an independent cursor over the same (`Arc`-shared) table at the same
+/// position; advancing one does not affect the other.
+#[derive(Clone)]
 pub struct TableIter {
     reader: Arc<Reader>,
     handles: Vec<BlockHandle>,

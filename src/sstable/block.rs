@@ -191,6 +191,7 @@ fn decompress(kind: CompressionType, raw: &[u8]) -> Result<Arc<[u8]>> {
 /// Keys are returned as raw byte slices. For data and index blocks these are encoded
 /// internal keys; for the metaindex they are block names. Seeking uses internal-key
 /// order via [`compare_encoded`].
+#[derive(Clone)]
 pub struct BlockIter {
     block: Arc<[u8]>,
     /// Offset where the restart array begins.

@@ -1187,6 +1187,45 @@ fn eventually_file_only_snapshot_is_consistent_and_scoped() {
 }
 
 #[test]
+fn iterator_clone_is_independent() {
+    let dir = temp_dir("iter-clone");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..10u32 {
+        db.set(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+
+    let mut a = db.iter().unwrap();
+    a.first().unwrap();
+    a.next().unwrap(); // a at k01
+    assert_eq!(a.key(), b"k01");
+
+    // Clone mid-iteration: the clone starts at the same position.
+    let mut b = a.clone();
+    assert_eq!(b.key(), b"k01");
+
+    // Advancing each independently does not affect the other.
+    a.next().unwrap(); // a -> k02
+    assert_eq!(a.key(), b"k02");
+    assert_eq!(b.key(), b"k01"); // b unchanged
+
+    b.next().unwrap();
+    b.next().unwrap(); // b -> k03
+    assert_eq!(b.key(), b"k03");
+    assert_eq!(a.key(), b"k02"); // a unchanged
+
+    // Each can run to completion on its own.
+    let mut count_a = 0;
+    while a.valid() {
+        count_a += 1;
+        a.next().unwrap();
+    }
+    assert_eq!(count_a, 8); // k02..k09
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn efos_survives_disjoint_excise_but_not_overlapping() {
     let dir = temp_dir("efos-excise");
     let db = Db::open(&dir, Options::default()).unwrap();

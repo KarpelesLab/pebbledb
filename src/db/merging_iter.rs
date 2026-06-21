@@ -46,6 +46,9 @@ pub(crate) trait InternalIter {
     fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
         None
     }
+    /// An independent copy of this iterator over the same (`Arc`-shared) sources, at the same
+    /// position — backs `DbIterator::clone`.
+    fn clone_box(&self) -> Box<dyn InternalIter>;
 }
 
 impl InternalIter for TableIter {
@@ -78,6 +81,9 @@ impl InternalIter for TableIter {
     }
     fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
         TableIter::blob_ref(self)
+    }
+    fn clone_box(&self) -> Box<dyn InternalIter> {
+        Box::new(self.clone())
     }
 }
 
@@ -114,6 +120,9 @@ impl InternalIter for OwnedMemIter {
     fn retreat(&mut self) -> Result<()> {
         OwnedMemIter::prev(self);
         Ok(())
+    }
+    fn clone_box(&self) -> Box<dyn InternalIter> {
+        Box::new(self.clone())
     }
 }
 
@@ -221,6 +230,15 @@ impl InternalIter for BoundedIter {
     fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
         self.inner.blob_ref()
     }
+    fn clone_box(&self) -> Box<dyn InternalIter> {
+        Box::new(BoundedIter {
+            inner: self.inner.clone_box(),
+            lo: self.lo.clone(),
+            hi: self.hi.clone(),
+            cmp: self.cmp.clone(),
+            valid: self.valid,
+        })
+    }
 }
 
 /// Interleaves several internal iterators, exposing the globally smallest internal key.
@@ -240,6 +258,17 @@ pub(crate) struct MergingIter {
     /// reverse), if any.
     cur: Option<usize>,
     dir: Dir,
+}
+
+impl Clone for MergingIter {
+    fn clone(&self) -> MergingIter {
+        MergingIter {
+            sources: self.sources.iter().map(|s| s.clone_box()).collect(),
+            cmp: self.cmp.clone(),
+            cur: self.cur,
+            dir: self.dir,
+        }
+    }
 }
 
 impl MergingIter {
@@ -455,6 +484,9 @@ pub struct IterOptions {
 /// Collapses the multiple internal-key versions of each user key down to the single
 /// newest one visible at the snapshot, hides tombstones, applies range-tombstone
 /// shadowing and the merge operator, and honors the configured key bounds.
+/// `Clone` yields an independent cursor over the same pinned sources and snapshot, at the
+/// same position; advancing one does not affect the other.
+#[derive(Clone)]
 pub struct DbIterator {
     merge: MergingIter,
     snapshot: SeqNum,

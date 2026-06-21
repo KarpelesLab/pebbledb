@@ -571,6 +571,7 @@ impl MemTable {
 
 /// A forward iterator over a [`MemTable`] that owns an `Arc` to it and produces encoded
 /// internal keys.
+#[derive(Clone)]
 pub struct OwnedMemIter {
     mem: Arc<MemTable>,
     nd: u32,

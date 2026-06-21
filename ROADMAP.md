@@ -73,14 +73,6 @@ gated on the Go interop CI is under **Byte-parity & interop**.
 
 ### In-crate refinements & optimizations
 
-- [ ] **Iterator `Clone`.** Let a `DbIterator` be cloned into an independent cursor over the
-  same pinned sources.
-  - [ ] Make each source iterator (memtable scan, sstable `TableIter`, merging iter) cloneable
-    or re-creatable from its pinned `Arc`s without reopening files.
-  - [ ] Implement `Clone` for `DbIterator`, sharing the pinned version/source `Arc`s, with a
-    fresh independent position; reset to invalid (caller re-seeks).
-  - [ ] Test: clone mid-iteration, advance each independently, confirm no interference.
-
 - [ ] **`LazyValue` / deferred value fetch.** Avoid materializing a value until the caller
   asks for it (Pebble's `LazyValue`). Must be sound — no `unsafe` lifetime extension.
   - [ ] Add a `LazyValue` type that is either inline bytes or an *owned* fetch handle
