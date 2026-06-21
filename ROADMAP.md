@@ -125,10 +125,6 @@ gated on the Go interop CI is under **Byte-parity & interop**.
     file count; a flat L0 still drains via the file-count guard; point reads over a flat L0
     touch one file per sublevel, not one per file.
 
-- [ ] **Per-op latency metrics.** Extend `Metrics` with latency breakdowns.
-  - [ ] Add counters/histograms for get / set-commit / flush / compaction durations.
-  - [ ] Surface them in `Metrics` and the `lsm`/metrics CLI output.
-
 - [ ] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
   recovery, match `pebble/wal`'s manager surface.
   - [ ] Failover health monitoring (latency-triggered secondary switch) + the related metrics.

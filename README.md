@@ -50,7 +50,9 @@ lineage.
   so a range is removed by rewriting only boundary files), `Options` + `OPTIONS` file with a
   **comparer/merger name→impl registry**,
   tunable level budgets (`l1_max_bytes`), step-wise `FormatMajorVersion` migrations,
-  `Metrics`, an `lsm_view`, **`check_consistency`** (LSM invariant validation), an
+  `Metrics` (read/write amplification, L0 sublevels, and **per-op latencies** for
+  get/commit/flush/compaction), an `lsm_view`, **`check_consistency`** (LSM invariant
+  validation), an
   `EventListener` (flush/compaction, table, WAL/MANIFEST
   create-delete, format upgrade, write-stall, background-error), a `Logger`, and a `Cleaner`
   (delete or archive obsolete files).

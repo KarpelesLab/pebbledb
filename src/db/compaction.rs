@@ -555,6 +555,7 @@ impl DbInner {
     /// writes, and other compactions proceed concurrently. The input files' `compacting`
     /// marks are cleared when the edit applies (or, for a move, inside `run_move_compaction`).
     fn run_compaction(&self, c: Compaction) -> Result<()> {
+        let _timer = self.time_compaction();
         // Phase A (locked): a single non-overlapping file is relevelled by a MANIFEST edit
         // alone (move compaction); otherwise reserve enough output file numbers — output
         // bytes never exceed total input bytes — and snapshot the open-snapshot list.

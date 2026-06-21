@@ -324,5 +324,22 @@ fn db_bench(dir: &str, count: u64) -> Result<(), String> {
         "read:  {count} keys in {read_secs:.3}s ({:.0} ops/sec), {found} found",
         rate(count, read_secs)
     );
+
+    // Per-operation latencies accumulated over the run.
+    let m = db.metrics();
+    let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
+    let row = |name: &str, s: pebbledb::LatencyStat| {
+        println!(
+            "  {name:<11} count={:<9} avg={:>8.2}us max={:>9.2}us",
+            s.count,
+            us(s.avg),
+            us(s.max)
+        );
+    };
+    println!("latencies:");
+    row("get", m.latencies.get);
+    row("commit", m.latencies.commit);
+    row("flush", m.latencies.flush);
+    row("compaction", m.latencies.compaction);
     Ok(())
 }

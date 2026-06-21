@@ -66,6 +66,7 @@ pub use batch::Batch;
 pub use db::{
     ArchiveCleaner, CheckpointOptions, Cleaner, Db, DbIterator, DeleteCleaner, EventListener,
     EventuallyFileOnlySnapshot, FormatMajorVersion, IndexedBatch, InternalScan, IterKeyType,
-    IterOptions, Logger, Metrics, Options, OptionsFile, Snapshot, TableStats, new_external_iter,
+    IterOptions, LatencyStat, Logger, Metrics, OpLatencyMetrics, Options, OptionsFile, Snapshot,
+    TableStats, new_external_iter,
 };
 pub use error::{Error, Result};

@@ -1187,6 +1187,50 @@ fn eventually_file_only_snapshot_is_consistent_and_scoped() {
 }
 
 #[test]
+fn metrics_report_per_op_latencies() {
+    let dir = temp_dir("op-latencies");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 4 * 1024, // force flushes (and thus compactions)
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..500u32 {
+        db.set(format!("k{i:04}").as_bytes(), &[b'v'; 32]).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+    for i in 0..500u32 {
+        let _ = db.get(format!("k{i:04}").as_bytes()).unwrap();
+    }
+
+    let m = db.metrics();
+    // Each op type was exercised, so its count is non-zero.
+    assert!(
+        m.latencies.commit.count >= 500,
+        "commits: {:?}",
+        m.latencies.commit
+    );
+    assert!(m.latencies.get.count >= 500, "gets: {:?}", m.latencies.get);
+    assert!(
+        m.latencies.flush.count >= 1,
+        "flushes: {:?}",
+        m.latencies.flush
+    );
+    assert!(
+        m.latencies.compaction.count >= 1,
+        "compactions: {:?}",
+        m.latencies.compaction
+    );
+    // avg never exceeds max for a populated stat.
+    assert!(m.latencies.get.avg <= m.latencies.get.max);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn iterator_clone_is_independent() {
     let dir = temp_dir("iter-clone");
     let db = Db::open(&dir, Options::default()).unwrap();

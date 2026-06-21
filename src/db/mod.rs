@@ -40,7 +40,9 @@ pub use options_file::{FormatMajorVersion, OptionsFile};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::base::comparer::{Comparer, DefaultComparer};
 use crate::base::internal_key::{
@@ -432,6 +434,85 @@ impl crate::sstable::BlobResolver for BlobStore {
     }
 }
 
+/// A lock-free accumulator for one operation's latency: call count, summed nanoseconds, and
+/// the maximum seen. Recorded off any lock so it never adds contention.
+#[derive(Default)]
+struct LatencySum {
+    count: AtomicU64,
+    total_nanos: AtomicU64,
+    max_nanos: AtomicU64,
+}
+
+impl LatencySum {
+    fn record(&self, d: Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = d.as_nanos().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Relaxed);
+        self.total_nanos.fetch_add(n, Relaxed);
+        self.max_nanos.fetch_max(n, Relaxed);
+    }
+
+    fn snapshot(&self) -> LatencyStat {
+        use std::sync::atomic::Ordering::Relaxed;
+        let count = self.count.load(Relaxed);
+        let total = self.total_nanos.load(Relaxed);
+        LatencyStat {
+            count,
+            avg: total
+                .checked_div(count)
+                .map(Duration::from_nanos)
+                .unwrap_or(Duration::ZERO),
+            max: Duration::from_nanos(self.max_nanos.load(Relaxed)),
+        }
+    }
+}
+
+/// Per-operation latency accumulators (get / commit / flush / compaction).
+#[derive(Default)]
+struct OpLatencies {
+    get: LatencySum,
+    commit: LatencySum,
+    flush: LatencySum,
+    compaction: LatencySum,
+}
+
+/// An RAII timer that records its elapsed duration into a [`LatencySum`] when dropped, so the
+/// measurement covers all exit paths (including `?` early returns).
+pub(crate) struct LatencyTimer<'a> {
+    start: Instant,
+    sum: &'a LatencySum,
+}
+
+impl Drop for LatencyTimer<'_> {
+    fn drop(&mut self) {
+        self.sum.record(self.start.elapsed());
+    }
+}
+
+/// A summary of one operation's observed latency, in [`Metrics::latencies`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LatencyStat {
+    /// Number of operations recorded.
+    pub count: u64,
+    /// Mean latency over all recorded operations (zero if none).
+    pub avg: Duration,
+    /// Maximum latency observed.
+    pub max: Duration,
+}
+
+/// Per-operation latency summaries, in [`Metrics::latencies`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpLatencyMetrics {
+    /// Point lookups (`get` / snapshot `get`).
+    pub get: LatencyStat,
+    /// Write-batch commits (`set` / `delete` / `write` / `apply`).
+    pub commit: LatencyStat,
+    /// Memtable flushes.
+    pub flush: LatencyStat,
+    /// Compactions.
+    pub compaction: LatencyStat,
+}
+
 /// The shared inner state of a [`Db`], held behind an `Arc` so the background flush worker
 /// can operate on it concurrently with foreground reads and writes.
 pub struct DbInner {
@@ -456,6 +537,8 @@ pub struct DbInner {
     /// Open `EventuallyFileOnlySnapshot`s: each registers its spans and an invalidation flag
     /// that an overlapping `excise` flips (an excise disjoint from the spans leaves it valid).
     efos: Mutex<Vec<EfosReg>>,
+    /// Per-operation latency accumulators, surfaced in [`Metrics::latencies`].
+    latencies: OpLatencies,
     /// Optional event listener.
     listener: Option<Arc<dyn EventListener>>,
     /// Optional merge operator.
@@ -932,6 +1015,7 @@ impl DbInner {
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
                 efos: Mutex::new(Vec::new()),
+                latencies: OpLatencies::default(),
                 listener: opts.event_listener.clone(),
                 merger: merger.clone(),
                 block_cache: if opts.block_cache_size > 0 {
@@ -1082,6 +1166,7 @@ impl DbInner {
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
             efos: Mutex::new(Vec::new()),
+            latencies: OpLatencies::default(),
             listener: opts.event_listener.clone(),
             merger: merger.clone(),
             block_cache: if opts.block_cache_size > 0 {
@@ -1449,6 +1534,7 @@ impl DbInner {
         if batch.is_empty() {
             return Ok(());
         }
+        let _timer = self.time_commit();
         let slot = Arc::new(CommitSlot {
             result: Mutex::new(None),
             cv: Condvar::new(),
@@ -1715,6 +1801,8 @@ impl DbInner {
             let file_nums: Vec<u64> = (0..n).map(|_| state.vs.allocate_file_number()).collect();
             (mem, file_nums)
         };
+        // Time only an actual flush (an empty immutable queue returned early above).
+        let _timer = self.time_flush();
         if let Some(l) = &self.listener {
             l.on_flush_begin();
         }
@@ -1859,6 +1947,7 @@ impl DbInner {
     /// if its sequence number exceeds every covering tombstone seen so far (and is a
     /// non-tombstone kind).
     pub fn get_at(&self, key: &[u8], snapshot: SeqNum) -> Result<Option<Vec<u8>>> {
+        let _timer = self.time_get();
         // Snapshot the volatile state under the lock, then read without holding it.
         let (mem, imm, version) = {
             let state = self.state.lock().unwrap();
@@ -2314,6 +2403,31 @@ impl DbInner {
         total
     }
 
+    fn time_get(&self) -> LatencyTimer<'_> {
+        LatencyTimer {
+            start: Instant::now(),
+            sum: &self.latencies.get,
+        }
+    }
+    fn time_commit(&self) -> LatencyTimer<'_> {
+        LatencyTimer {
+            start: Instant::now(),
+            sum: &self.latencies.commit,
+        }
+    }
+    fn time_flush(&self) -> LatencyTimer<'_> {
+        LatencyTimer {
+            start: Instant::now(),
+            sum: &self.latencies.flush,
+        }
+    }
+    pub(super) fn time_compaction(&self) -> LatencyTimer<'_> {
+        LatencyTimer {
+            start: Instant::now(),
+            sum: &self.latencies.compaction,
+        }
+    }
+
     /// Returns a point-in-time [`Metrics`] snapshot of the LSM tree.
     pub fn metrics(&self) -> Metrics {
         let state = self.state.lock().unwrap();
@@ -2353,6 +2467,12 @@ impl DbInner {
             l0_sublevels,
             read_amplification,
             write_amplification,
+            latencies: OpLatencyMetrics {
+                get: self.latencies.get.snapshot(),
+                commit: self.latencies.commit.snapshot(),
+                flush: self.latencies.flush.snapshot(),
+                compaction: self.latencies.compaction.snapshot(),
+            },
         }
     }
 
@@ -2819,6 +2939,8 @@ pub struct Metrics {
     /// write-amplification factor (`1.0` when nothing has been compacted; `0.0` before any
     /// flush).
     pub write_amplification: f64,
+    /// Per-operation latency summaries (get / commit / flush / compaction).
+    pub latencies: OpLatencyMetrics,
 }
 
 /// Creates an iterator over a set of sstables **without** ingesting them into a database,
