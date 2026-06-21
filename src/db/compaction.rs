@@ -558,7 +558,7 @@ impl DbInner {
         // Phase A (locked): a single non-overlapping file is relevelled by a MANIFEST edit
         // alone (move compaction); otherwise reserve enough output file numbers — output
         // bytes never exceed total input bytes — and snapshot the open-snapshot list.
-        let (output_nums, snapshots) = {
+        let (output_nums, snapshots, external) = {
             let mut state = self.state.lock().unwrap();
             if c.inputs.len() == 1
                 && c.overlap.is_empty()
@@ -577,7 +577,46 @@ impl DbInner {
             let target = self.target_file_size_for(c.output_level).max(1);
             let n = (total_in / target + 2) as usize;
             let nums: Vec<u64> = (0..n).map(|_| state.vs.allocate_file_number()).collect();
-            (nums, self.open_snapshots())
+            // User-key bounds of every live file NOT part of this compaction. A tombstone may
+            // only be elided if none of these could hold an older version it shadows: because
+            // tombstones travel down independently of the keys they cover (and move
+            // compactions can relevel a tombstone-bearing file past older data), an older
+            // covered version can sit in a file outside the compaction — at a shallower level
+            // or, at this level, a file the picker did not include. Dropping the tombstone
+            // would then resurrect it.
+            let in_compaction: std::collections::HashSet<u64> = c
+                .inputs
+                .iter()
+                .chain(c.mid.iter())
+                .chain(c.overlap.iter())
+                .map(|f| f.file_num)
+                .collect();
+            let mut external: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for level in state.vs.current.levels.iter() {
+                for f in level {
+                    if !in_compaction.contains(&f.file_num) {
+                        external.push((
+                            encoded_user_key(&f.smallest).to_vec(),
+                            encoded_user_key(&f.largest).to_vec(),
+                        ));
+                    }
+                }
+            }
+            (nums, self.open_snapshots(), external)
+        };
+        // An external file overlaps point key `k` (inclusive bounds).
+        let ext_covers_key = |k: &[u8]| -> bool {
+            external.iter().any(|(s, l)| {
+                self.cmp.compare(s, k) != std::cmp::Ordering::Greater
+                    && self.cmp.compare(l, k) != std::cmp::Ordering::Less
+            })
+        };
+        // An external file overlaps the half-open span `[a, b)`.
+        let ext_covers_span = |a: &[u8], b: &[u8]| -> bool {
+            external.iter().any(|(s, l)| {
+                self.cmp.compare(s, b) == std::cmp::Ordering::Less
+                    && self.cmp.compare(l, a) != std::cmp::Ordering::Less
+            })
         };
         let mut output_nums = output_nums.into_iter();
 
@@ -628,17 +667,36 @@ impl DbInner {
         }
         let mut merge = MergingIter::new(sources, self.cmp.clone())?;
 
-        // Tombstones (point and range) can be dropped only when compacting into the
-        // lowest level, where there is no older data left to shadow. Range keys are
-        // always carried (their resolution is deferred to read time).
-        let drop_tombstones = c.output_level == NUM_LEVELS - 1;
-        let write_tombstones = !drop_tombstones && !tombstones.is_empty();
+        // A tombstone (point or range) can be elided only when compacting into the bottom
+        // level AND it sits below every open snapshot — i.e. in the last snapshot stripe,
+        // where no reader can observe a version it shadows. A tombstone in a higher stripe
+        // still shadows older versions of its key that are being preserved for a snapshot in
+        // a lower stripe; dropping it would resurrect them (a deleted key reappearing). Range
+        // keys are always carried (their resolution is deferred to read time).
+        let bottom = c.output_level == NUM_LEVELS - 1;
+        let last_stripe = snapshots.len();
         let write_range_keys = !range_keys.is_empty();
         tombstones.sort_by(|a, b| {
             self.cmp
                 .compare(&a.start, &b.start)
                 .then(b.seqnum.cmp(&a.seqnum))
         });
+        // Range tombstones to emit: at the bottom level, only those a snapshot could still
+        // need (not in the last stripe) — the rest are safe to elide. Above the bottom level,
+        // all of them (there is older data below that they must keep shadowing).
+        let retained_tombstones: Vec<RangeTombstone> = if bottom {
+            tombstones
+                .iter()
+                .filter(|t| {
+                    snapshot_stripe(&snapshots, t.seqnum) != last_stripe
+                        || ext_covers_span(&t.start, &t.end)
+                })
+                .cloned()
+                .collect()
+        } else {
+            tombstones.clone()
+        };
+        let write_tombstones = !retained_tombstones.is_empty();
         range_keys.sort_by(|a, b| {
             self.cmp
                 .compare(&a.start, &b.start)
@@ -705,10 +763,12 @@ impl DbInner {
                 continue;
             }
 
-            // Tombstones may be elided only at the bottom level and only in the top
-            // stripe (no open snapshot can observe them); doing so also shadows older
+            // A point tombstone may be elided only at the bottom level and only in the last
+            // stripe (below every open snapshot), where no older version of the key survives
+            // for a snapshot to observe. Eliding it in a higher stripe would resurrect an
+            // older version preserved for a lower-stripe snapshot. Doing so also shadows older
             // versions in this stripe.
-            if drop_tombstones && is_tombstone(kind) && stripe == 0 {
+            if bottom && is_tombstone(kind) && stripe == last_stripe && !ext_covers_key(ukey) {
                 terminated = true;
                 continue;
             }
@@ -725,7 +785,7 @@ impl DbInner {
                 })?;
                 builder = Some(self.new_output(
                     num,
-                    &tombstones,
+                    &retained_tombstones,
                     write_tombstones,
                     &range_keys,
                     write_range_keys,
@@ -752,7 +812,7 @@ impl DbInner {
             })?;
             let b = self.new_output(
                 num,
-                &tombstones,
+                &retained_tombstones,
                 write_tombstones,
                 &range_keys,
                 write_range_keys,
