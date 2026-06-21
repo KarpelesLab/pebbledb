@@ -22,10 +22,12 @@ lineage.
 ## Capabilities
 
 - **Writes**: `set` / `delete` / `single_delete` / `merge` / `delete_range`, range keys,
-  atomic `Batch`es, and **indexed batches** (read-your-own-writes via `Db::indexed_batch`,
+  atomic `Batch`es (a batch larger than the memtable commits as its own flushable, so batch
+  size is unbounded), and **indexed batches** (read-your-own-writes via `Db::indexed_batch`,
   including a **lazy `IndexedBatch::iter`** that layers pending writes over the committed view).
 - **Reads**: point `get`, snapshots (incl. an **EventuallyFileOnlySnapshot** scoped to key
-  spans), a **bidirectional** iterator (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with
+  spans, invalidated by an overlapping `excise` but not a disjoint one), a **bidirectional**,
+  **cloneable** iterator (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with
   `IterOptions` bounds, `set_bounds`, `seek_prefix_ge`, **key-type selection**
   (`IterKeyType` points / ranges / both), range-key surfacing + coalescing,
   **range-key masking**, **block-property filters** that skip non-matching sstables, and
