@@ -241,6 +241,164 @@ impl InternalIter for BoundedIter {
     }
 }
 
+/// Presents a sorted, non-overlapping sequence of internal iterators — the files of one L1+
+/// level, or one L0 sublevel — as a single ordered iterator. The [`MergingIter`] then pays one
+/// source per run rather than one per file (its per-step cost is linear in the source count),
+/// and seeks binary-search to the containing part. The parts must be ascending and
+/// non-overlapping by key range; `bounds[i]` is part `i`'s `[smallest, largest]` encoded
+/// internal-key range.
+pub(crate) struct ConcatIter {
+    parts: Vec<Box<dyn InternalIter>>,
+    bounds: Vec<(Vec<u8>, Vec<u8>)>,
+    cmp: Arc<dyn Comparer>,
+    cur: Option<usize>,
+}
+
+impl ConcatIter {
+    pub(crate) fn new(
+        parts: Vec<Box<dyn InternalIter>>,
+        bounds: Vec<(Vec<u8>, Vec<u8>)>,
+        cmp: Arc<dyn Comparer>,
+    ) -> ConcatIter {
+        debug_assert_eq!(parts.len(), bounds.len());
+        ConcatIter {
+            parts,
+            bounds,
+            cmp,
+            cur: None,
+        }
+    }
+
+    /// Positions on the first valid entry of the first part at or after index `i`.
+    fn first_from(&mut self, i: usize) -> Result<()> {
+        let mut j = i;
+        while j < self.parts.len() {
+            self.parts[j].first()?;
+            if self.parts[j].valid() {
+                self.cur = Some(j);
+                return Ok(());
+            }
+            j += 1;
+        }
+        self.cur = None;
+        Ok(())
+    }
+
+    /// Positions on the last valid entry of the first part at or before index `i`.
+    fn last_from(&mut self, i: isize) -> Result<()> {
+        let mut j = i;
+        while j >= 0 {
+            self.parts[j as usize].last()?;
+            if self.parts[j as usize].valid() {
+                self.cur = Some(j as usize);
+                return Ok(());
+            }
+            j -= 1;
+        }
+        self.cur = None;
+        Ok(())
+    }
+}
+
+impl InternalIter for ConcatIter {
+    fn first(&mut self) -> Result<()> {
+        self.first_from(0)
+    }
+    fn last(&mut self) -> Result<()> {
+        self.last_from(self.parts.len() as isize - 1)
+    }
+    fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        // First part whose largest bound is >= target.
+        let mut lo = 0usize;
+        let mut hi = self.parts.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].1, target)
+                == std::cmp::Ordering::Less
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= self.parts.len() {
+            self.cur = None;
+            return Ok(());
+        }
+        self.parts[lo].seek_ge(target)?;
+        if self.parts[lo].valid() {
+            self.cur = Some(lo);
+            Ok(())
+        } else {
+            // `target` is above this part's keys; the answer (if any) opens the next part.
+            self.first_from(lo + 1)
+        }
+    }
+    fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+        // Last part whose smallest bound is < target (the one before the first with smallest >=).
+        let mut lo = 0usize;
+        let mut hi = self.parts.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].0, target)
+                == std::cmp::Ordering::Less
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            self.cur = None;
+            return Ok(());
+        }
+        let idx = lo - 1;
+        self.parts[idx].seek_lt(target)?;
+        if self.parts[idx].valid() {
+            self.cur = Some(idx);
+            Ok(())
+        } else {
+            self.last_from(idx as isize - 1)
+        }
+    }
+    fn valid(&self) -> bool {
+        self.cur.is_some_and(|i| self.parts[i].valid())
+    }
+    fn key(&self) -> &[u8] {
+        self.parts[self.cur.expect("valid")].key()
+    }
+    fn value(&self) -> &[u8] {
+        self.parts[self.cur.expect("valid")].value()
+    }
+    fn advance(&mut self) -> Result<()> {
+        let i = self.cur.expect("advance on invalid concat iter");
+        self.parts[i].advance()?;
+        if !self.parts[i].valid() {
+            self.first_from(i + 1)?;
+        }
+        Ok(())
+    }
+    fn retreat(&mut self) -> Result<()> {
+        let i = self.cur.expect("retreat on invalid concat iter");
+        self.parts[i].retreat()?;
+        if !self.parts[i].valid() {
+            self.last_from(i as isize - 1)?;
+        }
+        Ok(())
+    }
+    fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
+        self.cur.and_then(|i| self.parts[i].blob_ref())
+    }
+    fn clone_box(&self) -> Box<dyn InternalIter> {
+        Box::new(ConcatIter {
+            parts: self.parts.iter().map(|p| p.clone_box()).collect(),
+            bounds: self.bounds.clone(),
+            cmp: self.cmp.clone(),
+            cur: self.cur,
+        })
+    }
+}
+
 /// Interleaves several internal iterators, exposing the globally smallest internal key.
 ///
 /// Used both by [`DbIterator`] (with snapshot collapsing on top) and directly by

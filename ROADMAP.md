@@ -103,19 +103,18 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: concurrent writers proceed during an ingest; the ingested values still win over
     older unflushed keys.
 
-- [ ] **Sublevel-aware L0 reads, then sublevel scoring.** Pebble scores L0 by sublevel count
-  (read amplification) and keeps L0 reads cheap by treating each sublevel as one
-  binary-searchable run. Our reader instead consults every L0 file, so our real read
-  amplification *is* the L0 file count — which is exactly what the picker already scores. Doing
-  sublevel scoring alone (with Pebble's high `L0CompactionFileThreshold`) would let
-  non-overlapping L0 files pile up and regress reads, so the two pieces must land together:
-  - [ ] Group L0 files into sublevels (non-overlapping runs) for the read path; build one
-    binary-searching iterator per sublevel instead of one per file (merging iter + point `get`).
+- [ ] **Sublevel scoring + lazy run files (the second half of sublevel-aware reads).** The
+  read path now presents each level (and each L0 sublevel) as one ordered `ConcatIter` run, so
+  the merging iterator pays one source per run, not per file (done). What remains is letting L0
+  *file count* grow (Pebble scores L0 by sublevel count) without paying for it:
+  - [ ] Make `ConcatIter`/`build_run_iters` open a run's files lazily (on seek/cross), so a
+    flat L0 of many files does not open them all up front when a scan starts.
   - [ ] Then switch the picker's L0 score from file count to sublevel count
-    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`).
-  - [ ] Test: a deep (many-sublevel) L0 compacts before a flat (one-sublevel) L0 of the same
-    file count; a flat L0 still drains via the file-count guard; point reads over a flat L0
-    touch one file per sublevel, not one per file.
+    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`). Until lazy
+    opening lands, file-count scoring is the right fit — it keeps a run's file set small, which
+    bounds both scan-setup cost (files opened per run) and L0 read amplification.
+  - [ ] Test: a deep (many-sublevel) L0 compacts before a flat (one-sublevel) L0; a flat L0
+    still drains via the file-count guard; a scan over a flat L0 opens files lazily.
 
 - [ ] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
   recovery, match `pebble/wal`'s manager surface.

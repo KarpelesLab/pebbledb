@@ -34,6 +34,10 @@ mod options_file;
 
 pub use indexed_batch::IndexedBatch;
 use merging_iter::InternalIter;
+
+/// One ordered run's point iterators and their parallel `[smallest, largest]` bounds — the
+/// inputs to a [`merging_iter::ConcatIter`].
+type RunIters = (Vec<Box<dyn InternalIter>>, Vec<(Vec<u8>, Vec<u8>)>);
 pub use merging_iter::{DbIterator, IterKeyType, IterOptions};
 pub use options_file::{FormatMajorVersion, OptionsFile};
 
@@ -2227,51 +2231,96 @@ impl DbInner {
                 sources.push(Box::new(m.scan()));
             }
         }
-        for level in version.levels.iter() {
-            for f in level {
-                // A virtual sstable reads from its physical backing file, bounded to its range.
-                let reader = self.open_reader(f.physical_num())?;
-                // Range tombstones and range keys must be consulted even when a block-property
-                // filter rules the table's point keys out: they can shadow keys elsewhere. For
-                // a virtual file, surface only range keys starting within its bounds (so a
-                // backing range key in an excised span is not resurfaced).
-                tombstones.extend_from_slice(reader.range_tombstones());
-                if f.backing.is_some() {
-                    let lo = encoded_user_key(&f.smallest);
-                    let hi = encoded_user_key(&f.largest);
-                    for rk in reader.range_keys() {
-                        if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
-                            && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
-                        {
-                            range_keys.push(rk.clone());
-                        }
-                    }
-                } else {
-                    range_keys.extend_from_slice(reader.range_keys());
-                }
-                let point_excluded = opts
-                    .block_property_filters
-                    .iter()
-                    .any(|filter| !reader.may_match_block_property(filter.as_ref()));
-                if !point_excluded {
-                    // Within a table that passes the table-level filter, skip individual data
-                    // blocks ruled out by the same filters via their per-block properties.
-                    let inner: Box<dyn InternalIter> =
-                        Box::new(reader.iter_with_filters(&opts.block_property_filters)?);
-                    if f.backing.is_some() {
-                        sources.push(Box::new(merging_iter::BoundedIter::new(
-                            inner,
-                            f.smallest.clone(),
-                            f.largest.clone(),
+        // Each LSM level contributes one merge source per *ordered run* rather than one per
+        // file, so the merging iterator (whose per-step cost is linear in its source count)
+        // stays cheap as files accumulate. L1+ files are already one non-overlapping run; L0
+        // files overlap, so they are grouped into sublevels (each a run).
+        for (lvl, level) in version.levels.iter().enumerate() {
+            if level.is_empty() {
+                continue;
+            }
+            if lvl == 0 {
+                for sub in l0_sublevels(level, self.cmp.as_ref()) {
+                    let (parts, bounds) =
+                        self.build_run_iters(&sub, opts, &mut tombstones, &mut range_keys)?;
+                    if !parts.is_empty() {
+                        sources.push(Box::new(merging_iter::ConcatIter::new(
+                            parts,
+                            bounds,
                             self.cmp.clone(),
                         )));
-                    } else {
-                        sources.push(inner);
                     }
+                }
+            } else {
+                let (parts, bounds) =
+                    self.build_run_iters(level, opts, &mut tombstones, &mut range_keys)?;
+                if !parts.is_empty() {
+                    sources.push(Box::new(merging_iter::ConcatIter::new(
+                        parts,
+                        bounds,
+                        self.cmp.clone(),
+                    )));
                 }
             }
         }
         Ok((sources, tombstones, range_keys))
+    }
+
+    /// Opens the point iterators for one ordered run of files (a level or L0 sublevel),
+    /// collecting their range tombstones and range keys into `tombstones` / `range_keys` along
+    /// the way. Returns the per-file point iterators and their `[smallest, largest]` bounds, in
+    /// the input order (ascending, non-overlapping) — ready to wrap in a [`ConcatIter`]. A file
+    /// excluded by a block-property filter contributes no point iterator but its spans are still
+    /// collected (they can shadow keys elsewhere).
+    fn build_run_iters(
+        &self,
+        files: &[Arc<FileMetadata>],
+        opts: &IterOptions,
+        tombstones: &mut Vec<RangeTombstone>,
+        range_keys: &mut Vec<RangeKeyEntry>,
+    ) -> Result<RunIters> {
+        let mut parts: Vec<Box<dyn InternalIter>> = Vec::new();
+        let mut bounds: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for f in files {
+            // A virtual sstable reads from its physical backing file, bounded to its range.
+            let reader = self.open_reader(f.physical_num())?;
+            tombstones.extend_from_slice(reader.range_tombstones());
+            if f.backing.is_some() {
+                let lo = encoded_user_key(&f.smallest);
+                let hi = encoded_user_key(&f.largest);
+                for rk in reader.range_keys() {
+                    if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
+                        && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
+                    {
+                        range_keys.push(rk.clone());
+                    }
+                }
+            } else {
+                range_keys.extend_from_slice(reader.range_keys());
+            }
+            let point_excluded = opts
+                .block_property_filters
+                .iter()
+                .any(|filter| !reader.may_match_block_property(filter.as_ref()));
+            if point_excluded {
+                continue;
+            }
+            let inner: Box<dyn InternalIter> =
+                Box::new(reader.iter_with_filters(&opts.block_property_filters)?);
+            let it: Box<dyn InternalIter> = if f.backing.is_some() {
+                Box::new(merging_iter::BoundedIter::new(
+                    inner,
+                    f.smallest.clone(),
+                    f.largest.clone(),
+                    self.cmp.clone(),
+                ))
+            } else {
+                inner
+            };
+            parts.push(it);
+            bounds.push((f.smallest.clone(), f.largest.clone()));
+        }
+        Ok((parts, bounds))
     }
 
     /// Returns a lazy iterator over the database **as if `batch` were already applied** on top
@@ -3251,37 +3300,46 @@ fn clone_commit_result(r: &Result<()>) -> Result<()> {
     }
 }
 
-/// Computes the number of **L0 sublevels** (Pebble's read-amplification measure for L0):
+/// Groups the L0 files into **sublevels** (Pebble's read-amplification structure for L0):
 /// L0 files can overlap, so they are greedily packed — newest first — into the fewest layers
-/// of mutually non-overlapping files. Within one sublevel a read touches at most one file, so
-/// the sublevel count is L0's contribution to read amplification.
-fn l0_sublevel_count(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> usize {
+/// of mutually non-overlapping files. Within one sublevel a read touches at most one file. Each
+/// returned sublevel is sorted ascending by user key (so it forms one ordered run, e.g. for a
+/// [`ConcatIter`]); sublevels are ordered newest-first.
+fn l0_sublevels(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> Vec<Vec<Arc<FileMetadata>>> {
     // Process newest-first so older versions settle into deeper sublevels.
-    let mut ordered: Vec<&Arc<FileMetadata>> = files.iter().collect();
+    let mut ordered: Vec<Arc<FileMetadata>> = files.to_vec();
     ordered.sort_by_key(|f| std::cmp::Reverse(f.largest_seqnum));
-    // Each sublevel records the [smallest, largest] user-key spans it already holds.
-    let mut sublevels: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    let mut sublevels: Vec<Vec<Arc<FileMetadata>>> = Vec::new();
     for f in ordered {
-        let fs = encoded_user_key(&f.smallest).to_vec();
-        let fl = encoded_user_key(&f.largest).to_vec();
+        let fs = encoded_user_key(&f.smallest);
+        let fl = encoded_user_key(&f.largest);
         // Place in the first sublevel with no range overlap; else start a new one.
         let mut placed = false;
         for sub in &mut sublevels {
-            let overlaps = sub.iter().any(|(s, l)| {
-                cmp.compare(&fs, l) != std::cmp::Ordering::Greater
-                    && cmp.compare(s, &fl) != std::cmp::Ordering::Greater
+            let overlaps = sub.iter().any(|g| {
+                cmp.compare(fs, encoded_user_key(&g.largest)) != std::cmp::Ordering::Greater
+                    && cmp.compare(encoded_user_key(&g.smallest), fl) != std::cmp::Ordering::Greater
             });
             if !overlaps {
-                sub.push((fs.clone(), fl.clone()));
+                sub.push(f.clone());
                 placed = true;
                 break;
             }
         }
         if !placed {
-            sublevels.push(vec![(fs, fl)]);
+            sublevels.push(vec![f]);
         }
     }
-    sublevels.len()
+    // Order each sublevel's files ascending by key so it reads as one ordered run.
+    for sub in &mut sublevels {
+        sub.sort_by(|a, b| compare_encoded(cmp, &a.smallest, &b.smallest));
+    }
+    sublevels
+}
+
+/// The number of L0 sublevels — L0's contribution to read amplification.
+fn l0_sublevel_count(files: &[Arc<FileMetadata>], cmp: &dyn Comparer) -> usize {
+    l0_sublevels(files, cmp).len()
 }
 
 /// Builds the sstable [`WriterOptions`] the engine uses, enabling value-block separation in a
@@ -3650,34 +3708,48 @@ mod tests {
             ..Default::default()
         };
         let db = Db::open(&dir, opts).unwrap();
-        // Many distinct keys across many flushes; L0 should be compacted into deeper
-        // levels rather than growing without bound.
-        for i in 0..3000u32 {
-            db.set(format!("k{i:06}").as_bytes(), format!("v{i:06}").as_bytes())
+        // Repeatedly overwrite the same small key space across many forced flushes: the L0
+        // files overlap, stacking into sublevels. The engine scores L0 by sublevel count
+        // (read amplification), so it compacts the stack down into deeper levels.
+        for round in 0..40u32 {
+            for i in 0..200u32 {
+                db.set(
+                    format!("k{i:04}").as_bytes(),
+                    format!("v{round}-{i}").as_bytes(),
+                )
                 .unwrap();
+            }
+            db.flush().unwrap();
         }
-        // Background compaction drains L0 asynchronously, so poll for the drained state rather
-        // than assuming the worker has already caught up the instant the write loop returns
-        // (it can lag under CI load).
-        let mut counts = db.level_file_counts();
+        // Background compaction drains L0 asynchronously, so poll for the read amplification
+        // (sublevel count) to settle below the trigger rather than assuming the worker has
+        // already caught up (it can lag under CI load). The raw L0 file count is not the
+        // metric — a flat L0 may keep many files at one sublevel.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while counts[0] >= 4 && std::time::Instant::now() < deadline {
+        let mut m = db.metrics();
+        while m.l0_sublevels >= 4 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            counts = db.level_file_counts();
+            m = db.metrics();
         }
-        assert!(counts[0] < 4, "L0 should be drained, got {counts:?}");
         assert!(
-            counts[1..].iter().sum::<usize>() > 0,
-            "deeper levels should hold files, got {counts:?}"
+            m.l0_sublevels < 4,
+            "L0 sublevels (read amp) should drain, got {} (files {:?})",
+            m.l0_sublevels,
+            m.level_files
         );
-        // All reads remain correct after compaction.
-        for i in (0..3000u32).step_by(137) {
+        assert!(
+            m.level_files[1..].iter().sum::<usize>() > 0,
+            "deeper levels should hold files, got {:?}",
+            m.level_files
+        );
+        // All reads remain correct after compaction (latest value per key).
+        for i in (0..200u32).step_by(7) {
             assert_eq!(
-                db.get(format!("k{i:06}").as_bytes()).unwrap(),
-                Some(format!("v{i:06}").into_bytes())
+                db.get(format!("k{i:04}").as_bytes()).unwrap(),
+                Some(format!("v39-{i}").into_bytes())
             );
         }
-        assert_eq!(collect(&db).len(), 3000);
+        assert_eq!(collect(&db).len(), 200);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3883,11 +3955,24 @@ mod tests {
             ..Default::default()
         };
         let db = Db::open(&dir, opts).unwrap();
-        for i in 0..3000u32 {
-            db.set(format!("k{i:06}").as_bytes(), b"v").unwrap();
+        // Overwrite a small key space across many forced flushes so the L0 files overlap and
+        // stack into sublevels, which the (sublevel-scored) picker then compacts down.
+        for round in 0..30u32 {
+            for i in 0..200u32 {
+                db.set(
+                    format!("k{i:04}").as_bytes(),
+                    format!("v{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+            db.flush().unwrap();
         }
-        db.flush().unwrap();
 
+        // Give the background worker a moment to run the triggered compaction(s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while db.metrics().compaction_count == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let m = db.metrics();
         assert!(m.flush_count >= 1, "flushes: {}", m.flush_count);
         assert!(
