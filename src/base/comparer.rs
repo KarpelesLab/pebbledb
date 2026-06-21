@@ -54,6 +54,18 @@ pub trait Comparer: Send + Sync {
         key.len()
     }
 
+    /// The name of this comparer's prefix extractor, or `None` if it has none.
+    ///
+    /// When `Some`, [`split`](Self::split) yields a meaningful key prefix and the sstable
+    /// writer builds the table's bloom filter over **prefixes** (not whole keys), recording
+    /// this name in the table properties. A reader then uses the bloom to skip a whole table
+    /// during [`seek_prefix_ge`](crate::DbIterator::seek_prefix_ge) when no key shares the
+    /// sought prefix. The default (bytewise) comparer is suffix-less and returns `None`, so its
+    /// bloom stays whole-key — better for point lookups — and no prefix skipping is attempted.
+    fn prefix_extractor_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Appends to `dst` a key in the range `[a, b)` that is `>= a` and `< b`, preferring
     /// the shortest such key. Requires `a < b`. Used to shorten sstable index keys.
     fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]);

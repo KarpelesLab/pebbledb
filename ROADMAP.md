@@ -83,17 +83,6 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: iterate without touching values does no value-block/blob reads (count via a
     probe `RemoteStorage`/reader).
 
-- [ ] **Bloom-skip during `seek_prefix_ge`.** Skip a whole sstable when its prefix bloom
-  rules the seek prefix out (currently unsound because the default comparer is suffix-less,
-  so the bloom is whole-key).
-  - [ ] Add a prefix-extractor concept (`Comparer::split` already exists; expose a
-    prefix length / extractor on `Options`).
-  - [ ] Record the prefix-extractor identity in table properties at write time.
-  - [ ] In `seek_prefix_ge`, only consult the bloom for a table whose recorded extractor
-    matches; skip the table when the prefix is absent.
-  - [ ] Test: seek for an absent prefix skips tables (assert via block-read counts) and never
-    skips a present prefix.
-
 - [ ] **Flushable ingest (queue, don't force-flush).** Today `ingest` forces a memtable flush
   for correctness; instead queue the ingested sstables as a flushable so writers aren't
   blocked.

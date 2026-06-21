@@ -567,8 +567,17 @@ impl<W: Write> Writer<W> {
         ) {
             self.num_deletions += 1;
         }
+        // With a prefix extractor, the bloom is built over key *prefixes* so a reader can skip
+        // the table during a prefix seek; otherwise over whole user keys. (Consecutive
+        // duplicates — common for prefixes — are deduped by the filter writer.)
+        let uk = crate::base::internal_key::encoded_user_key(internal_key);
+        let bloom_len = if self.cmp.prefix_extractor_name().is_some() {
+            self.cmp.split(uk)
+        } else {
+            uk.len()
+        };
         if let Some(fw) = self.filter.as_mut() {
-            fw.add_key(crate::base::internal_key::encoded_user_key(internal_key));
+            fw.add_key(&uk[..bloom_len]);
         }
 
         if self.data_block.size_estimate() >= self.opts.block_size {
@@ -790,6 +799,7 @@ impl<W: Write> Writer<W> {
             property_collectors: "[]".to_string(),
             compression_name: compression_name(self.opts.compression).to_string(),
             filter_policy: filter_policy_name,
+            prefix_extractor: self.cmp.prefix_extractor_name().unwrap_or("").to_string(),
             ..Default::default()
         };
         // Finish the block-property collectors into the properties block.

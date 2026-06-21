@@ -34,6 +34,7 @@ const MERGER: &str = "rocksdb.merge.operator";
 const NUM_MERGE_OPERANDS: &str = "rocksdb.merge.operands";
 const PROPERTY_COLLECTORS: &str = "rocksdb.property.collectors";
 const COMPRESSION: &str = "rocksdb.compression";
+const PREFIX_EXTRACTOR: &str = "rocksdb.prefix.extractor.name";
 
 /// Index types recorded in [`Properties::index_type`].
 pub const BINARY_SEARCH_INDEX: u32 = 0;
@@ -77,6 +78,9 @@ pub struct Properties {
     pub compression_name: String,
     /// The property-collector names (`"[]"` when none).
     pub property_collectors: String,
+    /// The prefix-extractor name (empty when none). When set, the bloom filter is built over
+    /// key prefixes rather than whole keys.
+    pub prefix_extractor: String,
     /// Arbitrary user / block-property entries (collector outputs and any properties this
     /// reader does not model), preserved verbatim for round-trip and filtering.
     pub user_properties: std::collections::BTreeMap<String, Vec<u8>>,
@@ -142,6 +146,12 @@ impl Properties {
                 self.filter_policy.clone().into_bytes(),
             ));
         }
+        if !self.prefix_extractor.is_empty() {
+            m.push((
+                PREFIX_EXTRACTOR.to_string(),
+                self.prefix_extractor.clone().into_bytes(),
+            ));
+        }
 
         // User / block-property entries (e.g. block-property-collector outputs).
         for (k, v) in &self.user_properties {
@@ -171,6 +181,7 @@ impl Properties {
             MERGER,
             FILTER_POLICY,
             COMPRESSION,
+            PREFIX_EXTRACTOR,
             PROPERTY_COLLECTORS,
         ];
         KNOWN.iter().any(|k| k.as_bytes() == name)
@@ -205,6 +216,7 @@ impl Properties {
             n if n == MERGER.as_bytes() => self.merger_name = s(),
             n if n == FILTER_POLICY.as_bytes() => self.filter_policy = s(),
             n if n == COMPRESSION.as_bytes() => self.compression_name = s(),
+            n if n == PREFIX_EXTRACTOR.as_bytes() => self.prefix_extractor = s(),
             n if n == PROPERTY_COLLECTORS.as_bytes() => self.property_collectors = s(),
             _ => {
                 // Unknown / user property (e.g. a block-property-collector output): keep it.
@@ -268,6 +280,7 @@ mod tests {
             filter_policy: String::new(),
             compression_name: "Snappy".to_string(),
             property_collectors: "[]".to_string(),
+            prefix_extractor: "test.prefix".to_string(),
             user_properties: Default::default(),
         };
         let entries = props.encode();

@@ -34,6 +34,11 @@ pub(crate) trait InternalIter {
     fn first(&mut self) -> Result<()>;
     fn last(&mut self) -> Result<()>;
     fn seek_ge(&mut self, target: &[u8]) -> Result<()>;
+    /// Positions at the first entry `>= target`, but may skip the underlying table entirely if
+    /// its prefix bloom rules `prefix` out. Defaults to `seek_ge` (ignoring the bloom).
+    fn seek_prefix_ge(&mut self, target: &[u8], _prefix: &[u8]) -> Result<()> {
+        self.seek_ge(target)
+    }
     fn seek_lt(&mut self, target: &[u8]) -> Result<()>;
     fn valid(&self) -> bool;
     fn key(&self) -> &[u8];
@@ -60,6 +65,9 @@ impl InternalIter for TableIter {
     }
     fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
         TableIter::seek_ge(self, target).map(|_| ())
+    }
+    fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<()> {
+        TableIter::seek_prefix_ge(self, target, prefix).map(|_| ())
     }
     fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         TableIter::seek_lt(self, target).map(|_| ())
@@ -195,6 +203,17 @@ impl InternalIter for BoundedIter {
             target.to_vec()
         };
         self.inner.seek_ge(&t)?;
+        self.refresh();
+        Ok(())
+    }
+    fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<()> {
+        let t = if compare_encoded(self.cmp.as_ref(), target, &self.lo) == std::cmp::Ordering::Less
+        {
+            self.lo.clone()
+        } else {
+            target.to_vec()
+        };
+        self.inner.seek_prefix_ge(&t, prefix)?;
         self.refresh();
         Ok(())
     }
@@ -334,6 +353,32 @@ impl InternalIter for ConcatIter {
             self.first_from(lo + 1)
         }
     }
+    fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<()> {
+        // Same as `seek_ge` but the containing part may skip its table via the prefix bloom.
+        let mut lo = 0usize;
+        let mut hi = self.parts.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].1, target)
+                == std::cmp::Ordering::Less
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= self.parts.len() {
+            self.cur = None;
+            return Ok(());
+        }
+        self.parts[lo].seek_prefix_ge(target, prefix)?;
+        if self.parts[lo].valid() {
+            self.cur = Some(lo);
+            Ok(())
+        } else {
+            self.first_from(lo + 1)
+        }
+    }
     fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         // Last part whose smallest bound is < target (the one before the first with smallest >=).
         let mut lo = 0usize;
@@ -468,6 +513,17 @@ impl MergingIter {
     pub(crate) fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
         for s in &mut self.sources {
             s.seek_ge(target)?;
+        }
+        self.dir = Dir::Forward;
+        self.refresh_min();
+        Ok(())
+    }
+
+    /// Like [`seek_ge`](Self::seek_ge), but each source may skip its table(s) whose prefix
+    /// bloom rules `prefix` out.
+    pub(crate) fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<()> {
+        for s in &mut self.sources {
+            s.seek_prefix_ge(target, prefix)?;
         }
         self.dir = Dir::Forward;
         self.refresh_min();
@@ -1039,9 +1095,27 @@ impl DbIterator {
 
     /// Positions at the first visible key `>= target` that shares `target`'s prefix,
     /// restricting subsequent forward iteration to that prefix. `prefix` must be a prefix
-    /// of `target` (typically the two are equal).
+    /// of `target` (typically the two are equal). With a prefix-aware comparer, sstables whose
+    /// prefix bloom rules `prefix` out are skipped without reading their blocks.
     pub fn seek_prefix_ge(&mut self, prefix: &[u8], target: &[u8]) -> Result<()> {
-        self.seek_ge(target)?;
+        if self.key_type == IterKeyType::RangesOnly {
+            // Range-only mode has no point bloom; fall back to a prefix-bounded forward seek.
+            self.seek_ge(target)?;
+            self.prefix = Some(prefix.to_vec());
+            if self.valid && !self.cur_key.starts_with(prefix) {
+                self.valid = false;
+            }
+            return Ok(());
+        }
+        let key = if self.below_lower(target) {
+            self.lower_bound.clone().unwrap()
+        } else {
+            target.to_vec()
+        };
+        let ikey = self.key_with_max_trailer(&key);
+        self.merge.seek_prefix_ge(&ikey, prefix)?;
+        self.dir = Dir::Forward;
+        self.advance_to_next_user_key()?;
         self.prefix = Some(prefix.to_vec());
         if self.valid && !self.cur_key.starts_with(prefix) {
             self.valid = false;

@@ -402,6 +402,37 @@ impl Reader {
         &self.props
     }
 
+    /// The key to probe the bloom filter with for a point lookup of `user_key`:
+    /// - `Some(user_key)` when the bloom is whole-key (no prefix extractor);
+    /// - `Some(prefix)` when the bloom is prefix-scoped by *our* comparer's extractor;
+    /// - `None` when the bloom is prefix-scoped by a different (unknown) extractor — it then
+    ///   cannot rule the key out, so the caller must skip the bloom and read the block.
+    fn bloom_key<'a>(&self, user_key: &'a [u8]) -> Option<&'a [u8]> {
+        if self.props.prefix_extractor.is_empty() {
+            Some(user_key)
+        } else if self.cmp.prefix_extractor_name() == Some(self.props.prefix_extractor.as_str()) {
+            Some(&user_key[..self.cmp.split(user_key)])
+        } else {
+            None
+        }
+    }
+
+    /// Whether any key with prefix `prefix` may be present, per the prefix-scoped bloom filter.
+    /// Returns `true` (cannot rule out) unless the table has a prefix bloom built by our
+    /// comparer's extractor that does not contain `prefix`. Used to skip a whole table during a
+    /// prefix seek.
+    pub fn prefix_may_match(&self, prefix: &[u8]) -> bool {
+        if self.props.prefix_extractor.is_empty()
+            || self.cmp.prefix_extractor_name() != Some(self.props.prefix_extractor.as_str())
+        {
+            return true;
+        }
+        match &self.filter {
+            Some(f) => filter::may_contain(f, prefix),
+            None => true,
+        }
+    }
+
     /// The serialized value of the block property produced by the collector named `name`,
     /// if the table carries one.
     pub fn block_property(&self, name: &str) -> Option<&[u8]> {
@@ -584,7 +615,8 @@ impl Reader {
     ) -> Result<Option<(SeqNum, InternalKeyKind, Vec<u8>)>> {
         // The bloom filter can rule the key out without touching any data block.
         if let Some(filter) = &self.filter
-            && !filter::may_contain(filter, user_key)
+            && let Some(bk) = self.bloom_key(user_key)
+            && !filter::may_contain(filter, bk)
         {
             return Ok(None);
         }
@@ -621,7 +653,8 @@ impl Reader {
     ) -> Result<Vec<(SeqNum, InternalKeyKind, Vec<u8>)>> {
         let mut out = Vec::new();
         if let Some(filter) = &self.filter
-            && !filter::may_contain(filter, user_key)
+            && let Some(bk) = self.bloom_key(user_key)
+            && !filter::may_contain(filter, bk)
         {
             return Ok(out);
         }
@@ -901,6 +934,16 @@ impl TableIter {
         }
         self.clear();
         Ok(false)
+    }
+
+    /// Like [`seek_ge`](Self::seek_ge), but first consults the table's prefix bloom: if no key
+    /// shares `prefix`, the iterator is positioned invalid without reading any data block.
+    pub fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<bool> {
+        if !self.reader.prefix_may_match(prefix) {
+            self.clear();
+            return Ok(false);
+        }
+        self.seek_ge(target)
     }
 
     /// Positions at the first entry whose internal key is `>= target`.

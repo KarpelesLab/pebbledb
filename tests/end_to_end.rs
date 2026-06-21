@@ -1276,6 +1276,92 @@ fn metrics_report_per_op_latencies() {
 }
 
 #[test]
+fn prefix_bloom_seek_is_correct_with_a_prefix_comparer() {
+    use pebbledb::{Comparer, DefaultComparer};
+    use std::cmp::Ordering as Ord;
+
+    // A prefix-aware comparer: a key is "<prefix>#<suffix>"; the prefix is the part before the
+    // first '#'. Ordering/index helpers delegate to bytewise. Declaring an extractor makes the
+    // writer build the bloom over prefixes and the reader skip tables on a prefix seek.
+    struct PrefixCmp(DefaultComparer);
+    impl Comparer for PrefixCmp {
+        fn name(&self) -> &str {
+            "test.prefix"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Ord {
+            self.0.compare(a, b)
+        }
+        fn abbreviated_key(&self, k: &[u8]) -> u64 {
+            self.0.abbreviated_key(k)
+        }
+        fn split(&self, key: &[u8]) -> usize {
+            key.iter().position(|&b| b == b'#').unwrap_or(key.len())
+        }
+        fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]) {
+            self.0.separator(dst, a, b)
+        }
+        fn successor(&self, dst: &mut Vec<u8>, a: &[u8]) {
+            self.0.successor(dst, a)
+        }
+        fn prefix_extractor_name(&self) -> Option<&str> {
+            Some("test.prefix")
+        }
+    }
+
+    let dir = temp_dir("prefix-bloom");
+    let opts = || Options {
+        comparer: Arc::new(PrefixCmp(DefaultComparer)),
+        mem_table_size: 4 * 1024,
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts()).unwrap();
+    // Write several prefixes, each flushed to its own sstable so a prefix seek must locate the
+    // right table(s) — and skip the others via their prefix bloom.
+    for p in ["aaa", "bbb", "ccc", "ddd", "eee"] {
+        for i in 0..20u32 {
+            db.set(format!("{p}#{i:03}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    let collect_prefix = |db: &Db, prefix: &[u8]| -> Vec<Vec<u8>> {
+        let mut it = db.iter().unwrap();
+        it.seek_prefix_ge(prefix, prefix).unwrap();
+        let mut out = Vec::new();
+        while it.valid() {
+            out.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        out
+    };
+
+    // Present prefixes return exactly their keys (a wrong bloom skip would lose these).
+    for p in ["aaa", "ccc", "eee"] {
+        let got = collect_prefix(&db, p.as_bytes());
+        assert_eq!(got.len(), 20, "prefix {p}");
+        assert!(got.iter().all(|k| k.starts_with(p.as_bytes())));
+    }
+    // Absent prefixes return nothing.
+    for p in ["aa0", "zzz", "fff"] {
+        assert!(
+            collect_prefix(&db, p.as_bytes()).is_empty(),
+            "absent prefix {p} returned keys"
+        );
+    }
+    // Point lookups still work (the bloom is prefix-scoped, so it never rules out a real key).
+    assert_eq!(db.get(b"bbb#005").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"bbb#999").unwrap(), None);
+
+    // Survives reopen with the same comparer.
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    assert_eq!(collect_prefix(&db, b"ddd").len(), 20);
+    assert_eq!(db.get(b"aaa#000").unwrap(), Some(b"v".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn iterator_clone_is_independent() {
     let dir = temp_dir("iter-clone");
     let db = Db::open(&dir, Options::default()).unwrap();
