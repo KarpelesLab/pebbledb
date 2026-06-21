@@ -104,7 +104,10 @@ impl Properties {
         // varints). It must be written the same way or Go Pebble panics with a short read when
         // opening the table. (Written here, after the last `put_u`, so the closure's borrow of
         // `m` has ended.)
-        m.push((INDEX_TYPE.to_string(), self.index_type.to_le_bytes().to_vec()));
+        m.push((
+            INDEX_TYPE.to_string(),
+            self.index_type.to_le_bytes().to_vec(),
+        ));
 
         // Optional integer properties: written only when non-zero.
         if self.index_size != 0 {
