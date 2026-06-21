@@ -453,6 +453,9 @@ pub struct DbInner {
     /// Sequence numbers of currently-open snapshots. Compaction retains the versions
     /// they need.
     snapshots: Mutex<Vec<SeqNum>>,
+    /// Open `EventuallyFileOnlySnapshot`s: each registers its spans and an invalidation flag
+    /// that an overlapping `excise` flips (an excise disjoint from the spans leaves it valid).
+    efos: Mutex<Vec<EfosReg>>,
     /// Optional event listener.
     listener: Option<Arc<dyn EventListener>>,
     /// Optional merge operator.
@@ -928,6 +931,7 @@ impl DbInner {
                 drained_cv: Condvar::new(),
                 cache: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
+                efos: Mutex::new(Vec::new()),
                 listener: opts.event_listener.clone(),
                 merger: merger.clone(),
                 block_cache: if opts.block_cache_size > 0 {
@@ -1077,6 +1081,7 @@ impl DbInner {
             drained_cv: Condvar::new(),
             cache: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(Vec::new()),
+            efos: Mutex::new(Vec::new()),
             listener: opts.event_listener.clone(),
             merger: merger.clone(),
             block_cache: if opts.block_cache_size > 0 {
@@ -1253,6 +1258,9 @@ impl DbInner {
         if self.cmp.compare(start, end) != std::cmp::Ordering::Less {
             return Ok(());
         }
+        // Invalidate any EventuallyFileOnlySnapshot whose spans overlap the excised range; one
+        // disjoint from every span is left valid (Pebble's disjoint-excise optimization).
+        self.invalidate_overlapping_efos(start, end);
         // Flush so all committed data (including the memtable) lives in sstables we can split.
         self.flush()?;
 
@@ -2560,11 +2568,34 @@ impl DbInner {
         }
         let seqnum = self.last_sequence();
         self.snapshots.lock().unwrap().push(seqnum);
+        let invalid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.efos.lock().unwrap().push(EfosReg {
+            spans: spans.clone(),
+            invalid: Arc::clone(&invalid),
+        });
         Ok(EventuallyFileOnlySnapshot {
             db: self,
             seqnum,
             spans,
+            invalid,
         })
+    }
+
+    /// Invalidates every open EventuallyFileOnlySnapshot whose spans overlap `[start, end)`.
+    /// An EFOS disjoint from the excised range stays valid.
+    fn invalidate_overlapping_efos(&self, start: &[u8], end: &[u8]) {
+        let cmp = self.cmp.as_ref();
+        for reg in self.efos.lock().unwrap().iter() {
+            let overlaps = reg.spans.iter().any(|(s, e)| {
+                // Half-open [s, e) intersects [start, end): s < end and start < e.
+                cmp.compare(s, end) == std::cmp::Ordering::Less
+                    && cmp.compare(start, e) == std::cmp::Ordering::Less
+            });
+            if overlaps {
+                reg.invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     /// The sorted sequence numbers of currently-open snapshots.
@@ -2613,13 +2644,24 @@ impl Drop for Snapshot<'_> {
     }
 }
 
+/// Registration for an open `EventuallyFileOnlySnapshot`: its spans plus a flag an
+/// overlapping `excise` flips to invalidate it. The flag is shared (`Arc`) with the EFOS so it
+/// observes the invalidation.
+struct EfosReg {
+    spans: Vec<(Vec<u8>, Vec<u8>)>,
+    invalid: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// A consistent read view restricted to a set of key spans (Pebble's
 /// `EventuallyFileOnlySnapshot`). Reads outside the registered spans are rejected. Created by
-/// [`DbInner::new_eventually_file_only_snapshot`]; pins its sequence number until dropped.
+/// [`DbInner::new_eventually_file_only_snapshot`]; pins its sequence number until dropped. An
+/// `excise` whose range overlaps any registered span **invalidates** the snapshot (later reads
+/// error); an excise disjoint from every span leaves it usable.
 pub struct EventuallyFileOnlySnapshot<'a> {
     db: &'a DbInner,
     seqnum: SeqNum,
     spans: Vec<(Vec<u8>, Vec<u8>)>,
+    invalid: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventuallyFileOnlySnapshot<'_> {
@@ -2633,6 +2675,22 @@ impl EventuallyFileOnlySnapshot<'_> {
         &self.spans
     }
 
+    /// Whether an `excise` overlapping one of the registered spans has invalidated this
+    /// snapshot. Once invalidated, reads error; an excise disjoint from every span does not
+    /// invalidate it.
+    pub fn is_invalidated(&self) -> bool {
+        self.invalid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn check_valid(&self) -> Result<()> {
+        if self.is_invalidated() {
+            return Err(Error::InvalidState(
+                "efos: invalidated by an excise overlapping its spans".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn covers(&self, key: &[u8]) -> bool {
         let cmp = self.db.cmp.as_ref();
         self.spans.iter().any(|(s, e)| {
@@ -2643,6 +2701,7 @@ impl EventuallyFileOnlySnapshot<'_> {
 
     /// Looks up `key` as of the snapshot. Errors if `key` is outside the registered spans.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_valid()?;
         if !self.covers(key) {
             return Err(Error::InvalidState(
                 "efos: key is outside the snapshot's registered spans".into(),
@@ -2653,6 +2712,7 @@ impl EventuallyFileOnlySnapshot<'_> {
 
     /// Returns an iterator over `[start, end)`, which must lie within a single registered span.
     pub fn iter_span(&self, start: &[u8], end: &[u8]) -> Result<DbIterator> {
+        self.check_valid()?;
         let cmp = self.db.cmp.as_ref();
         let within = self.spans.iter().any(|(s, e)| {
             cmp.compare(start, s) != std::cmp::Ordering::Less
@@ -2676,9 +2736,19 @@ impl EventuallyFileOnlySnapshot<'_> {
 
 impl Drop for EventuallyFileOnlySnapshot<'_> {
     fn drop(&mut self) {
-        let mut snaps = self.db.snapshots.lock().unwrap();
-        if let Some(pos) = snaps.iter().position(|&s| s == self.seqnum) {
-            snaps.swap_remove(pos);
+        {
+            let mut snaps = self.db.snapshots.lock().unwrap();
+            if let Some(pos) = snaps.iter().position(|&s| s == self.seqnum) {
+                snaps.swap_remove(pos);
+            }
+        }
+        // Deregister from the EFOS registry (identified by the shared invalidation flag).
+        let mut efos = self.db.efos.lock().unwrap();
+        if let Some(pos) = efos
+            .iter()
+            .position(|r| Arc::ptr_eq(&r.invalid, &self.invalid))
+        {
+            efos.swap_remove(pos);
         }
     }
 }

@@ -119,17 +119,19 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: concurrent writers proceed during an ingest; the ingested values still win over
     older unflushed keys.
 
-- [ ] **EFOS disjoint-range excise.** Let an `excise` whose spans are disjoint from every open
-  EventuallyFileOnlySnapshot proceed without invalidating those snapshots (now unblocked by
-  virtual sstables).
-  - [ ] On excise, compare its span against open EFOS spans; only invalidate the EFOS whose
-    spans overlap.
-  - [ ] Test: excise disjoint from an EFOS leaves it readable; excise overlapping it invalidates.
-
-- [ ] **L0 scoring by sublevel count.** The picker scores L0 by raw file count; score it by
-  sublevel count (read amplification) like Pebble.
-  - [ ] Feed the existing `Metrics::l0_sublevels` count into the L0 compaction score.
-  - [ ] Test: a many-file-but-few-sublevels L0 scores lower than a few-file-many-sublevels L0.
+- [ ] **Sublevel-aware L0 reads, then sublevel scoring.** Pebble scores L0 by sublevel count
+  (read amplification) and keeps L0 reads cheap by treating each sublevel as one
+  binary-searchable run. Our reader instead consults every L0 file, so our real read
+  amplification *is* the L0 file count — which is exactly what the picker already scores. Doing
+  sublevel scoring alone (with Pebble's high `L0CompactionFileThreshold`) would let
+  non-overlapping L0 files pile up and regress reads, so the two pieces must land together:
+  - [ ] Group L0 files into sublevels (non-overlapping runs) for the read path; build one
+    binary-searching iterator per sublevel instead of one per file (merging iter + point `get`).
+  - [ ] Then switch the picker's L0 score from file count to sublevel count
+    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`).
+  - [ ] Test: a deep (many-sublevel) L0 compacts before a flat (one-sublevel) L0 of the same
+    file count; a flat L0 still drains via the file-count guard; point reads over a flat L0
+    touch one file per sublevel, not one per file.
 
 - [ ] **Per-op latency metrics.** Extend `Metrics` with latency breakdowns.
   - [ ] Add counters/histograms for get / set-commit / flush / compaction durations.

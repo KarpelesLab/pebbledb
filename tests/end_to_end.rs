@@ -1187,6 +1187,37 @@ fn eventually_file_only_snapshot_is_consistent_and_scoped() {
 }
 
 #[test]
+fn efos_survives_disjoint_excise_but_not_overlapping() {
+    let dir = temp_dir("efos-excise");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..30u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"v1").unwrap();
+    }
+
+    // EFOS scoped to [k005, k015).
+    let efos = db
+        .new_eventually_file_only_snapshot(vec![(b"k005".to_vec(), b"k015".to_vec())])
+        .unwrap();
+    assert!(!efos.is_invalidated());
+
+    // An excise disjoint from the span [k020, k025) leaves the EFOS valid and readable.
+    db.excise(b"k020", b"k025").unwrap();
+    assert!(
+        !efos.is_invalidated(),
+        "disjoint excise must not invalidate"
+    );
+    assert_eq!(efos.get(b"k010").unwrap(), Some(b"v1".to_vec()));
+
+    // An excise overlapping the span [k012, k018) invalidates it; reads then error.
+    db.excise(b"k012", b"k018").unwrap();
+    assert!(efos.is_invalidated(), "overlapping excise must invalidate");
+    assert!(efos.get(b"k010").is_err());
+    assert!(efos.iter_span(b"k005", b"k015").is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn checkpoint_restricted_to_spans() {
     use pebbledb::CheckpointOptions;
 
