@@ -3649,3 +3649,133 @@ fn read_only_open_after_writes() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression test for a compaction that split a user key's versions across two output
+/// files. A compaction emits entries in (user-key asc, seqnum desc) order; the output was
+/// previously cut whenever the running file reached `target_file_size`, even between two
+/// internal versions of the *same* user key. That produced two same-level files overlapping
+/// at that key — and because the picker compacts one file at a time, a later
+/// L(n)->L(n+1) compaction could relevel the file holding the newer version below the one
+/// holding the older version, so a point lookup then returned the stale value.
+///
+/// Several retained snapshots keep many Set versions of every key alive through compaction
+/// (each version lands in its own snapshot stripe, so none are collapsed). Values larger
+/// than a data block make the writer's size estimate advance roughly per entry, and a small
+/// target file size then forces splits to land between a key's versions unless the split is
+/// user-key-aligned. With `l1_max_bytes` set huge, no L1->L2 compaction runs to merge any
+/// overlap away, so the post-compaction LSM is inspected directly: no two files at any level
+/// below L0 may overlap in user-key range.
+#[test]
+fn compaction_splits_output_only_on_user_key_boundaries() {
+    let dir = temp_dir("split-boundary");
+    let opts = Options {
+        mem_table_size: 8 * 1024,
+        // Roughly two-and-a-bit large entries per output file, so a key's version chain
+        // straddles a boundary unless the split is aligned to the user key.
+        target_file_size: 14_000,
+        // Never trigger an L1+ compaction, so any overlap a bad L0->L1 split created
+        // survives for inspection instead of being merged away.
+        l1_max_bytes: 1 << 40,
+        l0_compaction_threshold: 2,
+        max_concurrent_compactions: 1,
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts).unwrap();
+
+    // Incompressible 6 KiB values (> the 4 KiB data-block size, so each entry flushes its own
+    // block and the writer's byte estimate advances per entry). xorshift keeps them
+    // incompressible so block sizes stay ~6 KiB and splitting is fine-grained.
+    let val = |kidx: usize, round: usize| -> Vec<u8> {
+        let mut x = ((kidx as u64) << 20 | (round as u64) << 1) | 1;
+        (0..6000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let key = |kidx: usize| format!("key{kidx:03}").into_bytes();
+    const N: usize = 24;
+
+    // v0 for every key, then a snapshot pinning it.
+    for k in 0..N {
+        db.set(&key(k), &val(k, 0)).unwrap();
+    }
+    let mut snaps = vec![db.snapshot()];
+
+    // Several rounds of overwrites, each pinned by its own snapshot so every version survives
+    // compaction in a distinct stripe. Flushes between rounds build L0 and drive L0->L1.
+    let rounds = 4usize;
+    for r in 1..=rounds {
+        for k in 0..N {
+            db.set(&key(k), &val(k, r)).unwrap();
+        }
+        db.flush().unwrap();
+        snaps.push(db.snapshot());
+    }
+    db.flush().unwrap();
+
+    // Invariant: below L0, files at the same level never overlap in user-key range. A
+    // mid-key split would leave two files sharing a boundary key.
+    let view = db.lsm_view();
+    let mut level: Option<usize> = None;
+    let mut prev_largest: Option<String> = None;
+    for line in view.lines() {
+        if let Some(rest) = line.strip_prefix('L') {
+            // Level header like "L1: 3 files, ...".
+            let lvl: usize = rest
+                .split(':')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("level header");
+            level = Some(lvl);
+            prev_largest = None;
+            continue;
+        }
+        let lvl = match level {
+            Some(l) => l,
+            None => continue,
+        };
+        // File line: "  000007.sst  N bytes  [small .. large]".
+        let Some(open) = line.find('[') else { continue };
+        let Some(close) = line.find(']') else {
+            continue;
+        };
+        let span = &line[open + 1..close];
+        let mut parts = span.split(" .. ");
+        let small = parts.next().unwrap_or("").to_string();
+        let large = parts.next().unwrap_or("").to_string();
+        if lvl >= 1 {
+            if let Some(pl) = &prev_largest {
+                assert!(
+                    pl.as_str() < small.as_str(),
+                    "L{lvl} files overlap in user-key range: previous largest {pl:?} \
+                     >= next smallest {small:?}\n{view}"
+                );
+            }
+            prev_largest = Some(large);
+        }
+    }
+
+    // And the data reads back correctly: the live view sees the newest value, and each
+    // snapshot still sees the version it pinned (snaps[i] was taken just after round i).
+    for k in 0..N {
+        assert_eq!(
+            db.get(&key(k)).unwrap().as_deref(),
+            Some(val(k, rounds).as_slice()),
+            "live get for key{k:03}"
+        );
+        for (r, snap) in snaps.iter().enumerate() {
+            assert_eq!(
+                snap.get(&key(k)).unwrap().as_deref(),
+                Some(val(k, r).as_slice()),
+                "snapshot-after-round-{r} get for key{k:03}"
+            );
+        }
+    }
+
+    drop(snaps);
+    let _ = std::fs::remove_dir_all(&dir);
+}

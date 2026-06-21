@@ -778,6 +778,19 @@ impl DbInner {
                 terminated = true;
             }
 
+            // Split output files only on a user-key boundary. Cutting between two internal
+            // versions of the same user key would place a newer version in one file and an
+            // older one in the next; both files then overlap at that key, and a later
+            // single-file L(n)->L(n+1) compaction (the picker takes one file at a time) could
+            // relevel the newer version below the older one, resurrecting the stale value.
+            // The flush path guards the same way (see `write_memtable_to_sstables`).
+            if !same_user
+                && let Some(b) = builder.as_ref()
+                && b.writer.estimated_size() >= self.target_file_size_for(c.output_level)
+            {
+                outputs.push(builder.take().unwrap().finish()?);
+            }
+
             if builder.is_none() {
                 let num = output_nums.next().ok_or_else(|| {
                     crate::Error::InvalidState(
@@ -796,9 +809,6 @@ impl DbInner {
             match blob_ref {
                 Some((blob_num, handle)) => b.add_preserved_blob(&ikey, blob_num, handle)?,
                 None => b.add(&ikey, &value)?,
-            }
-            if b.writer.estimated_size() >= self.target_file_size_for(c.output_level) {
-                outputs.push(builder.take().unwrap().finish()?);
             }
         }
         if let Some(b) = builder.take() {
