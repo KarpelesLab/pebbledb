@@ -97,8 +97,14 @@ impl Properties {
         put_u(NUM_DATA_BLOCKS, self.num_data_blocks);
         put_u(DATA_SIZE, self.data_size);
         put_u(NUM_MERGE_OPERANDS, self.num_merge_operands);
-        put_u(INDEX_TYPE, u64::from(self.index_type));
         put_u(FILTER_SIZE, self.filter_size);
+
+        // `rocksdb.block.based.table.index.type` is a RocksDB *Uint32* property, which Pebble
+        // reads as a fixed 4-byte little-endian value (unlike the u64 properties, which are
+        // varints). It must be written the same way or Go Pebble panics with a short read when
+        // opening the table. (Written here, after the last `put_u`, so the closure's borrow of
+        // `m` has ended.)
+        m.push((INDEX_TYPE.to_string(), self.index_type.to_le_bytes().to_vec()));
 
         // Optional integer properties: written only when non-zero.
         if self.index_size != 0 {
@@ -180,7 +186,15 @@ impl Properties {
             n if n == NUM_DATA_BLOCKS.as_bytes() => self.num_data_blocks = uv(),
             n if n == DATA_SIZE.as_bytes() => self.data_size = uv(),
             n if n == INDEX_SIZE.as_bytes() => self.index_size = uv(),
-            n if n == INDEX_TYPE.as_bytes() => self.index_type = uv() as u32,
+            n if n == INDEX_TYPE.as_bytes() => {
+                // Fixed 4-byte little-endian Uint32 (see `encode`); fall back to a varint for
+                // any legacy table that wrote it that way.
+                self.index_type = if value.len() >= 4 {
+                    u32::from_le_bytes([value[0], value[1], value[2], value[3]])
+                } else {
+                    uv() as u32
+                };
+            }
             n if n == TOP_LEVEL_INDEX_SIZE.as_bytes() => self.top_level_index_size = uv(),
             n if n == FILTER_SIZE.as_bytes() => self.filter_size = uv(),
             n if n == NUM_MERGE_OPERANDS.as_bytes() => self.num_merge_operands = uv(),

@@ -3192,6 +3192,20 @@ fn update_marker(fs: &dyn Fs, dir: &Path, names: &[String], value: &str) -> Resu
     for n in old {
         let _ = fs.remove(&dir.join(n));
     }
+
+    // Also maintain the legacy `CURRENT` file (the MANIFEST's filename + a newline), written
+    // atomically via a temp file + rename like Pebble's `setCurrentFile`. The atomic marker
+    // above is this engine's source of truth, but upstream Pebble builds that locate the
+    // MANIFEST through `CURRENT` (e.g. the Go interop target) cannot otherwise open a database
+    // this engine writes.
+    let tmp = dir.join(format!("CURRENT.{:06}.dbtmp", max_iter + 1));
+    {
+        let mut f = fs.create(&tmp)?;
+        f.write_all(value.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    fs.rename(&tmp, &dir.join("CURRENT"))?;
     Ok(())
 }
 
