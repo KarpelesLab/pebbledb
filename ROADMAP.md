@@ -122,10 +122,6 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Failover health monitoring (latency-triggered secondary switch) + the related metrics.
   - [ ] Configurable failover policy on `Options`.
 
-- [ ] **vfs syncing-FS guarantees.** Round out the vfs surface vs. Pebble's `vfs`.
-  - [ ] A syncing-FS wrapper that enforces directory-sync-on-create semantics uniformly.
-  - [ ] Audit fsync points (file + parent dir) against Pebble for crash-consistency.
-
 ### Byte-parity & interop (Go CI)
 
 These are correctness-vs-upstream checks; the formats are implemented to spec with in-crate

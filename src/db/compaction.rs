@@ -825,6 +825,10 @@ impl DbInner {
         for m in &outputs {
             self.upload_if_shared(m.file_num)?;
         }
+        // Make the new sstables' directory entries durable before the MANIFEST references them
+        // (crash-consistency: a synced MANIFEST must never point at a file whose directory
+        // entry was lost). Off the state lock.
+        self.fs.sync_dir(&self.dir)?;
 
         // Phase C (locked): record the edit — delete every input, add every output to the
         // output level — apply it, and clear the inputs' `compacting` marks.

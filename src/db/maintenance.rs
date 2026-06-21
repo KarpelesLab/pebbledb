@@ -166,6 +166,8 @@ impl DbInner {
             self.upload_if_shared(*file_num)?;
             new_files.push(NewFileEntry { level: 0, meta });
         }
+        // Make the ingested files' directory entries durable before the MANIFEST references them.
+        self.fs.sync_dir(&self.dir)?;
 
         // Add the ingested files to L0.
         {

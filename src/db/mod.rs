@@ -1886,6 +1886,10 @@ impl DbInner {
         for m in &metas {
             self.upload_if_shared(m.file_num)?;
         }
+        // Make the new sstables' directory entries durable before the MANIFEST references them:
+        // otherwise a crash after the MANIFEST sync but before the directory is flushed could
+        // leave the MANIFEST pointing at a file the OS cannot find. Done off the state lock.
+        self.fs.sync_dir(&self.dir)?;
         let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
         let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
         let created: Vec<u64> = metas.iter().map(|m| m.file_num).collect();
