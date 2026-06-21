@@ -160,9 +160,11 @@ mod disk_lock {
 
     /// A held lock: the open file handle keeps the lock for its lifetime. Dropping the
     /// `File` closes the descriptor, which releases the `flock`.
+    #[cfg(unix)]
     struct Lock {
         _file: File,
     }
+    #[cfg(unix)]
     impl DirLock for Lock {}
 
     #[cfg(unix)]
@@ -195,8 +197,26 @@ mod disk_lock {
 
     #[cfg(not(unix))]
     pub(super) fn acquire(path: &Path) -> io::Result<Box<dyn DirLock>> {
-        // Without flock, create the lock file exclusively: its presence is the lock. The
-        // file is removed when the process that created it exits cleanly.
+        use std::path::PathBuf;
+
+        // Without flock, the lock file's existence IS the lock: create it exclusively, and
+        // remove it when the lock is dropped so the same process can reopen the database
+        // (on Windows `create_new` fails with ERROR_FILE_EXISTS otherwise). A process that
+        // crashes leaves a stale lock file — the standard lock-file caveat.
+        struct FileLock {
+            // `Option` so we can close the handle in `drop` before unlinking: Windows refuses
+            // to delete a file that still has an open handle (absent `FILE_SHARE_DELETE`).
+            file: Option<File>,
+            path: PathBuf,
+        }
+        impl DirLock for FileLock {}
+        impl Drop for FileLock {
+            fn drop(&mut self) {
+                self.file = None;
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -207,7 +227,10 @@ mod disk_lock {
                     format!("vfs: database is locked ({e})"),
                 )
             })?;
-        Ok(Box::new(Lock { _file: file }))
+        Ok(Box::new(FileLock {
+            file: Some(file),
+            path: path.to_path_buf(),
+        }))
     }
 }
 

@@ -768,6 +768,40 @@ impl DbInner {
         // Phase C (locked): record the edit — delete every input, add every output to the
         // output level — apply it, and clear the inputs' `compacting` marks.
         let mut state = self.state.lock().unwrap();
+
+        // A concurrent `excise` (or another compaction) may have removed one of our input
+        // files from the version while we merged off-lock. Our output reflects the
+        // pre-removal data, so installing it would resurrect removed keys and could overlap
+        // the files that replaced the input — leaving the LSM inconsistent. Abort instead:
+        // discard the freshly written outputs (via the reference-counted obsolete path, so a
+        // shared blob file other sstables still use is preserved) and clear our marks.
+        let inputs_live = {
+            let present = |level: usize, file_num: u64| -> bool {
+                state
+                    .vs
+                    .current
+                    .levels
+                    .get(level)
+                    .is_some_and(|fs| fs.iter().any(|f| f.file_num == file_num))
+            };
+            c.inputs.iter().all(|f| present(c.level, f.file_num))
+                && c.mid.iter().all(|f| present(c.level + 1, f.file_num))
+                && c.overlap
+                    .iter()
+                    .all(|f| present(c.output_level, f.file_num))
+        };
+        if !inputs_live {
+            for f in c.inputs.iter().chain(c.mid.iter()).chain(c.overlap.iter()) {
+                state.compacting.remove(&f.file_num);
+            }
+            drop(state);
+            let orphans: Vec<Arc<FileMetadata>> = outputs.into_iter().map(Arc::new).collect();
+            self.enqueue_obsolete(orphans.iter());
+            self.collect_obsolete();
+            self.work_cv.notify_all();
+            return Ok(());
+        }
+
         let mut edit = VersionEdit {
             next_file_number: Some(state.vs.next_file_number),
             last_sequence: Some(state.vs.last_sequence),

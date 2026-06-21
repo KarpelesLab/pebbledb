@@ -82,8 +82,11 @@ jobs:
         with:
           key: miri
 
+      # Scope to the `memtable::` module: a bare `memtable` substring filter also matches
+      # `db::tests::*memtable*`, which open a real database and do filesystem I/O that Miri's
+      # isolation (no `statx`/`lstat`) rejects.
       - name: cargo miri test (memtable)
-        run: cargo miri test --lib memtable
+        run: cargo miri test --lib 'memtable::'
 
   docs:
     name: Docs build (warnings denied)
