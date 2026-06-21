@@ -3337,7 +3337,15 @@ mod tests {
             db.set(format!("k{i:06}").as_bytes(), format!("v{i:06}").as_bytes())
                 .unwrap();
         }
-        let counts = db.level_file_counts();
+        // Background compaction drains L0 asynchronously, so poll for the drained state rather
+        // than assuming the worker has already caught up the instant the write loop returns
+        // (it can lag under CI load).
+        let mut counts = db.level_file_counts();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while counts[0] >= 4 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            counts = db.level_file_counts();
+        }
         assert!(counts[0] < 4, "L0 should be drained, got {counts:?}");
         assert!(
             counts[1..].iter().sum::<usize>() > 0,

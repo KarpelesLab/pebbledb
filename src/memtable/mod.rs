@@ -819,7 +819,15 @@ mod tests {
     #[test]
     fn concurrent_reads_during_writes() {
         use std::thread;
-        let s = Arc::new(Skiplist::new(Arc::new(DefaultComparer), 8 << 20));
+        // Miri models every memory access (and runs ~50x slower), so scale the work down under
+        // it: a smaller arena and far fewer iterations still exercise the lock-free read/write
+        // interleaving its data-race and aliasing checks care about, without taking forever.
+        let (arena, total, reader_iters) = if cfg!(miri) {
+            (1 << 18, 400u32, 40)
+        } else {
+            (8 << 20, 2000u32, 2000)
+        };
+        let s = Arc::new(Skiplist::new(Arc::new(DefaultComparer), arena));
         // Pre-populate so readers have something to find.
         for i in 0..100u32 {
             s.add(
@@ -832,7 +840,7 @@ mod tests {
         let reader = {
             let s = Arc::clone(&s);
             thread::spawn(move || {
-                for _ in 0..2000 {
+                for _ in 0..reader_iters {
                     let mut it = s.iter();
                     it.first();
                     let mut count = 0;
@@ -851,7 +859,7 @@ mod tests {
             })
         };
         // Single writer adds more entries concurrently.
-        for i in 100..2000u32 {
+        for i in 100..total {
             s.add(
                 &i.to_be_bytes(),
                 make_trailer(i as u64, InternalKeyKind::Set),

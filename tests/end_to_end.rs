@@ -2991,7 +2991,18 @@ fn write_stall_engages_when_flush_falls_behind() {
     }
     impl EventListener for Slow {
         fn on_flush_begin(&self) {
-            std::thread::sleep(Duration::from_millis(5));
+            // Hold each flush until at least one write stall has been observed, so immutable
+            // memtables deterministically pile up to the stop-writes threshold regardless of
+            // disk speed. (A fixed sleep is timing-fragile: on slow-I/O platforms like Windows
+            // CI — ~20x slower than Linux here — the flusher kept up and the stall never
+            // engaged.) `on_write_stall_begin` fires before the writer blocks, so this never
+            // deadlocks; the deadline is a safety valve in case no stall ever occurs.
+            let start = std::time::Instant::now();
+            while self.stalls.load(Ordering::SeqCst) == 0
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         fn on_write_stall_begin(&self, _reason: &str) {
             self.stalls.fetch_add(1, Ordering::SeqCst);

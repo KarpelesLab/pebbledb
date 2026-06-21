@@ -14,16 +14,18 @@
 //! and thereafter read-only, so non-atomic access is data-race free given the happens-
 //! before established by the link atomics.
 
-use std::cell::UnsafeCell;
+use std::alloc::{self, Layout};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A lock-free, fixed-capacity arena.
 pub(super) struct Arena {
-    // Backing store, allocated as `u32` words to guarantee 4-byte alignment so that
-    // `AtomicU32` overlays are aligned. Never reallocated. Boxed and kept alive for the
-    // lifetime of `base`.
-    _buf: Box<[UnsafeCell<u32>]>,
+    // A single heap allocation owned for the arena's lifetime. Allocating it directly (rather
+    // than as a `Box<[UnsafeCell<u32>]>`) gives `base` read-write provenance over the *whole*
+    // region as one object: headers, `u64` trailers, and key/value bytes routinely span what
+    // would otherwise be separate per-cell provenance domains, which Stacked Borrows forbids.
+    // Link fields are viewed as atomics via `AtomicU32::from_ptr`, never as plain bytes.
     base: *mut u8,
+    layout: Layout,
     cap: u32,
     n: AtomicU32,
 }
@@ -31,13 +33,18 @@ pub(super) struct Arena {
 impl Arena {
     /// Creates an arena with `size` bytes of capacity (rounded up to a multiple of 4).
     pub(super) fn new(size: usize) -> Arena {
-        let words = size.div_ceil(4).max(1);
-        let buf: Box<[UnsafeCell<u32>]> = (0..words).map(|_| UnsafeCell::new(0)).collect();
-        let base = buf.as_ptr() as *mut u8;
+        let cap = size.div_ceil(4).max(1) * 4;
+        // 4-byte alignment so the `AtomicU32` link overlays are aligned.
+        let layout = Layout::from_size_align(cap, 4).expect("arena layout");
+        // SAFETY: `cap >= 4`, so the layout has non-zero size.
+        let base = unsafe { alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
         Arena {
-            _buf: buf,
             base,
-            cap: (words * 4) as u32,
+            layout,
+            cap: cap as u32,
             // Offset 0 is reserved so it can serve as a null node pointer.
             n: AtomicU32::new(1),
         }
@@ -69,9 +76,10 @@ impl Arena {
     pub(super) fn link(&self, offset: usize) -> &AtomicU32 {
         debug_assert!(offset.is_multiple_of(4));
         debug_assert!(offset + 4 <= self.cap as usize);
-        // SAFETY: `offset` is 4-aligned and in bounds; link fields are only ever
-        // accessed through this atomic view, never as plain bytes.
-        unsafe { &*(self.base.add(offset) as *const AtomicU32) }
+        // SAFETY: `offset` is 4-aligned and in bounds, so `base + offset` is a valid, aligned
+        // `u32` location living as long as `self`; link fields are only ever accessed through
+        // this atomic view, never as plain bytes.
+        unsafe { AtomicU32::from_ptr(self.base.add(offset) as *mut u32) }
     }
 
     /// Reads a little-endian `u32` written at `offset` (a node header field).
@@ -122,8 +130,16 @@ impl Arena {
     }
 }
 
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: `base` was returned by `alloc_zeroed(self.layout)` in `new`, is non-null,
+        // and is freed exactly once here.
+        unsafe { alloc::dealloc(self.base, self.layout) }
+    }
+}
+
 // SAFETY: The arena's bytes are either accessed atomically (link fields) or written
 // once before publication and read-only afterward, with happens-before provided by the
-// link atomics. The raw `base` pointer aliases `_buf`, which lives as long as the arena.
+// link atomics. `base` owns its heap allocation for the arena's lifetime.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
