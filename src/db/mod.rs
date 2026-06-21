@@ -910,7 +910,7 @@ impl DbInner {
             &opts,
             options_file.as_ref().and_then(|o| o.merger_name.as_deref()),
         );
-        let mut mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
+        let mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
 
         // Resolve the format major version: an existing OPTIONS file's value (validated
         // against the resolved comparer), or the option for a fresh store.
@@ -922,13 +922,26 @@ impl DbInner {
             None => opts.format_major_version,
         };
 
+        // Memtables reconstructed from un-flushed WALs (oldest first); empty for a fresh store
+        // or one opened with everything flushed. A large recovered batch yields its own
+        // oversized memtable here.
+        let mut recovered: Vec<(Arc<MemTable>, u64)> = Vec::new();
         let mut vs = match filenames::current_manifest(&names) {
             Some(manifest_name) => {
                 let bytes = fs.read(&dir.join(&manifest_name))?;
                 let vs = VersionSet::load(&bytes, cmp.clone())?;
                 // Recover the un-flushed WALs across every WAL directory. Recycled WALs are read
                 // tolerantly so recovery stops at the stale tail left by a previous use.
-                recover_wals(fs.as_ref(), &wal_dirs, &mem, vs, opts.wal_recycle_limit > 0)?
+                let (vs, rec) = recover_wals(
+                    fs.as_ref(),
+                    &wal_dirs,
+                    &cmp,
+                    opts.mem_table_size,
+                    vs,
+                    opts.wal_recycle_limit > 0,
+                )?;
+                recovered = rec;
+                vs
             }
             None => {
                 if !opts.create_if_missing {
@@ -973,11 +986,26 @@ impl DbInner {
         }
 
         if opts.read_only {
+            // Recovered memtables form the read view: the newest is active, the rest immutable
+            // (read-only never flushes, so they are simply consulted).
+            let (mem, imm, imm_wals) = if recovered.is_empty() {
+                (mem, Vec::new(), Vec::new())
+            } else {
+                let mut mems: Vec<Arc<MemTable>> = Vec::with_capacity(recovered.len());
+                let mut wals: Vec<u64> = Vec::with_capacity(recovered.len());
+                for (m, w) in recovered {
+                    mems.push(m);
+                    wals.push(w);
+                }
+                let active = mems.pop().expect("non-empty");
+                wals.pop();
+                (active, mems, wals)
+            };
             let state = State {
                 vs,
                 mem,
-                imm: Vec::new(),
-                imm_wals: Vec::new(),
+                imm,
+                imm_wals,
                 wal_recycle: Vec::new(),
                 wal: None,
                 wal_number: 0,
@@ -1070,19 +1098,21 @@ impl DbInner {
         )?;
         fs.sync_dir(&dir)?;
 
-        // If recovery loaded data from un-flushed WALs into the memtable, persist it to an
-        // L0 sstable now. Otherwise advancing `log_number` to this session's WAL would
-        // strand that data: the older WALs holding it become obsolete and are skipped on
-        // the next open.
-        if !mem.is_empty() {
-            // Recovery flush goes to a single file (no split needed here).
+        // Persist any data recovered from un-flushed WALs to L0 sstables now (each recovered
+        // memtable, oldest first, becomes one L0 file). Otherwise advancing `log_number` to
+        // this session's WAL would strand that data: the older WALs holding it become obsolete
+        // and are skipped on the next open. `mem` stays the fresh, empty active memtable.
+        for (rmem, _wal) in &recovered {
+            if rmem.is_empty() {
+                continue;
+            }
             let file_num = vs.allocate_file_number();
             let metas = write_memtable_to_sstables(
                 fs.as_ref(),
                 &dir,
                 &cmp,
                 &[file_num],
-                &mem,
+                rmem,
                 &opts.block_property_collectors,
                 opts.target_file_size,
                 opts.value_block_threshold,
@@ -1100,8 +1130,8 @@ impl DbInner {
             vs.apply(&edit)?;
             manifest.write_record(&edit.encode())?;
             manifest.sync_all()?;
-            mem = Arc::new(MemTable::new(cmp.clone(), opts.mem_table_size));
         }
+        drop(recovered);
 
         let (wal_writer, wal_dir_idx) = create_wal(fs.as_ref(), &wal_dirs, 0, wal_number)?;
         let wal = wal_writer;
@@ -1630,22 +1660,54 @@ impl DbInner {
     /// backpressure is applied once per group by the caller (it owns the lock guard).
     fn commit_one(&self, state: &mut State, batch: &Batch) -> Result<()> {
         let mut batch = batch.clone();
-        // Rotate once the memtable has used half its arena, leaving the rest as headroom
-        // for this batch (the arena fills faster than wire bytes due to per-node
-        // overhead, so the threshold is measured in arena bytes). The actual flush of the
-        // rotated memtable runs on the background worker, off this writer's path.
-        if state.mem.size() as usize >= self.mem_table_size / 2 {
+        let base = state.vs.last_sequence + 1;
+        batch.set_seqnum(base);
+        let count = u64::from(batch.count());
+        // Conservative arena bytes this batch needs: wire bytes plus per-entry skiplist node
+        // overhead (`MAX_NODE_SIZE` ~104 B, padded to 128) plus the head/tail nodes. Kept tight
+        // so the large-batch path triggers only for a batch that truly won't fit a fresh arena.
+        let needed = batch
+            .as_bytes()
+            .len()
+            .saturating_add((count as usize).saturating_mul(128))
+            .saturating_add(512);
+
+        // A batch too large for a fresh memtable arena becomes its own flushable immutable
+        // memtable rather than overflowing the active one (Pebble's `flushableBatch`). Sizing
+        // the dedicated memtable to the batch means an arbitrarily large batch still commits.
+        if needed > self.mem_table_size {
+            if state.wal.is_some() {
+                self.append_to_wal(state, &batch)?;
+            }
+            let fmem = Arc::new(MemTable::new(self.cmp.clone(), needed));
+            fmem.apply(&batch)?;
+            // Rotate the active memtable out first so it stays *older* than this batch, then
+            // push the batch's memtable as the newest immutable. Both map to the WAL the batch
+            // was just logged to, so recovery replays it and the flush reclaims that WAL.
+            let batch_wal = state.wal_number;
+            self.rotate_memtable(state)?;
+            state.imm.push(fmem);
+            state.imm_wals.push(batch_wal);
+            state.vs.last_sequence = base + count - 1;
+            self.work_cv.notify_all();
+            return Ok(());
+        }
+
+        // Rotate once the memtable has used half its arena (or could not fit this batch in the
+        // remaining space), leaving room for this batch. The actual flush of the rotated
+        // memtable runs on the background worker, off this writer's path.
+        if state.mem.size() as usize >= self.mem_table_size / 2
+            || (state.mem.size() as usize).saturating_add(needed) > self.mem_table_size
+        {
             self.rotate_memtable(state)?;
             self.work_cv.notify_all();
         }
 
-        let base = state.vs.last_sequence + 1;
-        batch.set_seqnum(base);
         if state.wal.is_some() {
             self.append_to_wal(state, &batch)?;
         }
         state.mem.apply(&batch)?;
-        state.vs.last_sequence = base + u64::from(batch.count()) - 1;
+        state.vs.last_sequence = base + count - 1;
         Ok(())
     }
 
@@ -1851,7 +1913,12 @@ impl DbInner {
         let popped_wal = state.imm_wals.remove(0);
         state.flush_count += 1;
         state.flush_bytes += flushed_bytes;
-        if popped_wal != 0 {
+        // Reclaim the WAL only if no other live memtable still has data in it: a large
+        // flushable batch shares its WAL with the active memtable (and possibly another
+        // immutable), so the WAL must outlive every memtable that wrote to it.
+        let still_referenced =
+            popped_wal == state.wal_number || state.imm_wals.contains(&popped_wal);
+        if popped_wal != 0 && !still_referenced {
             // Recycling: with a single WAL directory and room in the pool, keep the file on
             // disk and remember its number so the next rotation can reuse it in place rather
             // than create and allocate a fresh file. Otherwise delete it. (Failover configs use
@@ -3009,13 +3076,18 @@ fn wal_filename(num: u64) -> String {
 /// WALs numbered below the manifest's `log_number` hold data already captured in sstables;
 /// replaying them would inject stale versions into the memtable that, being consulted
 /// first, would wrongly shadow the newer on-disk data.
+/// Memtables reconstructed from un-flushed WALs (oldest first), each tagged with the WAL
+/// number its latest data came from.
+type RecoveredMemtables = Vec<(Arc<MemTable>, u64)>;
+
 fn recover_wals(
     fs: &dyn Fs,
     wal_dirs: &[PathBuf],
-    mem: &Arc<MemTable>,
+    cmp: &Arc<dyn Comparer>,
+    mem_table_size: usize,
     mut vs: VersionSet,
     tolerant: bool,
-) -> Result<VersionSet> {
+) -> Result<(VersionSet, RecoveredMemtables)> {
     let min_unflushed = vs.log_number;
     // Collect un-flushed WALs from every WAL directory, keyed by number. WAL numbers are
     // globally monotonic, so the same number never appears in two directories.
@@ -3035,6 +3107,12 @@ fn recover_wals(
     }
     logs.sort_by_key(|(num, _)| *num);
 
+    // Replay batches into a sequence of memtables (oldest first). A batch too large for the
+    // standard arena gets its own appropriately-sized memtable — mirroring the flushable-batch
+    // handling on the commit path — so an arbitrarily large recovered batch never overflows.
+    let mut recovered: Vec<(Arc<MemTable>, u64)> = Vec::new();
+    let mut cur = Arc::new(MemTable::new(cmp.clone(), mem_table_size));
+    let mut cur_wal = 0u64;
     let mut last_seq = vs.last_sequence;
     for (num, path) in logs {
         let bytes = fs.read(&path)?;
@@ -3050,12 +3128,43 @@ fn recover_wals(
             if batch.is_empty() {
                 continue;
             }
-            mem.apply(&batch)?;
-            last_seq = last_seq.max(batch.seqnum() + u64::from(batch.count()) - 1);
+            let count = u64::from(batch.count());
+            last_seq = last_seq.max(batch.seqnum() + count - 1);
+            let needed = batch
+                .as_bytes()
+                .len()
+                .saturating_add((count as usize).saturating_mul(128))
+                .saturating_add(512);
+            if needed > mem_table_size {
+                // Seal any in-progress memtable (older), then give this batch its own.
+                if !cur.is_empty() {
+                    let sealed = std::mem::replace(
+                        &mut cur,
+                        Arc::new(MemTable::new(cmp.clone(), mem_table_size)),
+                    );
+                    recovered.push((sealed, cur_wal));
+                }
+                let big = Arc::new(MemTable::new(cmp.clone(), needed));
+                big.apply(&batch)?;
+                recovered.push((big, num));
+                continue;
+            }
+            if !cur.is_empty() && (cur.size() as usize).saturating_add(needed) > mem_table_size {
+                let sealed = std::mem::replace(
+                    &mut cur,
+                    Arc::new(MemTable::new(cmp.clone(), mem_table_size)),
+                );
+                recovered.push((sealed, cur_wal));
+            }
+            cur.apply(&batch)?;
+            cur_wal = num;
         }
     }
+    if !cur.is_empty() {
+        recovered.push((cur, cur_wal));
+    }
     vs.last_sequence = last_seq;
-    Ok(vs)
+    Ok((vs, recovered))
 }
 
 /// Resolves the comparer to open a store with, given the comparer name recorded in its

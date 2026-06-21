@@ -94,14 +94,6 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: seek for an absent prefix skips tables (assert via block-read counts) and never
     skips a present prefix.
 
-- [ ] **Large batches as flushables.** A batch over a threshold becomes its own immutable
-  memtable instead of being applied into the active one (Pebble's `flushableBatch`).
-  - [ ] Add a size threshold (`Options`) above which `apply` wraps the batch as a flushable.
-  - [ ] Build a memtable-like flushable directly from batch bytes at the assigned seqnums and
-    push it onto the immutable/flush queue (still WAL-logged first).
-  - [ ] Ensure reads and the flush worker treat it like any immutable memtable.
-  - [ ] Test: a large batch is durable and correctly ordered vs. neighbors across flush+reopen.
-
 - [ ] **Flushable ingest (queue, don't force-flush).** Today `ingest` forces a memtable flush
   for correctness; instead queue the ingested sstables as a flushable so writers aren't
   blocked.

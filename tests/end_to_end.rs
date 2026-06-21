@@ -1187,6 +1187,51 @@ fn eventually_file_only_snapshot_is_consistent_and_scoped() {
 }
 
 #[test]
+fn large_batch_exceeding_memtable_commits_and_recovers() {
+    let dir = temp_dir("large-batch");
+    let opts = || Options {
+        mem_table_size: 16 * 1024, // small arena; the batch is far larger
+        ..Default::default()
+    };
+    let db = Db::open(&dir, opts()).unwrap();
+
+    // One batch whose contents dwarf the memtable arena. Without flushable-batch handling
+    // this overflows the arena and fails.
+    let mut batch = pebbledb::Batch::new();
+    for i in 0..2000u32 {
+        batch.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]);
+    }
+    db.write(batch).unwrap();
+
+    // All keys are readable immediately (the batch's flushable is part of the read view).
+    for i in 0..2000u32 {
+        assert_eq!(
+            db.get(format!("k{i:05}").as_bytes()).unwrap(),
+            Some(vec![b'v'; 64]),
+            "key k{i:05} missing after large batch"
+        );
+    }
+    // Interleave smaller writes (these go to the regular active memtable) and re-check.
+    db.set(b"small", b"x").unwrap();
+    assert_eq!(db.get(b"small").unwrap(), Some(b"x".to_vec()));
+    assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 64]));
+
+    // Survives reopen (WAL recovery reconstructs the batch).
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    for i in (0..2000u32).step_by(53) {
+        assert_eq!(
+            db.get(format!("k{i:05}").as_bytes()).unwrap(),
+            Some(vec![b'v'; 64]),
+            "key k{i:05} missing after reopen"
+        );
+    }
+    assert_eq!(db.get(b"small").unwrap(), Some(b"x".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn metrics_report_per_op_latencies() {
     let dir = temp_dir("op-latencies");
     let db = Db::open(
