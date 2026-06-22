@@ -43,6 +43,8 @@ const TAG_NEW_FILE4: u64 = 103;
 const TAG_NEW_FILE5: u64 = 104;
 const TAG_CREATED_BACKING_TABLE: u64 = 105;
 const TAG_REMOVED_BACKING_TABLE: u64 = 106;
+const TAG_NEW_BLOB_FILE: u64 = 107;
+const TAG_DELETED_BLOB_FILE: u64 = 108;
 
 // Custom sub-tags within NewFile4/NewFile5.
 const CUSTOM_TAG_TERMINATE: u64 = 1;
@@ -144,6 +146,12 @@ pub struct VersionEdit {
     pub deleted_files: Vec<(usize, u64)>,
     /// Files added.
     pub new_files: Vec<NewFileEntry>,
+    /// Native blob files added (Pebble `FormatValueSeparation`), as `(blob_file_id, file_num)`
+    /// pairs — the logical blob file id mapped to the physical `<file_num>.blob`. pebbledb does
+    /// not yet write these; they are decoded so a Pebble format-24 MANIFEST can be read.
+    pub new_blob_files: Vec<(u64, u64)>,
+    /// Native blob files removed, as `(blob_file_id, file_num)` pairs.
+    pub deleted_blob_files: Vec<(u64, u64)>,
 }
 
 /// A cursor for decoding a version edit's field stream.
@@ -242,6 +250,20 @@ impl VersionEdit {
                 }
                 TAG_REMOVED_BACKING_TABLE => {
                     let _disk_file_num = d.uvarint()?;
+                }
+                TAG_NEW_BLOB_FILE => {
+                    // file_id, disk_file_num, size, value_size, creation_time.
+                    let file_id = d.uvarint()?;
+                    let file_num = d.uvarint()?;
+                    let _size = d.uvarint()?;
+                    let _value_size = d.uvarint()?;
+                    let _creation_time = d.uvarint()?;
+                    edit.new_blob_files.push((file_id, file_num));
+                }
+                TAG_DELETED_BLOB_FILE => {
+                    let file_id = d.uvarint()?;
+                    let file_num = d.uvarint()?;
+                    edit.deleted_blob_files.push((file_id, file_num));
                 }
                 other => {
                     return Err(Error::Corruption(format!(
@@ -520,10 +542,32 @@ mod tests {
                     meta: meta(11, "n", "z", 50, 60),
                 },
             ],
+            new_blob_files: Vec::new(),
+            deleted_blob_files: Vec::new(),
         };
         let bytes = edit.encode();
         let got = VersionEdit::decode(&bytes).unwrap();
         assert_eq!(got, edit);
+    }
+
+    #[test]
+    fn decodes_native_blob_file_tags() {
+        // A Pebble FormatValueSeparation MANIFEST records native blob files via tag 107
+        // (file_id, file_num, size, value_size, creation_time) and removals via tag 108. Our
+        // decoder must accept them so a format-24 MANIFEST can be replayed.
+        let mut buf = Vec::new();
+        put_uvarint(&mut buf, TAG_NEW_BLOB_FILE);
+        put_uvarint(&mut buf, 3); // file_id
+        put_uvarint(&mut buf, 6); // file_num
+        put_uvarint(&mut buf, 4096); // size
+        put_uvarint(&mut buf, 2048); // value_size
+        put_uvarint(&mut buf, 0); // creation_time
+        put_uvarint(&mut buf, TAG_DELETED_BLOB_FILE);
+        put_uvarint(&mut buf, 1); // file_id
+        put_uvarint(&mut buf, 2); // file_num
+        let got = VersionEdit::decode(&buf).unwrap();
+        assert_eq!(got.new_blob_files, vec![(3, 6)]);
+        assert_eq!(got.deleted_blob_files, vec![(1, 2)]);
     }
 
     #[test]
