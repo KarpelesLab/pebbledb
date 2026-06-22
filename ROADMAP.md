@@ -120,6 +120,14 @@ gated on the Go interop CI is under **Byte-parity & interop**.
 These are correctness-vs-upstream checks; the formats are implemented to spec with in-crate
 round-trip tests, but exact byte-parity is proven only by the Go interop workflow.
 
+> **Blocked on an upstream Pebble release.** The columnar block format
+> (`FormatColumnarBlocks`), separate blob files, and the current objstorage catalog format
+> exist only on Pebble's `master`; the newest *tagged* release is `v1.1.5`, which predates all
+> three (`go list -m -versions github.com/cockroachdb/pebble` stops at `v1.1.5`). The interop
+> workflow pins a tagged release for reproducibility, so these round-trips cannot be added to
+> CI until Pebble tags a release that includes them. The in-crate encoders/decoders are
+> implemented and round-trip-tested; only the cross-engine byte-parity check is gated.
+
 - [ ] **Columnar round-trip in interop.** Extend the workflow beyond the row format.
   - [ ] Match `colblk.DefaultKeySchema(comparer, 16)`'s exact `KeySchema` name string.
   - [ ] Verify/finish the `PrefixBytes` delta-offset sub-encoding (see `sstable::colblk`).
