@@ -38,6 +38,9 @@ fn full_lifecycle_with_reopen_and_compaction() {
     let dir = temp_dir("lifecycle");
     let opts = Options {
         mem_table_size: 32 * 1024, // small, to force flushes + compaction
+        // Drain L0 by file count (these are disjoint, single-sublevel flushes); matches the
+        // pre-sublevel-scoring default so "L0 stays bounded" holds.
+        l0_compaction_file_threshold: 4,
         ..Default::default()
     };
 
@@ -753,6 +756,8 @@ fn read_triggered_compaction_moves_a_passed_through_file() {
         &dir,
         Options {
             read_compaction_threshold: 4,
+            // The four disjoint flushes below should merge by file count (one sublevel).
+            l0_compaction_file_threshold: 4,
             ..Default::default()
         },
     )
@@ -803,7 +808,15 @@ fn read_triggered_compaction_moves_a_passed_through_file() {
 #[test]
 fn tombstone_density_compaction_drains_a_dense_file() {
     let dir = temp_dir("tombstone-density");
-    let db = Db::open(&dir, Options::default()).unwrap();
+    let db = Db::open(
+        &dir,
+        Options {
+            // Merge the four flushes by file count into one dense L1 file (one sublevel).
+            l0_compaction_file_threshold: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Four L0 flushes — including a batch of deletes — reach the L0 file-count trigger (4),
     // so the score picker merges them into a single L1 file. Because L1 is not the bottom
@@ -1589,6 +1602,8 @@ fn per_level_target_file_size_splits_more() {
             mem_table_size: 16 * 1024,
             // Override only L1's target to 4 KiB (index 0 = L0, unused).
             level_target_file_sizes: vec![0, 4 * 1024],
+            // Drain the disjoint (single-sublevel) L0 flushes into L1 by file count.
+            l0_compaction_file_threshold: 4,
             ..Default::default()
         },
     )
@@ -2126,6 +2141,9 @@ fn deletion_pacing_defers_obsolete_file_removal() {
             // 1 byte/sec: after the pacer deletes one file it sleeps for ~its size in seconds,
             // so the rest of a compaction's obsolete inputs stay queued.
             target_byte_deletion_rate: 1,
+            // Build up levels by file count during the writes so the full compaction has many
+            // input files to obsolete (disjoint flushes are a single sublevel otherwise).
+            l0_compaction_file_threshold: 4,
             ..Default::default()
         },
     )
@@ -2179,6 +2197,8 @@ fn multilevel_compaction_folds_three_levels() {
             mem_table_size: 4 * 1024,
             target_file_size: 1024,
             l1_max_bytes: 1024,
+            // Drain L0 by file count so data flows down into L1/L2/L3 for the fold.
+            l0_compaction_file_threshold: 4,
             logger: Some(logger.clone()),
             ..Default::default()
         },
@@ -3568,8 +3588,9 @@ fn ingest_and_excise_replaces_a_range() {
 
 #[test]
 fn l0_compaction_threshold_is_configurable() {
-    // A high L0 threshold lets many L0 files accumulate without compaction (the default
-    // of 4 would have drained them), proving the tunable is wired through.
+    // L0 is scored by sublevel count, so write *overlapping* flushes (each rewrite of the same
+    // keys adds a sublevel). A high sublevel threshold lets them accumulate without compaction;
+    // the default of 4 would have drained them — proving the tunable is wired through.
     let dir = temp_dir("l0-threshold");
     let opts = Options {
         mem_table_size: 4 * 1024,
@@ -3577,23 +3598,95 @@ fn l0_compaction_threshold_is_configurable() {
         ..Default::default()
     };
     let db = Db::open(&dir, opts).unwrap();
-    for i in 0..400u32 {
-        db.set(format!("k{i:05}").as_bytes(), &[b'v'; 64]).unwrap();
-        if i % 20 == 19 {
-            db.flush().unwrap(); // force an L0 file
+    for _round in 0..12u32 {
+        for k in 0..20u32 {
+            db.set(format!("k{k:05}").as_bytes(), &[b'v'; 64]).unwrap();
         }
+        db.flush().unwrap(); // each round overlaps the last → one more sublevel
     }
     let m = db.metrics();
     assert!(
-        m.level_files[0] > 4,
-        "high L0 threshold should let L0 accumulate, got {:?}",
+        m.l0_sublevels > 4,
+        "high sublevel threshold should let overlapping L0 accumulate, got {} sublevels {:?}",
+        m.l0_sublevels,
         m.level_files
     );
     // Data is still correct.
     assert_eq!(db.get(b"k00000").unwrap(), Some(vec![b'v'; 64]));
-    assert_eq!(db.get(b"k00399").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(db.get(b"k00019").unwrap(), Some(vec![b'v'; 64]));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L0 is scored by **sublevel** count, not raw file count: overlapping flushes (which stack
+/// into sublevels) trigger an L0→L1 compaction at `l0_compaction_threshold`, while disjoint
+/// flushes (a single sublevel) do not — they accumulate until the file-count safety cap.
+#[test]
+fn l0_compaction_scores_by_sublevels() {
+    // Flat L0: disjoint key ranges form one sublevel and do NOT trigger the sublevel threshold.
+    let dir = temp_dir("sublevel-flat");
+    let db = Db::open(
+        &dir,
+        Options {
+            mem_table_size: 4 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for g in 0..6u32 {
+        for k in 0..20u32 {
+            db.set(format!("k{g:02}{k:03}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let m = db.metrics();
+    assert_eq!(
+        m.l0_sublevels, 1,
+        "disjoint flushes pack into one sublevel: {:?}",
+        m.level_files
+    );
+    assert!(
+        m.level_files[0] >= 6,
+        "a flat (single-sublevel) L0 is not drained by the sublevel trigger, so files \
+         accumulate (until the file-count cap): {:?}",
+        m.level_files
+    );
+    drop(db);
+
+    // Deep L0: repeatedly rewriting the same keys stacks sublevels past the threshold (4),
+    // which triggers an L0→L1 compaction.
+    let dir2 = temp_dir("sublevel-deep");
+    let db2 = Db::open(
+        &dir2,
+        Options {
+            mem_table_size: 4 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for _round in 0..5u32 {
+        for k in 0..20u32 {
+            db2.set(format!("k{k:03}").as_bytes(), b"v").unwrap();
+        }
+        db2.flush().unwrap();
+    }
+    // The background worker drains L0 once the sublevel score crosses 1.0; poll for it.
+    let mut drained = false;
+    for _ in 0..200 {
+        let m = db2.metrics();
+        if m.level_files[1..].iter().sum::<usize>() > 0 && m.l0_sublevels < 4 {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        drained,
+        "overlapping flushes stack sublevels that trigger L0->L1: {:?}",
+        db2.metrics().level_files
+    );
+    assert_eq!(db2.get(b"k000").unwrap(), Some(b"v".to_vec()));
+    drop(db2);
 }
 
 #[test]

@@ -144,8 +144,16 @@ pub struct Options {
     /// until the background worker catches up (default 4). Bounds memory when writes
     /// outrun flushing. Minimum 1.
     pub mem_table_stop_writes_threshold: usize,
-    /// Number of L0 sstables that triggers an L0→L1 compaction (default 4).
+    /// Number of L0 **sublevels** (layers of mutually-overlapping sstables) that triggers an
+    /// L0→L1 compaction (default 4, Pebble's `L0CompactionThreshold`). L0 read amplification is
+    /// the sublevel count, not the file count, so disjoint files that pack into a single
+    /// sublevel do not force a compaction; they accumulate until the file-count safety cap
+    /// ([`l0_compaction_file_threshold`](Options::l0_compaction_file_threshold)) is reached.
     pub l0_compaction_threshold: usize,
+    /// Number of L0 sstables that triggers an L0→L1 compaction regardless of sublevel count — a
+    /// safety cap so an L0 with many disjoint (single-sublevel) files still drains (default 500,
+    /// Pebble's `L0CompactionFileThreshold`).
+    pub l0_compaction_file_threshold: usize,
     /// Target size in bytes of an output sstable before it is split during compaction
     /// (default 2 MiB).
     pub target_file_size: u64,
@@ -309,6 +317,7 @@ impl Default for Options {
             cleaner: Arc::new(DeleteCleaner),
             mem_table_stop_writes_threshold: 4,
             l0_compaction_threshold: 4,
+            l0_compaction_file_threshold: 500,
             target_file_size: 2 << 20,
             tombstone_dense_compaction_threshold: 0.10,
             read_compaction_threshold: 1024,
@@ -608,6 +617,8 @@ pub struct DbInner {
     l0_compaction_threshold: usize,
     /// Target output-sstable size before splitting during compaction.
     target_file_size: u64,
+    /// L0 file-count safety cap that triggers an L0→L1 compaction regardless of sublevel count.
+    l0_compaction_file_threshold: usize,
 }
 
 /// Lazily opens the point iterator for one file of an ordered run (a level or L0 sublevel) when
@@ -1156,6 +1167,7 @@ impl DbInner {
                 commit_q: Mutex::new(CommitQueue::default()),
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
+                l0_compaction_file_threshold: opts.l0_compaction_file_threshold.max(1),
                 target_file_size: opts.target_file_size.max(1),
             });
         }
@@ -1318,6 +1330,7 @@ impl DbInner {
             commit_q: Mutex::new(CommitQueue::default()),
             mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
+            l0_compaction_file_threshold: opts.l0_compaction_file_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
         })
     }

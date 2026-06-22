@@ -92,19 +92,14 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: concurrent writers proceed during an ingest; the ingested values still win over
     older unflushed keys.
 
-- [ ] **Sublevel scoring (the second half of sublevel-aware reads).** The read path presents
-  each level (and each L0 sublevel) as one ordered `ConcatIter` run, and a run now opens its
-  files **lazily** (done): a `ConcatIter` opens a part's sstable reader only when a seek lands
-  in it, while range tombstones / range keys are collected eagerly but skip files an in-memory
-  per-file "has spans" hint marks span-free. So a flat L0 of many files no longer reads them all
-  when a scan starts. What remains is letting L0 *file count* grow (Pebble scores L0 by sublevel
-  count) without paying for it:
-  - [ ] Switch the picker's L0 score from file count to sublevel count
-    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`). File-count
-    scoring is currently the right fit; lazy opening (now landed) is the prerequisite this
-    unblocks.
-  - [ ] Test: a deep (many-sublevel) L0 compacts before a flat (one-sublevel) L0; a flat L0
-    still drains via the file-count guard.
+- [x] **Sublevel-aware reads + scoring.** The read path presents each level (and each L0
+  sublevel) as one ordered `ConcatIter` run, opened **lazily** (a part's sstable reader is opened
+  only when a seek lands in it; range tombstones / range keys are collected eagerly but skip
+  files an in-memory per-file "has spans" hint marks span-free). The picker now scores L0 by
+  **sublevel** count — `max(sublevels/l0_compaction_threshold, files/l0_compaction_file_threshold)`
+  (Pebble's L0 score: sublevel threshold 4, file-count safety cap 500) — so a flat L0 of many
+  disjoint files (one sublevel) no longer over-compacts, while overlapping flushes still trigger
+  at the sublevel threshold.
   - [ ] Optional: persist the per-file span hint in the MANIFEST so files written by a prior
     session (or upstream Pebble) also skip the eager open on cold reopen instead of being opened
     once to learn it.

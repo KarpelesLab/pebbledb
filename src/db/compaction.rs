@@ -488,11 +488,18 @@ impl DbInner {
     }
 
     /// The compaction score of a level: how far over its trigger it is. A level with the
-    /// highest score above 1.0 is the most in need of compaction. L0 is scored by file
-    /// count; L1+ by total size against the level's byte budget.
+    /// highest score above 1.0 is the most in need of compaction. L0 is scored by **sublevel**
+    /// count (its read amplification) against `l0_compaction_threshold`, with a file-count term
+    /// against `l0_compaction_file_threshold` as a safety cap so a flat L0 of many disjoint
+    /// (single-sublevel) files still drains; the larger of the two wins (Pebble's L0 score).
+    /// L1+ are scored by total size against the level's byte budget.
     fn level_score(&self, version: &Version, level: usize) -> f64 {
         if level == 0 {
-            version.levels[0].len() as f64 / self.l0_compaction_threshold as f64
+            let files = version.levels[0].len();
+            let sublevels = super::l0_sublevel_count(&version.levels[0], self.cmp.as_ref());
+            let by_sublevels = sublevels as f64 / self.l0_compaction_threshold as f64;
+            let by_files = files as f64 / self.l0_compaction_file_threshold as f64;
+            by_sublevels.max(by_files)
         } else {
             let total: u64 = version.levels[level].iter().map(|f| f.size).sum();
             total as f64 / level_budget(self.l1_max_bytes, level) as f64
