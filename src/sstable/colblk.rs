@@ -825,6 +825,10 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
         let trailer_off = self.header.columns[num_key_cols + DATA_COL_TRAILER].page_offset as usize;
         let value_off = self.header.columns[num_key_cols + DATA_COL_VALUE].page_offset as usize;
 
+        // NOTE: out-of-line (value-block) columnar values — flagged by the is-value-external
+        // column — are not decoded yet; such a value column holds a handle rather than the value.
+        // (Our bool-column decoder does not yet match Pebble's compact all-equal bitmap form, so
+        // that column is not consulted here.)
         let keys = self.schema.decode_keys(self.block, &key_offsets, rows)?;
         let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
         let (values, _) = decode_raw_bytes(self.block, value_off, rows)?;
