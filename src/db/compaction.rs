@@ -84,13 +84,36 @@ impl DbInner {
             for level in 0..NUM_LEVELS - 1 {
                 let c = {
                     let mut state = self.state.lock().unwrap();
-                    let inputs: Vec<_> = self
+                    let in_range: Vec<_> = self
                         .range_overlap(&state.vs.current, level, start, end)
-                        .filter(|f| !state.compacting.contains(&f.file_num))
                         .collect();
-                    if inputs.is_empty() {
+                    if in_range.is_empty() {
                         continue;
                     }
+                    // L0 files overlap, so a single key's versions can be spread across several
+                    // of them. Compacting only a *subset* of L0 (e.g. because a sibling is being
+                    // compacted concurrently) can relevel a file holding the newest version of a
+                    // key below an older version left behind in an excluded L0 file — an
+                    // inversion. So L0 is all-or-nothing: take every overlapping L0 file, or defer
+                    // if any is busy. L1+ files are non-overlapping, so a subset is safe there.
+                    let inputs: Vec<_> = if level == 0 {
+                        if in_range
+                            .iter()
+                            .any(|f| state.compacting.contains(&f.file_num))
+                        {
+                            continue;
+                        }
+                        in_range
+                    } else {
+                        let v: Vec<_> = in_range
+                            .into_iter()
+                            .filter(|f| !state.compacting.contains(&f.file_num))
+                            .collect();
+                        if v.is_empty() {
+                            continue;
+                        }
+                        v
+                    };
                     let (min, max) = match key_range(self.cmp.as_ref(), &inputs) {
                         Some(r) => r,
                         None => continue,
