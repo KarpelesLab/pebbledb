@@ -34,6 +34,7 @@ pub mod colblk;
 pub mod columnar;
 pub mod filter;
 pub mod keyschema;
+pub mod pebble_blob;
 pub mod properties;
 pub mod valblk;
 pub mod writer;

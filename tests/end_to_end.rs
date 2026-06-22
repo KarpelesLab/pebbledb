@@ -4621,3 +4621,23 @@ fn engine_compacts_to_columnar_sstables() {
         );
     }
 }
+
+/// Reads a real Pebble v2 native blob file (`FormatValueSeparation`, format 24) — checked in as a
+/// fixture — through `pebble_blob::PebbleBlobReader`, proving byte-parity with Pebble's blob file
+/// format. The fixture holds the separated values for keys key00000..key00029, each value being
+/// "V<i>-" repeated 20 times.
+#[test]
+fn reads_pebble_v2_native_blob_file_fixture() {
+    use pebbledb::sstable::pebble_blob::PebbleBlobReader;
+
+    let bytes = include_bytes!("fixtures/pebble_v2_blobfile.blob").to_vec();
+    let r = PebbleBlobReader::open(bytes).expect("open blob file");
+
+    let values = r.iter_all().expect("iter all values");
+    assert_eq!(values.len(), 30, "30 separated values");
+    // The values are in insertion (key) order: value i = "V<i>-" * 20.
+    for (i, v) in values.iter().enumerate() {
+        let want = format!("V{i}-").repeat(20);
+        assert_eq!(v.as_slice(), want.as_bytes(), "blob value {i}");
+    }
+}

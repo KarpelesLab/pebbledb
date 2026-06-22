@@ -187,7 +187,15 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   byte-parity here is effectively implementing Pebble's whole value-separation subsystem (table v6 +
   native blob files + blob-ref MANIFEST encoding), a distinct multi-part effort rather than a
   format diff. (Confirmed against v2.1.6: a DB at format 19 with `ValueSeparationPolicy{Enabled}`
-  writes no `.blob` — the policy is gated on `FormatValueSeparation`.)
+  writes no `.blob` — the policy is gated on `FormatValueSeparation`.) Progress:
+  - [x] **Native blob file reader.** `sstable::pebble_blob::PebbleBlobReader` reads Pebble's native
+    `.blob` format byte-for-byte: the 38-byte footer (`crc | index_offset | index_length |
+    checksum_type | format | original_file_num | magic`, magic `🪳🦀`), the index block (4-byte
+    `countVirtualBlocks` header + a `colblk` offsets column of `countBlocks + 1` entries), and each
+    value block (a `colblk` single RawBytes column), resolving values by `(block_id, value_id)`.
+    Verified by a checked-in real Pebble v2.1.6 blob fixture (`pebble_v2_blobfile.blob`).
+  - [ ] v6 sstable table format (61-byte footer + attributes), the in-sstable `blob-reference-index`
+    block, `NewFile5` blob-reference MANIFEST encoding, and the value-separation write path.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
