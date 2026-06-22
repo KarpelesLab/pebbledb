@@ -54,9 +54,11 @@ const TARGET_DATA_BLOCK_SIZE: usize = 32 * 1024;
 /// use empty suffix/value; a range-key SET/UNSET with several suffixes contributes one per suffix.
 type KeyspanWriteEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>, Vec<u8>);
 
-/// A finished columnar table: `(sstable_bytes, blob_file_bytes, blob_file_refs)`. The blob is
-/// `Some` only when value separation was enabled and at least one value was separated.
-pub type ColumnarOutput = (Vec<u8>, Option<Vec<u8>>, Vec<u64>);
+/// A finished columnar table: `(sstable_bytes, blob, blob_file_refs)`. `blob` is `Some((bytes,
+/// value_size))` — the native blob file and the total bytes of values it holds — only when value
+/// separation was enabled and at least one value was separated. `blob_file_refs` are the sstable's
+/// referenced blob file IDs (here, the single blob file number).
+pub type ColumnarOutput = (Vec<u8>, Option<(Vec<u8>, u64)>, Vec<u64>);
 
 /// v7 footer attribute bits (Pebble's `sstable.Attributes`), in iota order: ValueBlocks=1<<0,
 /// RangeKeySets=1<<1, RangeKeyUnsets=1<<2, RangeKeyDels=1<<3, RangeDels=1<<4, TwoLevelIndex=1<<5,
@@ -89,6 +91,8 @@ pub struct ColumnarWriter {
     blob_file_num: u64,
     /// Whether any value was separated into `blob_writer`.
     separated_any: bool,
+    /// Total bytes of values written out-of-line (the blob file's value size).
+    separated_value_bytes: u64,
     index: colblk::IndexBlockBuilder,
     last_key: Vec<u8>,
     num_entries: u64,
@@ -130,6 +134,7 @@ impl ColumnarWriter {
             ),
             blob_file_num: 0,
             separated_any: false,
+            separated_value_bytes: 0,
             range_dels: Vec::new(),
             range_keys: Vec::new(),
         }
@@ -187,6 +192,7 @@ impl ColumnarWriter {
         if separate {
             let h = self.blob_writer.add_value(value);
             self.separated_any = true;
+            self.separated_value_bytes += value.len() as u64;
             // Inline blob handle: value-prefix 0x40 then uvarint(reference_id=0, value_len,
             // block_id, value_id). reference_id 0 indexes this sstable's single blob reference.
             let mut reference = vec![super::pebble_blob::VALUE_KIND_BLOB_HANDLE];
@@ -475,7 +481,10 @@ impl ColumnarWriter {
 
         // Finalize the blob file, if any values were separated.
         let (blob, refs) = if self.separated_any {
-            (Some(self.blob_writer.finish()?), vec![self.blob_file_num])
+            (
+                Some((self.blob_writer.finish()?, self.separated_value_bytes)),
+                vec![self.blob_file_num],
+            )
         } else {
             (None, Vec::new())
         };
@@ -813,7 +822,8 @@ mod tests {
         w.add(&ikey(b"key00008", 50), b"tiny").unwrap();
 
         let (table, blob, refs) = w.finish_columnar().unwrap();
-        let blob = blob.expect("a blob file (values were separated)");
+        let (blob, value_size) = blob.expect("a blob file (values were separated)");
+        assert!(value_size > 0);
         assert_eq!(refs, vec![6]);
 
         struct R(PebbleBlobReader);

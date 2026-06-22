@@ -649,12 +649,12 @@ pub struct DbInner {
     blob_store: Arc<BlobStore>,
     /// Opens and caches Pebble native blob files (`FormatValueSeparation`).
     native_blob_store: Arc<NativeBlobStore>,
-    /// For sstables written by upstream Pebble with separated values: maps the sstable's file
+    /// For sstables whose values are separated into native blob files: maps the sstable's file
     /// number to its resolved native blob file numbers (one per blob reference, in reference-id
-    /// order). Precomputed at open from the MANIFEST's blob-file registry + each file's blob
-    /// references; empty for databases pebbledb wrote (which store values inline or in sibling
-    /// blob files). Read lock-free by `open_reader`, so it never contends with the state lock.
-    native_blob_refs: HashMap<u64, Vec<u64>>,
+    /// order). Seeded at open from the MANIFEST's blob-file registry + each file's blob references,
+    /// and extended when a flush writes a value-separated table. Behind its own mutex so
+    /// `open_reader` never takes the state lock (it may itself be called under the state lock).
+    native_blob_refs: Mutex<HashMap<u64, Vec<u64>>>,
     /// Per-level output-sstable size targets; falls back to `target_file_size` past its end.
     level_target_file_sizes: Vec<u64>,
     /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
@@ -1193,7 +1193,7 @@ impl DbInner {
                 wal_dirs,
                 blob_store,
                 native_blob_store,
-                native_blob_refs,
+                native_blob_refs: Mutex::new(native_blob_refs),
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
                 wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
@@ -1375,7 +1375,7 @@ impl DbInner {
             wal_dirs,
             blob_store,
             native_blob_store,
-            native_blob_refs,
+            native_blob_refs: Mutex::new(native_blob_refs),
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
             wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
@@ -2105,14 +2105,23 @@ impl DbInner {
         // Write the sstable(s) without holding the state lock. At a columnar format major version
         // the memtable is flushed to a single columnar sstable; otherwise to row sstable(s),
         // splitting large point-only memtables at the target file size.
+        let mut new_blob_files: Vec<NewBlobFileRecord> = Vec::new();
         let metas = if self.format_major_version() >= FormatMajorVersion::COLUMNAR_BLOCKS {
-            write_memtable_to_columnar_sstable(
+            // A second preallocated file number backs a native blob file when value separation is
+            // active (format >= VALUE_SEPARATION with a blob threshold).
+            let blob_file_num = file_nums.get(1).copied().unwrap_or(file_nums[0]);
+            let (metas, blob_files) = write_memtable_to_columnar_sstable(
                 self.fs.as_ref(),
                 &self.dir,
                 &self.cmp,
                 file_nums[0],
                 &mem,
-            )?
+                self.format_major_version(),
+                self.blob_value_threshold,
+                blob_file_num,
+            )?;
+            new_blob_files = blob_files;
+            metas
         } else {
             write_memtable_to_sstables(
                 self.fs.as_ref(),
@@ -2126,6 +2135,28 @@ impl DbInner {
                 self.blob_value_threshold,
             )?
         };
+        // Record any flushed value-separated table's blob references so reads in this same
+        // instance (e.g. a triggered compaction) resolve them; a reopen re-seeds from the MANIFEST.
+        if !new_blob_files.is_empty() {
+            let id_to_num: HashMap<u64, u64> = new_blob_files
+                .iter()
+                .map(|&(id, num, _, _)| (id, num))
+                .collect();
+            let mut nbr = self.native_blob_refs.lock().unwrap();
+            for m in &metas {
+                if m.pebble_blob_refs.is_empty() {
+                    continue;
+                }
+                let nums: Vec<u64> = m
+                    .pebble_blob_refs
+                    .iter()
+                    .filter_map(|(id, _)| id_to_num.get(id).copied())
+                    .collect();
+                if nums.len() == m.pebble_blob_refs.len() {
+                    nbr.insert(m.file_num, nums);
+                }
+            }
+        }
         // Move freshly-flushed tables to shared storage when create_on_shared is enabled.
         for m in &metas {
             self.upload_if_shared(m.file_num)?;
@@ -2155,6 +2186,7 @@ impl DbInner {
                 .into_iter()
                 .map(|meta| NewFileEntry { level: 0, meta })
                 .collect(),
+            new_blob_files,
             ..Default::default()
         };
         state.vs.apply(&edit)?;
@@ -2693,13 +2725,18 @@ impl DbInner {
         // A table written by upstream Pebble with separated values resolves them against native
         // blob files; pass its blob references + resolver so resolution happens during the
         // columnar reader's up-front materialization.
-        let native_blob = self.native_blob_refs.get(&file_num).map(|refs| {
-            (
-                refs.clone(),
-                Arc::clone(&self.native_blob_store)
-                    as Arc<dyn crate::sstable::pebble_blob::NativeBlobResolver>,
-            )
-        });
+        let native_blob = self
+            .native_blob_refs
+            .lock()
+            .unwrap()
+            .get(&file_num)
+            .map(|refs| {
+                (
+                    refs.clone(),
+                    Arc::clone(&self.native_blob_store)
+                        as Arc<dyn crate::sstable::pebble_blob::NativeBlobResolver>,
+                )
+            });
         let reader = Arc::new(
             Reader::open_with_cache(
                 bytes,
@@ -3590,7 +3627,7 @@ fn native_blob_refs_from_version(vs: &crate::manifest::VersionSet) -> HashMap<u6
             let nums: Vec<u64> = f
                 .pebble_blob_refs
                 .iter()
-                .filter_map(|id| vs.blob_files.get(id).copied())
+                .filter_map(|(id, _)| vs.blob_files.get(id).copied())
                 .collect();
             if nums.len() == f.pebble_blob_refs.len() {
                 out.insert(f.file_num, nums);
@@ -3846,25 +3883,39 @@ fn write_memtable_to_sstables(
 /// inline (no value-block / blob separation — a valid, if less compact, columnar table) and the
 /// whole memtable goes to one file (no target-size splitting); both are correctness-preserving
 /// simplifications of the row path. Point keys, range deletions, and range keys are all written.
+///
+/// A native blob-file MANIFEST record: `(blob_file_id, file_num, size, value_size)`.
+type NewBlobFileRecord = (u64, u64, u64, u64);
+#[allow(clippy::too_many_arguments)]
 fn write_memtable_to_columnar_sstable(
     fs: &dyn Fs,
     dir: &Path,
     cmp: &Arc<dyn Comparer>,
     file_num: u64,
     mem: &Arc<MemTable>,
-) -> Result<Vec<FileMetadata>> {
+    format_major_version: FormatMajorVersion,
+    blob_value_threshold: Option<usize>,
+    blob_file_num: u64,
+) -> Result<(Vec<FileMetadata>, Vec<NewBlobFileRecord>)> {
     use crate::sstable::TableFormat;
     use crate::sstable::columnar::ColumnarWriter;
     use std::io::Write;
 
+    // At a value-separation format major version with a blob threshold, write a table-format-v7
+    // table and separate large values into a native blob file; otherwise a v5 inline columnar table.
+    let separate = format_major_version >= FormatMajorVersion::VALUE_SEPARATION
+        && blob_value_threshold.is_some();
     let has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
     let mut w = ColumnarWriter::new(
         cmp.clone(),
         WriterOptions {
-            table_format: TableFormat::Pebble(5),
+            table_format: TableFormat::Pebble(if separate { 7 } else { 5 }),
             ..Default::default()
         },
     );
+    if separate {
+        w.enable_value_separation(blob_value_threshold.unwrap(), blob_file_num);
+    }
 
     let mut smallest: Option<Vec<u8>> = None;
     let mut largest: Vec<u8> = Vec::new();
@@ -3942,24 +3993,41 @@ fn write_memtable_to_columnar_sstable(
         largest_seq = largest_seq.max(rk.seqnum);
     }
 
-    let bytes = w.finish()?;
+    let (bytes, blob_bytes, blob_refs) = w.finish_columnar()?;
     let path = dir.join(filenames::table(file_num));
     let mut file = fs.create(&path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
 
-    Ok(vec![FileMetadata {
-        file_num,
-        size: fs.size(&path)?,
-        smallest: smallest.unwrap_or_default(),
-        largest,
-        smallest_seqnum: smallest_seq.min(largest_seq),
-        largest_seqnum: largest_seq,
-        blob_refs: Vec::new(),
-        pebble_blob_refs: Vec::new(),
-        backing: None,
-        has_spans: Some(has_spans),
-    }])
+    // Write the native blob file, if values were separated. The blob file's number doubles as its
+    // blob-file ID; the NewBlobFile record carries its on-disk size and total value size, and the
+    // sstable's reference carries the same value size (Pebble requires non-zero value sizes).
+    let mut new_blob_files = Vec::new();
+    let mut pebble_blob_refs = Vec::new();
+    if let Some((blob, value_size)) = blob_bytes {
+        let blob_path = dir.join(filenames::blob(blob_file_num));
+        let mut bf = fs.create(&blob_path)?;
+        bf.write_all(&blob)?;
+        bf.sync_all()?;
+        new_blob_files.push((blob_file_num, blob_file_num, blob.len() as u64, value_size));
+        pebble_blob_refs = blob_refs.iter().map(|&id| (id, value_size)).collect();
+    }
+
+    Ok((
+        vec![FileMetadata {
+            file_num,
+            size: fs.size(&path)?,
+            smallest: smallest.unwrap_or_default(),
+            largest,
+            smallest_seqnum: smallest_seq.min(largest_seq),
+            largest_seqnum: largest_seq,
+            blob_refs: Vec::new(),
+            pebble_blob_refs,
+            backing: None,
+            has_spans: Some(has_spans),
+        }],
+        new_blob_files,
+    ))
 }
 
 /// Writes a new `manifest` marker pointing at `value`, with an `iter` one greater than

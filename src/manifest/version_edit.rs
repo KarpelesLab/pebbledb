@@ -96,12 +96,13 @@ pub struct FileMetadata {
     /// serialized to the MANIFEST; repopulated at open by scanning the sstable's metaindex.
     /// Empty for tables that reference no blob files.
     pub blob_refs: Vec<u64>,
-    /// For a table written by upstream Pebble at `FormatValueSeparation`, the ordered list of
-    /// **blob file IDs** this sstable references (decoded from the `customTagBlobReferences`
-    /// custom tag on a `NewFile4`/`NewFile5` record). An inline blob handle's `reference_id`
-    /// indexes this list; each ID is mapped to a physical blob file number via the version's blob
-    /// file registry. Empty for tables pebbledb wrote (which do not separate values this way).
-    pub pebble_blob_refs: Vec<u64>,
+    /// Blob references for a value-separated table (`FormatValueSeparation`): the ordered
+    /// `(blob_file_id, value_size)` pairs this sstable references, from the `customTagBlobReferences`
+    /// custom tag on a `NewFile4`/`NewFile5` record. An inline blob handle's `reference_id` indexes
+    /// this list; the ID maps to a physical blob file number via the version's blob-file registry,
+    /// and `value_size` is the bytes of values referenced (used by Pebble's GC accounting). Empty
+    /// for tables with no separated values.
+    pub pebble_blob_refs: Vec<(u64, u64)>,
     /// For a **virtual sstable**, the file number of the physical backing sstable it is a
     /// bounded view of (`<backing>.sst` on disk); the view is restricted to `[smallest,
     /// largest]`. `None` for an ordinary physical table (which is its own backing). Persisted
@@ -152,10 +153,10 @@ pub struct VersionEdit {
     pub deleted_files: Vec<(usize, u64)>,
     /// Files added.
     pub new_files: Vec<NewFileEntry>,
-    /// Native blob files added (Pebble `FormatValueSeparation`), as `(blob_file_id, file_num)`
-    /// pairs — the logical blob file id mapped to the physical `<file_num>.blob`. pebbledb does
-    /// not yet write these; they are decoded so a Pebble format-24 MANIFEST can be read.
-    pub new_blob_files: Vec<(u64, u64)>,
+    /// Native blob files added (Pebble `FormatValueSeparation`), as `(blob_file_id, file_num,
+    /// size, value_size)` — the logical blob file id, the physical `<file_num>.blob`, the file's
+    /// total size, and the total bytes of values it holds.
+    pub new_blob_files: Vec<(u64, u64, u64, u64)>,
     /// Native blob files removed, as `(blob_file_id, file_num)` pairs.
     pub deleted_blob_files: Vec<(u64, u64)>,
 }
@@ -261,10 +262,11 @@ impl VersionEdit {
                     // file_id, disk_file_num, size, value_size, creation_time.
                     let file_id = d.uvarint()?;
                     let file_num = d.uvarint()?;
-                    let _size = d.uvarint()?;
-                    let _value_size = d.uvarint()?;
+                    let size = d.uvarint()?;
+                    let value_size = d.uvarint()?;
                     let _creation_time = d.uvarint()?;
-                    edit.new_blob_files.push((file_id, file_num));
+                    edit.new_blob_files
+                        .push((file_id, file_num, size, value_size));
                 }
                 TAG_DELETED_BLOB_FILE => {
                     let file_id = d.uvarint()?;
@@ -352,27 +354,25 @@ impl VersionEdit {
                 }
                 if !nf.meta.pebble_blob_refs.is_empty() {
                     // Pebble's standard blob-reference tag: depth, count, then (blob_file_id,
-                    // value_size) per reference. We do not track value sizes, so they are encoded
-                    // as 0; reference depth is encoded as 1.
+                    // value_size) per reference. Reference depth is encoded as 1.
                     put_uvarint(&mut buf, CUSTOM_TAG_BLOB_REFERENCES);
                     put_uvarint(&mut buf, 1); // blob reference depth
                     put_uvarint(&mut buf, nf.meta.pebble_blob_refs.len() as u64);
-                    for &file_id in &nf.meta.pebble_blob_refs {
+                    for &(file_id, value_size) in &nf.meta.pebble_blob_refs {
                         put_uvarint(&mut buf, file_id);
-                        put_uvarint(&mut buf, 0); // value size (unknown)
+                        put_uvarint(&mut buf, value_size);
                     }
                 }
                 put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
             }
         }
-        for (file_id, file_num) in &self.new_blob_files {
-            // tagNewBlobFile: file_id, file_num, size, value_size, creation_time. Sizes are not
-            // tracked here, so they are encoded as 0.
+        for &(file_id, file_num, size, value_size) in &self.new_blob_files {
+            // tagNewBlobFile: file_id, file_num, size, value_size, creation_time.
             put_uvarint(&mut buf, TAG_NEW_BLOB_FILE);
-            put_uvarint(&mut buf, *file_id);
-            put_uvarint(&mut buf, *file_num);
-            put_uvarint(&mut buf, 0); // size
-            put_uvarint(&mut buf, 0); // value size
+            put_uvarint(&mut buf, file_id);
+            put_uvarint(&mut buf, file_num);
+            put_uvarint(&mut buf, size);
+            put_uvarint(&mut buf, value_size);
             put_uvarint(&mut buf, 0); // creation time
         }
         for (file_id, file_num) in &self.deleted_blob_files {
@@ -477,7 +477,7 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
 #[allow(clippy::type_complexity)]
 fn decode_custom_tags(
     d: &mut Decoder<'_>,
-) -> Result<(Option<u64>, Option<bool>, Vec<u64>, Vec<u64>)> {
+) -> Result<(Option<u64>, Option<bool>, Vec<u64>, Vec<(u64, u64)>)> {
     let mut backing = None;
     let mut has_spans = None;
     let mut blob_refs = Vec::new();
@@ -523,11 +523,11 @@ fn decode_custom_tags(
                 let n = d.uvarint()?;
                 for _ in 0..n {
                     let file_id = d.uvarint()?;
-                    let _value_size = d.uvarint()?;
+                    let value_size = d.uvarint()?;
                     if custom == CUSTOM_TAG_BLOB_REFERENCES2 {
                         let _backing_value_size = d.uvarint()?;
                     }
-                    pebble_blob_refs.push(file_id);
+                    pebble_blob_refs.push((file_id, value_size));
                 }
             }
             CUSTOM_TAG_PATH_ID => {
@@ -602,16 +602,19 @@ mod tests {
         // A new file referencing Pebble blob files, plus NewBlobFile/DeletedBlobFile records,
         // round-trip through encode/decode.
         let mut m = meta(10, "a", "z", 100, 200);
-        m.pebble_blob_refs = vec![3, 5];
+        m.pebble_blob_refs = vec![(3, 111), (5, 222)];
         let edit = VersionEdit {
             new_files: vec![NewFileEntry { level: 1, meta: m }],
-            new_blob_files: vec![(3, 6), (5, 7)],
+            new_blob_files: vec![(3, 6, 500, 111), (5, 7, 600, 222)],
             deleted_blob_files: vec![(2, 4)],
             ..Default::default()
         };
         let got = VersionEdit::decode(&edit.encode()).unwrap();
-        assert_eq!(got.new_files[0].meta.pebble_blob_refs, vec![3, 5]);
-        assert_eq!(got.new_blob_files, vec![(3, 6), (5, 7)]);
+        assert_eq!(
+            got.new_files[0].meta.pebble_blob_refs,
+            vec![(3, 111), (5, 222)]
+        );
+        assert_eq!(got.new_blob_files, vec![(3, 6, 500, 111), (5, 7, 600, 222)]);
         assert_eq!(got.deleted_blob_files, vec![(2, 4)]);
     }
 
@@ -631,7 +634,7 @@ mod tests {
         put_uvarint(&mut buf, 1); // file_id
         put_uvarint(&mut buf, 2); // file_num
         let got = VersionEdit::decode(&buf).unwrap();
-        assert_eq!(got.new_blob_files, vec![(3, 6)]);
+        assert_eq!(got.new_blob_files, vec![(3, 6, 4096, 2048)]);
         assert_eq!(got.deleted_blob_files, vec![(1, 2)]);
     }
 

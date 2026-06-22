@@ -4622,6 +4622,49 @@ fn engine_compacts_to_columnar_sstables() {
     }
 }
 
+/// At the value-separation format major version with a blob threshold, the engine flushes
+/// table-format-v7 sstables and writes large values into native blob files; reopening reads them
+/// back through the native-blob resolution path.
+#[test]
+fn engine_writes_and_reads_value_separated_database() {
+    use pebbledb::FormatMajorVersion;
+
+    let dir = temp_dir("value-separation");
+    let opts = Options {
+        format_major_version: FormatMajorVersion::VALUE_SEPARATION,
+        blob_value_threshold: Some(20),
+        ..Default::default()
+    };
+
+    let big = |i: u32| format!("bigvalue-{i}-{}", "x".repeat(40));
+    {
+        let db = Db::open(&dir, opts.clone()).unwrap();
+        for i in 0..30u32 {
+            db.set(format!("key{i:05}").as_bytes(), big(i).as_bytes())
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    // A native blob file must have been written.
+    let has_blob = std::fs::read_dir(&dir)
+        .unwrap()
+        .any(|e| e.unwrap().path().extension().and_then(|x| x.to_str()) == Some("blob"));
+    assert!(has_blob, "expected a native blob file");
+
+    // Reopen and read the separated values back through the engine.
+    {
+        let db = Db::open(&dir, opts).unwrap();
+        for i in 0..30u32 {
+            assert_eq!(
+                db.get(format!("key{i:05}").as_bytes()).unwrap().as_deref(),
+                Some(big(i).as_bytes()),
+                "separated value for key{i:05}"
+            );
+        }
+    }
+}
+
 /// Reads a real Pebble v2 native blob file (`FormatValueSeparation`, format 24) — checked in as a
 /// fixture — through `pebble_blob::PebbleBlobReader`, proving byte-parity with Pebble's blob file
 /// format. The fixture holds the separated values for keys key00000..key00029, each value being

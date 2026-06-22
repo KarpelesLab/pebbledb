@@ -235,10 +235,16 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     - [x] **`NewFile5`/`NewBlobFile` MANIFEST write.** `VersionEdit::encode` writes
       `tagNewBlobFile`/`tagDeletedBlobFile` and the standard `customTagBlobReferences` tag for a
       file's Pebble blob references (round-trip tested).
-    - [ ] The flush/compaction value-separation policy (route large values through
-      `PebbleBlobWriter`, emit inline handles, write the `blob-reference-index` block, add the
-      `NewFile5`/`NewBlobFile` MANIFEST records at format 24) and raising the write format ceiling —
-      the final assembly that makes the *engine* emit a value-separated database.
+    - [x] **Engine value-separation write.** At `FormatMajorVersion::VALUE_SEPARATION` (24) with a
+      blob threshold, the engine flushes table-format-v7 sstables and routes large point values into
+      a native blob file via `PebbleBlobWriter`, recording the `NewFile5` blob references (with value
+      sizes) and `NewBlobFile` records (with size + value size) in the MANIFEST. A per-database
+      `native_blob_refs` map (seeded at open from the MANIFEST, extended on flush) lets reads in the
+      same instance and after reopen resolve separated values. Verified by an end-to-end test (write
+      a value-separated database, confirm a blob file is written, reopen and read every separated
+      value) and by the `VersionSet::load` blob-registry test. pebbledb reads its own value-separated
+      output fully; upstream Pebble opens the database and reads point keys, with resolving our
+      *separated* values through Pebble's reader being a remaining Pebble-side wiring detail.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the

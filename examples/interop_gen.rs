@@ -18,11 +18,15 @@ use pebbledb::{Db, FormatMajorVersion, Options};
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .expect("usage: interop_gen <dir> [columnar]");
-    // An optional second argument "columnar" opens the database at the columnar format major
-    // version, so the engine flushes columnar sstables that Pebble v2 then reads back.
-    let columnar = std::env::args().nth(2).as_deref() == Some("columnar");
-    let format_major_version = if columnar {
+        .expect("usage: interop_gen <dir> [columnar|separated]");
+    // Optional second argument: "columnar" opens at the columnar format; "separated" opens at the
+    // value-separation format with a blob threshold so large values land in native blob files.
+    let mode = std::env::args().nth(2);
+    let columnar = mode.as_deref() == Some("columnar");
+    let separated = mode.as_deref() == Some("separated");
+    let format_major_version = if separated {
+        FormatMajorVersion::VALUE_SEPARATION
+    } else if columnar {
         FormatMajorVersion::COLUMNAR_BLOCKS
     } else {
         // Pebble v2 dropped the oldest formats; FLUSHABLE_INGEST (13) is its minimum and is
@@ -31,6 +35,8 @@ fn main() {
     };
     let opts = Options {
         format_major_version,
+        // Separate values large enough that the known values (value0..value99) qualify.
+        blob_value_threshold: if separated { Some(4) } else { None },
         ..Default::default()
     };
     let db = Db::open(&dir, opts).expect("open db");

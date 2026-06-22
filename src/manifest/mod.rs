@@ -119,8 +119,8 @@ impl VersionSet {
         for nf in &edit.new_files {
             self.current.levels[nf.level].push(Arc::new(nf.meta.clone()));
         }
-        for (file_id, file_num) in &edit.new_blob_files {
-            self.blob_files.insert(*file_id, *file_num);
+        for &(file_id, file_num, _size, _value_size) in &edit.new_blob_files {
+            self.blob_files.insert(file_id, file_num);
         }
         for (file_id, _file_num) in &edit.deleted_blob_files {
             self.blob_files.remove(file_id);
@@ -240,12 +240,12 @@ mod tests {
         // must populate both the blob-file registry and the file's pebble_blob_refs.
         let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
         let mut m = meta(5, "a", "z", 1, 2);
-        m.pebble_blob_refs = vec![6];
+        m.pebble_blob_refs = vec![(6, 100)];
         let edit = VersionEdit {
             comparer_name: Some(cmp.name().to_string()),
             next_file_number: Some(10),
             new_files: vec![NewFileEntry { level: 0, meta: m }],
-            new_blob_files: vec![(6, 6)],
+            new_blob_files: vec![(6, 6, 500, 100)],
             ..Default::default()
         };
         let mut manifest = Vec::new();
@@ -254,8 +254,12 @@ mod tests {
         w.finish().unwrap();
 
         let vs = VersionSet::load(&manifest, cmp).unwrap();
-        assert_eq!(vs.blob_files.get(&6), Some(&6), "blob-file registry populated");
-        assert_eq!(vs.current.levels[0][0].pebble_blob_refs, vec![6]);
+        assert_eq!(
+            vs.blob_files.get(&6),
+            Some(&6),
+            "blob-file registry populated"
+        );
+        assert_eq!(vs.current.levels[0][0].pebble_blob_refs, vec![(6, 100)]);
     }
 
     #[test]
