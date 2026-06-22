@@ -220,6 +220,14 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     writable `NEWEST` = 19). Verified by a Rust→Go interop step: Go writes a value-separated
     database, the engine opens it read-only and reads every separated value.
   - [ ] The value-separation **write** path (emit v6/v7 + separate values into native blob files).
+    Progress:
+    - [x] **Native blob file writer.** `pebble_blob::PebbleBlobWriter` writes Pebble's native
+      `.blob` format (value block + index block + 38-byte footer with masked-CRC32C checksum),
+      mirroring the reader. Verified by a round-trip through `PebbleBlobReader` (itself proven
+      byte-exact against real Pebble blob fixtures).
+    - [ ] v6/v7 sstable write (footer + columnar metaindex KV block + blob-reference-index block),
+      `NewFile5`/`NewBlobFile` MANIFEST write, the value-separation policy in flush/compaction, and
+      raising the write format ceiling.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
