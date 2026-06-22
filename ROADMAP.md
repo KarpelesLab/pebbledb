@@ -127,18 +127,17 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
 > columnar and blob round-trips are the remaining work; the reference source is vendored locally
 > for byte comparison.
 
-- [ ] **Columnar round-trip in interop.** Extend the workflow beyond the row format.
-  - [ ] **Read parity:** our `colblk` reader cannot yet parse a Pebble v2.1.6 columnar sstable.
-    The shared block *header* matches; per-block *schema* differs — e.g. Pebble's index block has
-    four columns (separator, offsets, lengths, **block-properties**); the data block uses
-    `DefaultKeySchema` (`PrefixBytes` prefix column + suffix + trailer + value). Reconcile each
-    block type against the vendored v2.1.6 source until `ColumnarReader` reads a real file.
-  - [ ] **Engine integration:** `sstable::Reader::open` currently *rejects* columnar tables
-    (`is_columnar()` → error). Dispatch the read path (lookup / iter / spans) to the columnar
-    reader so the engine can open a columnar DB.
-  - [ ] Match `colblk.DefaultKeySchema(comparer, 16)`'s exact `KeySchema` name string.
-  - [ ] Extend `.github/workflows/interop.yml` to round-trip a columnar table both ways
-    (`interop-tool generate-columnar` already writes one).
+- [x] **Columnar read round-trip in interop.** The engine reads Pebble v2 columnar
+  (`FormatColumnarBlocks`) sstables: the `colblk` reader/writer match Pebble v2.1.6's data block
+  (4-byte custom header + seven columns: prefix, suffix, trailer, prefix-changed, value,
+  is-value-external, is-obsolete), `sstable::Reader` decodes a columnar table and serves point
+  lookups + iteration, and the open ceiling is raised to `COLUMNAR_BLOCKS` (19). Verified by a
+  checked-in Pebble columnar sstable fixture and a `generate-columnar` interop CI step (Go writes
+  columnar → Rust reads). New databases still default to the row format.
+  - [ ] **Columnar keyspan + out-of-line values:** decode columnar range-del / range-key blocks
+    and out-of-line (value-block) columnar values so a columnar table using those reads fully.
+  - [ ] **Columnar write path:** the engine still flushes/compacts to the row format; emitting
+    columnar tables (and a Rust→Go columnar interop direction) is a separate step.
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
   `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
   encoding. (No longer blocked — v2 is tagged.)
