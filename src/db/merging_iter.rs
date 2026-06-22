@@ -260,40 +260,106 @@ impl InternalIter for BoundedIter {
     }
 }
 
+/// Opens the point iterator for one part of a [`ConcatIter`] run on demand. The run's files
+/// are known up front (their `[smallest, largest]` bounds drive the binary search) but their
+/// readers — each of which reads the whole sstable — are only opened when a seek actually lands
+/// in a part, so a bounded scan over a large run does not read every file. `open(idx)` may
+/// return an empty iterator (e.g. a block-property-filtered file) — [`ConcatIter`] treats an
+/// immediately-invalid part exactly like an exhausted one and skips to the next.
+pub(crate) trait PartOpener {
+    fn open(&self, idx: usize) -> Result<Box<dyn InternalIter>>;
+    fn len(&self) -> usize;
+}
+
+/// An iterator with no entries; used as the opened form of a part that contributes no point
+/// keys (e.g. excluded by a block-property filter).
+pub(crate) struct EmptyIter;
+
+impl InternalIter for EmptyIter {
+    fn first(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn last(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn seek_ge(&mut self, _target: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn seek_lt(&mut self, _target: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn valid(&self) -> bool {
+        false
+    }
+    fn key(&self) -> &[u8] {
+        panic!("key() on an empty iterator")
+    }
+    fn value(&self) -> &[u8] {
+        panic!("value() on an empty iterator")
+    }
+    fn advance(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn retreat(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn clone_box(&self) -> Box<dyn InternalIter> {
+        Box::new(EmptyIter)
+    }
+}
+
 /// Presents a sorted, non-overlapping sequence of internal iterators — the files of one L1+
 /// level, or one L0 sublevel — as a single ordered iterator. The [`MergingIter`] then pays one
 /// source per run rather than one per file (its per-step cost is linear in the source count),
 /// and seeks binary-search to the containing part. The parts must be ascending and
 /// non-overlapping by key range; `bounds[i]` is part `i`'s `[smallest, largest]` encoded
 /// internal-key range.
+///
+/// Parts are opened lazily through [`PartOpener`]: `parts[i]` is `None` until the iterator
+/// first positions into part `i`, so a scan only reads the files it actually visits.
 pub(crate) struct ConcatIter {
-    parts: Vec<Box<dyn InternalIter>>,
+    opener: std::rc::Rc<dyn PartOpener>,
     bounds: Vec<(Vec<u8>, Vec<u8>)>,
+    parts: Vec<Option<Box<dyn InternalIter>>>,
     cmp: Arc<dyn Comparer>,
     cur: Option<usize>,
 }
 
 impl ConcatIter {
     pub(crate) fn new(
-        parts: Vec<Box<dyn InternalIter>>,
+        opener: std::rc::Rc<dyn PartOpener>,
         bounds: Vec<(Vec<u8>, Vec<u8>)>,
         cmp: Arc<dyn Comparer>,
     ) -> ConcatIter {
-        debug_assert_eq!(parts.len(), bounds.len());
+        debug_assert_eq!(opener.len(), bounds.len());
+        let parts = (0..bounds.len()).map(|_| None).collect();
         ConcatIter {
-            parts,
+            opener,
             bounds,
+            parts,
             cmp,
             cur: None,
         }
+    }
+
+    /// Returns part `i`, opening (and caching) its point iterator if not already open.
+    fn part(&mut self, i: usize) -> Result<&mut Box<dyn InternalIter>> {
+        if self.parts[i].is_none() {
+            self.parts[i] = Some(self.opener.open(i)?);
+        }
+        Ok(self.parts[i].as_mut().expect("just opened"))
     }
 
     /// Positions on the first valid entry of the first part at or after index `i`.
     fn first_from(&mut self, i: usize) -> Result<()> {
         let mut j = i;
         while j < self.parts.len() {
-            self.parts[j].first()?;
-            if self.parts[j].valid() {
+            let valid = {
+                let p = self.part(j)?;
+                p.first()?;
+                p.valid()
+            };
+            if valid {
                 self.cur = Some(j);
                 return Ok(());
             }
@@ -307,8 +373,12 @@ impl ConcatIter {
     fn last_from(&mut self, i: isize) -> Result<()> {
         let mut j = i;
         while j >= 0 {
-            self.parts[j as usize].last()?;
-            if self.parts[j as usize].valid() {
+            let valid = {
+                let p = self.part(j as usize)?;
+                p.last()?;
+                p.valid()
+            };
+            if valid {
                 self.cur = Some(j as usize);
                 return Ok(());
             }
@@ -317,19 +387,11 @@ impl ConcatIter {
         self.cur = None;
         Ok(())
     }
-}
 
-impl InternalIter for ConcatIter {
-    fn first(&mut self) -> Result<()> {
-        self.first_from(0)
-    }
-    fn last(&mut self) -> Result<()> {
-        self.last_from(self.parts.len() as isize - 1)
-    }
-    fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
-        // First part whose largest bound is >= target.
+    /// Index of the first part whose largest bound is `>= target` (for forward seeks).
+    fn search_ge(&self, target: &[u8]) -> usize {
         let mut lo = 0usize;
-        let mut hi = self.parts.len();
+        let mut hi = self.bounds.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
             if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].1, target)
@@ -340,12 +402,29 @@ impl InternalIter for ConcatIter {
                 hi = mid;
             }
         }
-        if lo >= self.parts.len() {
+        lo
+    }
+}
+
+impl InternalIter for ConcatIter {
+    fn first(&mut self) -> Result<()> {
+        self.first_from(0)
+    }
+    fn last(&mut self) -> Result<()> {
+        self.last_from(self.bounds.len() as isize - 1)
+    }
+    fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        let lo = self.search_ge(target);
+        if lo >= self.bounds.len() {
             self.cur = None;
             return Ok(());
         }
-        self.parts[lo].seek_ge(target)?;
-        if self.parts[lo].valid() {
+        let valid = {
+            let p = self.part(lo)?;
+            p.seek_ge(target)?;
+            p.valid()
+        };
+        if valid {
             self.cur = Some(lo);
             Ok(())
         } else {
@@ -355,24 +434,17 @@ impl InternalIter for ConcatIter {
     }
     fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<()> {
         // Same as `seek_ge` but the containing part may skip its table via the prefix bloom.
-        let mut lo = 0usize;
-        let mut hi = self.parts.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].1, target)
-                == std::cmp::Ordering::Less
-            {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo >= self.parts.len() {
+        let lo = self.search_ge(target);
+        if lo >= self.bounds.len() {
             self.cur = None;
             return Ok(());
         }
-        self.parts[lo].seek_prefix_ge(target, prefix)?;
-        if self.parts[lo].valid() {
+        let valid = {
+            let p = self.part(lo)?;
+            p.seek_prefix_ge(target, prefix)?;
+            p.valid()
+        };
+        if valid {
             self.cur = Some(lo);
             Ok(())
         } else {
@@ -382,7 +454,7 @@ impl InternalIter for ConcatIter {
     fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         // Last part whose smallest bound is < target (the one before the first with smallest >=).
         let mut lo = 0usize;
-        let mut hi = self.parts.len();
+        let mut hi = self.bounds.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
             if compare_encoded(self.cmp.as_ref(), &self.bounds[mid].0, target)
@@ -398,8 +470,12 @@ impl InternalIter for ConcatIter {
             return Ok(());
         }
         let idx = lo - 1;
-        self.parts[idx].seek_lt(target)?;
-        if self.parts[idx].valid() {
+        let valid = {
+            let p = self.part(idx)?;
+            p.seek_lt(target)?;
+            p.valid()
+        };
+        if valid {
             self.cur = Some(idx);
             Ok(())
         } else {
@@ -407,37 +483,58 @@ impl InternalIter for ConcatIter {
         }
     }
     fn valid(&self) -> bool {
-        self.cur.is_some_and(|i| self.parts[i].valid())
+        self.cur
+            .is_some_and(|i| self.parts[i].as_ref().is_some_and(|p| p.valid()))
     }
     fn key(&self) -> &[u8] {
-        self.parts[self.cur.expect("valid")].key()
+        self.parts[self.cur.expect("valid")]
+            .as_ref()
+            .expect("valid")
+            .key()
     }
     fn value(&self) -> &[u8] {
-        self.parts[self.cur.expect("valid")].value()
+        self.parts[self.cur.expect("valid")]
+            .as_ref()
+            .expect("valid")
+            .value()
     }
     fn advance(&mut self) -> Result<()> {
         let i = self.cur.expect("advance on invalid concat iter");
-        self.parts[i].advance()?;
-        if !self.parts[i].valid() {
+        let valid = {
+            let p = self.part(i)?;
+            p.advance()?;
+            p.valid()
+        };
+        if !valid {
             self.first_from(i + 1)?;
         }
         Ok(())
     }
     fn retreat(&mut self) -> Result<()> {
         let i = self.cur.expect("retreat on invalid concat iter");
-        self.parts[i].retreat()?;
-        if !self.parts[i].valid() {
+        let valid = {
+            let p = self.part(i)?;
+            p.retreat()?;
+            p.valid()
+        };
+        if !valid {
             self.last_from(i as isize - 1)?;
         }
         Ok(())
     }
     fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
-        self.cur.and_then(|i| self.parts[i].blob_ref())
+        self.cur
+            .and_then(|i| self.parts[i].as_ref().and_then(|p| p.blob_ref()))
     }
     fn clone_box(&self) -> Box<dyn InternalIter> {
         Box::new(ConcatIter {
-            parts: self.parts.iter().map(|p| p.clone_box()).collect(),
+            opener: std::rc::Rc::clone(&self.opener),
             bounds: self.bounds.clone(),
+            parts: self
+                .parts
+                .iter()
+                .map(|p| p.as_ref().map(|x| x.clone_box()))
+                .collect(),
             cmp: self.cmp.clone(),
             cur: self.cur,
         })

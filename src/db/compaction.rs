@@ -917,7 +917,11 @@ impl DbInner {
         }
         let num_outputs = outputs.len();
         let output_bytes: u64 = outputs.iter().map(|m| m.size).sum();
+        // `new_output` writes the retained tombstones / range keys into every output file, so the
+        // span hint is the same for all of them. Lets a later scan skip opening span-free outputs.
+        let outputs_have_spans = write_tombstones || write_range_keys;
         for meta in outputs {
+            self.record_span_hint(meta.file_num, outputs_have_spans);
             edit.new_files.push(NewFileEntry {
                 level: c.output_level,
                 meta,

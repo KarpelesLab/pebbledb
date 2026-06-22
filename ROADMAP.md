@@ -92,18 +92,22 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   - [ ] Test: concurrent writers proceed during an ingest; the ingested values still win over
     older unflushed keys.
 
-- [ ] **Sublevel scoring + lazy run files (the second half of sublevel-aware reads).** The
-  read path now presents each level (and each L0 sublevel) as one ordered `ConcatIter` run, so
-  the merging iterator pays one source per run, not per file (done). What remains is letting L0
-  *file count* grow (Pebble scores L0 by sublevel count) without paying for it:
-  - [ ] Make `ConcatIter`/`build_run_iters` open a run's files lazily (on seek/cross), so a
-    flat L0 of many files does not open them all up front when a scan starts.
-  - [ ] Then switch the picker's L0 score from file count to sublevel count
-    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`). Until lazy
-    opening lands, file-count scoring is the right fit — it keeps a run's file set small, which
-    bounds both scan-setup cost (files opened per run) and L0 read amplification.
+- [ ] **Sublevel scoring (the second half of sublevel-aware reads).** The read path presents
+  each level (and each L0 sublevel) as one ordered `ConcatIter` run, and a run now opens its
+  files **lazily** (done): a `ConcatIter` opens a part's sstable reader only when a seek lands
+  in it, while range tombstones / range keys are collected eagerly but skip files an in-memory
+  per-file "has spans" hint marks span-free. So a flat L0 of many files no longer reads them all
+  when a scan starts. What remains is letting L0 *file count* grow (Pebble scores L0 by sublevel
+  count) without paying for it:
+  - [ ] Switch the picker's L0 score from file count to sublevel count
+    (`max(sublevels/l0_compaction_threshold, files/L0CompactionFileThreshold)`). File-count
+    scoring is currently the right fit; lazy opening (now landed) is the prerequisite this
+    unblocks.
   - [ ] Test: a deep (many-sublevel) L0 compacts before a flat (one-sublevel) L0; a flat L0
-    still drains via the file-count guard; a scan over a flat L0 opens files lazily.
+    still drains via the file-count guard.
+  - [ ] Optional: persist the per-file span hint in the MANIFEST so files written by a prior
+    session (or upstream Pebble) also skip the eager open on cold reopen instead of being opened
+    once to learn it.
 
 - [ ] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
   recovery, match `pebble/wal`'s manager surface.

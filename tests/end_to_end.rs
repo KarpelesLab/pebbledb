@@ -3779,3 +3779,136 @@ fn compaction_splits_output_only_on_user_key_boundaries() {
     drop(snaps);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A bounded scan over a large run opens only the sstable(s) the seek lands in, not every file
+/// — the lazy-open `ConcatIter`. Files written this session record a "no spans" hint, so the
+/// eager range-tombstone/range-key pass skips opening them, and the point iterators are opened
+/// lazily on seek. Verified by counting `.sst` reads through a wrapping `Fs`.
+#[test]
+fn bounded_scan_opens_only_the_files_it_touches() {
+    use std::io;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+
+    // Wraps an inner `Fs`, counting reads of `.sst` files and delegating everything else.
+    struct CountingFs {
+        inner: Arc<dyn Fs>,
+        sst_reads: Arc<AtomicUsize>,
+    }
+    impl Fs for CountingFs {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.create(path)
+        }
+        fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.reuse(path)
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if path.extension().is_some_and(|e| e == "sst") {
+                self.sst_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.inner.read(path)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn size(&self, path: &Path) -> io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(path)
+        }
+    }
+
+    let sst_reads = Arc::new(AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(CountingFs {
+        inner: Arc::new(MemFs::new()),
+        sst_reads: Arc::clone(&sst_reads),
+    });
+    let db = Db::open(
+        "/lazy-open",
+        Options {
+            fs: Arc::clone(&fs),
+            mem_table_size: 8 * 1024,
+            target_file_size: 1024, // small → many output files
+            max_concurrent_compactions: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Many point-only keys with sizeable values, flushed and compacted toward the bottom level
+    // so the run is many small, non-overlapping, span-free files.
+    const N: u32 = 600;
+    let val = vec![b'x'; 200];
+    for i in 0..N {
+        db.set(format!("key{i:04}").as_bytes(), &val).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    let counts = db.level_file_counts();
+    let total_files: usize = counts.iter().sum();
+    assert!(
+        total_files >= 10,
+        "expected the run to have many files, got {total_files} ({counts:?})"
+    );
+
+    // A bounded scan over three consecutive keys should open only the file they live in.
+    sst_reads.store(0, AtomicOrdering::Relaxed);
+    let mut it = db
+        .iter_with_options(IterOptions {
+            lower_bound: Some(b"key0100".to_vec()),
+            upper_bound: Some(b"key0103".to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    let mut bounded = Vec::new();
+    while it.valid() {
+        bounded.push(it.key().to_vec());
+        it.next().unwrap();
+    }
+    let bounded_reads = sst_reads.load(AtomicOrdering::Relaxed);
+    assert_eq!(
+        bounded,
+        vec![
+            b"key0100".to_vec(),
+            b"key0101".to_vec(),
+            b"key0102".to_vec()
+        ],
+    );
+
+    // A full scan opens every file in the run.
+    sst_reads.store(0, AtomicOrdering::Relaxed);
+    let full = collect(&db);
+    let full_reads = sst_reads.load(AtomicOrdering::Relaxed);
+    assert_eq!(full.len(), N as usize);
+
+    assert!(
+        bounded_reads < full_reads,
+        "bounded scan opened {bounded_reads} sstables; a full scan opened {full_reads} — the \
+         bounded scan should open strictly fewer"
+    );
+    assert!(
+        bounded_reads <= 2,
+        "a 3-key bounded scan opened {bounded_reads} sstables (run has {total_files} files); \
+         lazy open should touch at most the boundary file or two"
+    );
+}

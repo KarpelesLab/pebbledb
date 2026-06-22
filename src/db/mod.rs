@@ -35,9 +35,6 @@ mod options_file;
 pub use indexed_batch::IndexedBatch;
 use merging_iter::InternalIter;
 
-/// One ordered run's point iterators and their parallel `[smallest, largest]` bounds — the
-/// inputs to a [`merging_iter::ConcatIter`].
-type RunIters = (Vec<Box<dyn InternalIter>>, Vec<(Vec<u8>, Vec<u8>)>);
 pub use merging_iter::{DbIterator, IterKeyType, IterOptions};
 pub use options_file::{FormatMajorVersion, OptionsFile};
 
@@ -535,6 +532,17 @@ pub struct DbInner {
     /// Signaled when a flush completes, waking any waiter draining the immutable queue.
     drained_cv: Condvar,
     cache: Mutex<HashMap<u64, Arc<Reader>>>,
+    /// Per-file hint of whether an sstable carries range tombstones and/or range keys, keyed
+    /// by `file_num`: `Some(true)` = has spans, `Some(false)` = neither, absent = unknown.
+    /// Populated for free where files are written (flush, compaction, recovery flush) and
+    /// learned on first open; lets a scan skip *opening* span-free files in the eager
+    /// span-collection pass (their point data is still opened lazily on seek). Files written by
+    /// a prior session, ingested, or by upstream Pebble stay absent and are opened eagerly.
+    span_hint: Mutex<HashMap<u64, bool>>,
+    /// A weak handle to the enclosing `Arc<DbInner>`, set once in [`Db::open`]. Lets methods
+    /// reached through `Db`'s `Deref` (which only yields `&DbInner`) recover an owned
+    /// `Arc<DbInner>` to hand to lazily-opened iterator parts ([`RunPartOpener`]).
+    self_weak: std::sync::OnceLock<std::sync::Weak<DbInner>>,
     /// Sequence numbers of currently-open snapshots. Compaction retains the versions
     /// they need.
     snapshots: Mutex<Vec<SeqNum>>,
@@ -602,6 +610,46 @@ pub struct DbInner {
     target_file_size: u64,
 }
 
+/// Lazily opens the point iterator for one file of an ordered run (a level or L0 sublevel) when
+/// a [`merging_iter::ConcatIter`] first positions into it, so a bounded scan reads only the
+/// files it visits. Holds an owned `Arc<DbInner>` to keep the engine (and its reader cache)
+/// alive for the iterator's lifetime, the run's files (index-aligned with the iterator's
+/// bounds), and the block-property filters to apply. A file excluded by a filter yields an empty
+/// iterator, which the `ConcatIter` skips like an exhausted part.
+struct RunPartOpener {
+    db: Arc<DbInner>,
+    files: Vec<Arc<crate::manifest::FileMetadata>>,
+    filters: Vec<Arc<dyn crate::sstable::blockprop::BlockPropertyFilter>>,
+}
+
+impl merging_iter::PartOpener for RunPartOpener {
+    fn len(&self) -> usize {
+        self.files.len()
+    }
+    fn open(&self, idx: usize) -> Result<Box<dyn InternalIter>> {
+        let f = &self.files[idx];
+        let reader = self.db.open_reader(f.physical_num())?;
+        let point_excluded = self
+            .filters
+            .iter()
+            .any(|filter| !reader.may_match_block_property(filter.as_ref()));
+        if point_excluded {
+            return Ok(Box::new(merging_iter::EmptyIter));
+        }
+        let inner: Box<dyn InternalIter> = Box::new(reader.iter_with_filters(&self.filters)?);
+        if f.backing.is_some() {
+            Ok(Box::new(merging_iter::BoundedIter::new(
+                inner,
+                f.smallest.clone(),
+                f.largest.clone(),
+                self.db.cmp.clone(),
+            )))
+        } else {
+            Ok(inner)
+        }
+    }
+}
+
 impl DbInner {
     /// Logs an informational message if a [`Logger`] is configured.
     fn log(&self, msg: &str) {
@@ -625,6 +673,22 @@ impl DbInner {
             .items
             .push((path.to_path_buf(), size));
         self.delete_cv.notify_one();
+    }
+
+    /// Records whether a freshly written sstable carries range tombstones / range keys, so a
+    /// later scan can skip *opening* it during the eager span-collection pass when it has none.
+    fn record_span_hint(&self, file_num: u64, has_spans: bool) {
+        self.span_hint.lock().unwrap().insert(file_num, has_spans);
+    }
+
+    /// An owned handle to this `DbInner` via the weak self-reference set in [`Db::open`]. Used
+    /// to hand lazily-opened iterator parts ([`RunPartOpener`]) something that keeps the engine
+    /// alive for the lifetime of the iterator.
+    fn arc_self(&self) -> Arc<DbInner> {
+        self.self_weak
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("self_weak set in Db::open and engine alive")
     }
 
     /// Records files removed from the live version as obsolete (pending deletion), holding a
@@ -690,6 +754,13 @@ impl DbInner {
         if let Some(l) = &self.listener {
             for file_num in &ready {
                 l.on_table_deleted(*file_num);
+            }
+        }
+        // Drop span hints for the removed logical files so the map stays bounded.
+        if !ready.is_empty() {
+            let mut hints = self.span_hint.lock().unwrap();
+            for file_num in &ready {
+                hints.remove(file_num);
             }
         }
         // Delete physical sstables no live or in-flight file still references (a backing file
@@ -811,6 +882,9 @@ impl Db {
     /// Opens the database in `dir`, creating it if `opts.create_if_missing` and absent.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let inner = Arc::new(DbInner::open_inner(dir, opts)?);
+        // Record a weak self-handle so iterator paths reached via `Deref` can recover an owned
+        // `Arc<DbInner>` for lazily-opened sstable readers.
+        let _ = inner.self_weak.set(Arc::downgrade(&inner));
         // Spawn the background flush/compaction worker pool for writable databases. Multiple
         // workers pick disjoint compaction inputs, so compactions run concurrently.
         let read_only = inner.state.lock().unwrap().read_only;
@@ -1045,6 +1119,9 @@ impl DbInner {
                 work_cv: Condvar::new(),
                 drained_cv: Condvar::new(),
                 cache: Mutex::new(HashMap::new()),
+                // Read-only never flushes recovered data to files, so there is nothing to hint.
+                span_hint: Mutex::new(HashMap::new()),
+                self_weak: std::sync::OnceLock::new(),
                 snapshots: Mutex::new(Vec::new()),
                 efos: Mutex::new(Vec::new()),
                 latencies: OpLatencies::default(),
@@ -1106,6 +1183,7 @@ impl DbInner {
         // memtable, oldest first, becomes one L0 file). Otherwise advancing `log_number` to
         // this session's WAL would strand that data: the older WALs holding it become obsolete
         // and are skipped on the next open. `mem` stays the fresh, empty active memtable.
+        let mut recovered_span_hint: HashMap<u64, bool> = HashMap::new();
         for (rmem, _wal) in &recovered {
             if rmem.is_empty() {
                 continue;
@@ -1122,6 +1200,12 @@ impl DbInner {
                 opts.value_block_threshold,
                 opts.blob_value_threshold,
             )?;
+            // A memtable with spans is written as a single file (point-only memtables split);
+            // record whether each output carries range tombstones / range keys.
+            let has_spans = !rmem.range_tombstones().is_empty() || !rmem.range_keys().is_empty();
+            for m in &metas {
+                recovered_span_hint.insert(m.file_num, has_spans);
+            }
             let edit = VersionEdit {
                 next_file_number: Some(vs.next_file_number),
                 last_sequence: Some(vs.last_sequence),
@@ -1198,6 +1282,8 @@ impl DbInner {
             work_cv: Condvar::new(),
             drained_cv: Condvar::new(),
             cache: Mutex::new(HashMap::new()),
+            span_hint: Mutex::new(recovered_span_hint),
+            self_weak: std::sync::OnceLock::new(),
             snapshots: Mutex::new(Vec::new()),
             efos: Mutex::new(Vec::new()),
             latencies: OpLatencies::default(),
@@ -1897,6 +1983,12 @@ impl DbInner {
         let flushed_bytes: u64 = metas.iter().map(|m| m.size).sum();
         let first_file_num = metas.first().map(|m| m.file_num).unwrap_or(file_nums[0]);
         let created: Vec<u64> = metas.iter().map(|m| m.file_num).collect();
+        // A memtable with spans is written as a single file (point-only memtables split), so the
+        // span-bearing output is the only one that can carry them; record the hint per output.
+        let mem_has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
+        for m in &metas {
+            self.record_span_hint(m.file_num, mem_has_spans);
+        }
 
         let mut state = self.state.lock().unwrap();
         // The new oldest un-flushed WAL once this immutable is removed.
@@ -2234,93 +2326,85 @@ impl DbInner {
         // Each LSM level contributes one merge source per *ordered run* rather than one per
         // file, so the merging iterator (whose per-step cost is linear in its source count)
         // stays cheap as files accumulate. L1+ files are already one non-overlapping run; L0
-        // files overlap, so they are grouped into sublevels (each a run).
+        // files overlap, so they are grouped into sublevels (each a run). The run's point
+        // iterators are opened lazily by a [`RunPartOpener`]: only the files a seek lands in are
+        // read, while range tombstones / range keys (which can shadow keys elsewhere) are
+        // collected eagerly here — skipping files the span hint marks span-free.
+        let me = self.arc_self();
         for (lvl, level) in version.levels.iter().enumerate() {
             if level.is_empty() {
                 continue;
             }
-            if lvl == 0 {
-                for sub in l0_sublevels(level, self.cmp.as_ref()) {
-                    let (parts, bounds) =
-                        self.build_run_iters(&sub, opts, &mut tombstones, &mut range_keys)?;
-                    if !parts.is_empty() {
-                        sources.push(Box::new(merging_iter::ConcatIter::new(
-                            parts,
-                            bounds,
-                            self.cmp.clone(),
-                        )));
-                    }
-                }
+            let runs: Vec<Vec<Arc<FileMetadata>>> = if lvl == 0 {
+                l0_sublevels(level, self.cmp.as_ref())
             } else {
-                let (parts, bounds) =
-                    self.build_run_iters(level, opts, &mut tombstones, &mut range_keys)?;
-                if !parts.is_empty() {
-                    sources.push(Box::new(merging_iter::ConcatIter::new(
-                        parts,
-                        bounds,
-                        self.cmp.clone(),
-                    )));
+                vec![level.clone()]
+            };
+            for run in runs {
+                let bounds = self.collect_run_spans(&run, &mut tombstones, &mut range_keys)?;
+                if bounds.is_empty() {
+                    continue;
                 }
+                let opener: std::rc::Rc<dyn merging_iter::PartOpener> =
+                    std::rc::Rc::new(RunPartOpener {
+                        db: Arc::clone(&me),
+                        files: run,
+                        filters: opts.block_property_filters.clone(),
+                    });
+                sources.push(Box::new(merging_iter::ConcatIter::new(
+                    opener,
+                    bounds,
+                    self.cmp.clone(),
+                )));
             }
         }
         Ok((sources, tombstones, range_keys))
     }
 
-    /// Opens the point iterators for one ordered run of files (a level or L0 sublevel),
-    /// collecting their range tombstones and range keys into `tombstones` / `range_keys` along
-    /// the way. Returns the per-file point iterators and their `[smallest, largest]` bounds, in
-    /// the input order (ascending, non-overlapping) — ready to wrap in a [`ConcatIter`]. A file
-    /// excluded by a block-property filter contributes no point iterator but its spans are still
-    /// collected (they can shadow keys elsewhere).
-    fn build_run_iters(
+    /// Eager span pass for one ordered run (a level or L0 sublevel): collects every file's range
+    /// tombstones and range keys into `tombstones` / `range_keys`, and returns each file's
+    /// `[smallest, largest]` bound in input order (index-aligned with the run's
+    /// [`RunPartOpener`]). A file whose span hint is `Some(false)` is known to carry no spans and
+    /// is **not** opened here — its point data is opened lazily on seek. Files with an unknown or
+    /// `Some(true)` hint are opened so their spans can be collected, and the hint is refreshed
+    /// from what the reader actually holds. Range tombstones are collected unclipped (matching
+    /// the prior behavior); for a virtual table only range keys whose start falls in its bounds
+    /// are surfaced.
+    fn collect_run_spans(
         &self,
         files: &[Arc<FileMetadata>],
-        opts: &IterOptions,
         tombstones: &mut Vec<RangeTombstone>,
         range_keys: &mut Vec<RangeKeyEntry>,
-    ) -> Result<RunIters> {
-        let mut parts: Vec<Box<dyn InternalIter>> = Vec::new();
-        let mut bounds: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut bounds: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(files.len());
         for f in files {
-            // A virtual sstable reads from its physical backing file, bounded to its range.
-            let reader = self.open_reader(f.physical_num())?;
-            tombstones.extend_from_slice(reader.range_tombstones());
-            if f.backing.is_some() {
-                let lo = encoded_user_key(&f.smallest);
-                let hi = encoded_user_key(&f.largest);
-                for rk in reader.range_keys() {
-                    if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
-                        && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
-                    {
-                        range_keys.push(rk.clone());
+            let known_span_free =
+                self.span_hint.lock().unwrap().get(&f.file_num).copied() == Some(false);
+            if !known_span_free {
+                // A virtual sstable reads from its physical backing file, bounded to its range.
+                let reader = self.open_reader(f.physical_num())?;
+                let has_spans =
+                    !reader.range_tombstones().is_empty() || !reader.range_keys().is_empty();
+                tombstones.extend_from_slice(reader.range_tombstones());
+                if f.backing.is_some() {
+                    let lo = encoded_user_key(&f.smallest);
+                    let hi = encoded_user_key(&f.largest);
+                    for rk in reader.range_keys() {
+                        if self.cmp.compare(&rk.start, lo) != std::cmp::Ordering::Less
+                            && self.cmp.compare(&rk.start, hi) != std::cmp::Ordering::Greater
+                        {
+                            range_keys.push(rk.clone());
+                        }
                     }
+                } else {
+                    range_keys.extend_from_slice(reader.range_keys());
                 }
-            } else {
-                range_keys.extend_from_slice(reader.range_keys());
+                // Learn/refresh the hint now that the reader's spans are known precisely.
+                self.record_span_hint(f.file_num, has_spans);
             }
-            let point_excluded = opts
-                .block_property_filters
-                .iter()
-                .any(|filter| !reader.may_match_block_property(filter.as_ref()));
-            if point_excluded {
-                continue;
-            }
-            let inner: Box<dyn InternalIter> =
-                Box::new(reader.iter_with_filters(&opts.block_property_filters)?);
-            let it: Box<dyn InternalIter> = if f.backing.is_some() {
-                Box::new(merging_iter::BoundedIter::new(
-                    inner,
-                    f.smallest.clone(),
-                    f.largest.clone(),
-                    self.cmp.clone(),
-                ))
-            } else {
-                inner
-            };
-            parts.push(it);
             bounds.push((f.smallest.clone(), f.largest.clone()));
         }
-        Ok((parts, bounds))
+        Ok(bounds)
     }
 
     /// Returns a lazy iterator over the database **as if `batch` were already applied** on top
