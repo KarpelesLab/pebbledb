@@ -202,9 +202,17 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     metaindex reader handle both. Verified by a checked-in real Pebble v7 fixture
     (`pebble_v2_v7_inline.sst`, written at `FormatValueSeparation` with values inline). A v6/v7
     table whose values are *separated* additionally needs the items below.
-  - [ ] The in-sstable `blob-reference-index` block + per-row blob handles (so a v6/v7 table with
-    *separated* values resolves them against the native blob files), `NewFile5` blob-reference
-    MANIFEST encoding, and the value-separation write path.
+  - [x] **Separated-value resolution (sstable level).** A v6/v7 columnar table whose values are
+    separated into a native blob file now reads them: the value column holds a value-prefix byte
+    (kind bits select value-block vs blob handle) followed by an inline blob handle
+    (`reference_id, value_len, block_id, value_id`); `ColumnarReader::resolve_value` decodes it,
+    maps `reference_id` through an attached blob-reference list to a blob file number, and fetches
+    the value through a `pebble_blob::NativeBlobResolver`. Verified by checked-in real Pebble v7
+    fixtures (`pebble_v2_v7_separated.{sst,blob}`): all five separated values resolve.
+  - [ ] Engine glue for full DB open: `NewFile5` blob-reference + `tagNewBlobFile` MANIFEST decode
+    (reference_id → FileID → physical blob file number), raising the read format ceiling to open a
+    format-24 database, and attaching the native-blob resolver from the MANIFEST at table open.
+  - [ ] The value-separation **write** path (emit v6/v7 + separate values into native blob files).
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the

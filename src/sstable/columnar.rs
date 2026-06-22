@@ -37,6 +37,7 @@ use crate::{Error, Result};
 use super::block::{BlockHandle, BlockIter, ChecksumType, CompressionType, read_block};
 use super::colblk;
 use super::keyschema::{DefaultKeySchema, KeySchema};
+use super::pebble_blob;
 use super::properties::{
     META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME, META_VALUE_INDEX_NAME,
     Properties,
@@ -362,6 +363,12 @@ pub struct ColumnarReader {
     /// used to resolve out-of-line (is-value-external) columnar values. Empty if the table
     /// has no value blocks.
     value_block_handles: Vec<BlockHandle>,
+    /// Maps an inline blob handle's `reference_id` to a native blob file number (recorded in the
+    /// MANIFEST). Empty unless the engine attaches separated-value resolution.
+    blob_references: Vec<u64>,
+    /// Resolves values stored in native blob files (Pebble `FormatValueSeparation`). When absent,
+    /// a separated value cannot be read.
+    blob_resolver: Option<Arc<dyn pebble_blob::NativeBlobResolver>>,
     /// Index entries: each data block's last user key and its handle.
     index: Vec<(Vec<u8>, BlockHandle)>,
 }
@@ -438,14 +445,30 @@ impl ColumnarReader {
             metaindex: footer.metaindex,
             meta_columnar,
             value_block_handles,
+            blob_references: Vec::new(),
+            blob_resolver: None,
             index,
         })
     }
 
-    /// Resolves a columnar value column entry. When `is_external` is false the entry is the
-    /// inline value, returned as-is. When true it is an out-of-line reference — a value-prefix
-    /// byte followed by an encoded value-block handle — resolved against the table's value
-    /// blocks (read + decompressed via the standard block framing).
+    /// Attaches separated-value resolution: `blob_references` maps an inline blob handle's
+    /// `reference_id` to a native blob file number (from the MANIFEST), and `resolver` fetches
+    /// values from those files. Required to read a `FormatValueSeparation` table whose values are
+    /// stored in native blob files. Call before [`iter_all`](Self::iter_all) / [`get`](Self::get).
+    pub fn attach_blob_resolver(
+        &mut self,
+        blob_references: Vec<u64>,
+        resolver: Arc<dyn pebble_blob::NativeBlobResolver>,
+    ) {
+        self.blob_references = blob_references;
+        self.blob_resolver = Some(resolver);
+    }
+
+    /// Resolves a columnar value column entry. When `is_external` is false the entry is the inline
+    /// value, returned as-is. When true it is an out-of-line reference: a value-prefix byte whose
+    /// kind bits select either an in-sstable value-block handle (resolved against this table's
+    /// value blocks) or an inline blob handle (resolved against a native blob file via the attached
+    /// blob resolver).
     fn resolve_value(&self, raw: &[u8], is_external: bool) -> Result<Vec<u8>> {
         if !is_external {
             return Ok(raw.to_vec());
@@ -455,19 +478,39 @@ impl ColumnarReader {
                 "columnar: empty external value reference",
             ));
         }
-        // raw[0] is the value-prefix byte; the handle follows.
-        let h = valblk::decode_handle(&raw[1..])?;
-        let block_handle = *self
-            .value_block_handles
-            .get(h.block_num as usize)
-            .ok_or_else(|| Error::corruption("columnar: value block number out of range"))?;
-        let block = read_block(&self.file, block_handle, self.checksum)?;
-        let start = h.offset_in_block as usize;
-        let end = start + h.value_len as usize;
-        if end > block.len() {
-            return Err(Error::corruption("columnar: value handle out of range"));
+        let kind = raw[0] & pebble_blob::VALUE_KIND_MASK;
+        match kind {
+            pebble_blob::VALUE_KIND_BLOB_HANDLE => {
+                let h = pebble_blob::decode_inline_handle(&raw[1..])?;
+                let file_num = *self
+                    .blob_references
+                    .get(h.reference_id as usize)
+                    .ok_or_else(|| {
+                        Error::corruption("columnar: blob reference index out of range")
+                    })?;
+                let resolver = self.blob_resolver.as_ref().ok_or(Error::Unsupported(
+                    "columnar: separated value without a blob resolver",
+                ))?;
+                resolver.get(file_num, h.location())
+            }
+            _ => {
+                // In-sstable value-block handle (value-prefix byte then a value-block handle).
+                let h = valblk::decode_handle(&raw[1..])?;
+                let block_handle = *self
+                    .value_block_handles
+                    .get(h.block_num as usize)
+                    .ok_or_else(|| {
+                        Error::corruption("columnar: value block number out of range")
+                    })?;
+                let block = read_block(&self.file, block_handle, self.checksum)?;
+                let start = h.offset_in_block as usize;
+                let end = start + h.value_len as usize;
+                if end > block.len() {
+                    return Err(Error::corruption("columnar: value handle out of range"));
+                }
+                Ok(block[start..end].to_vec())
+            }
         }
-        Ok(block[start..end].to_vec())
     }
 
     /// Reads the metaindex and decodes the columnar keyspan blocks (range deletions and range

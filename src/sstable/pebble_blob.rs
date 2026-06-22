@@ -78,9 +78,20 @@ impl InlineHandle {
     }
 }
 
-/// The value-prefix byte that marks a columnar value column entry as an inline blob handle
-/// (Pebble's `block.ValuePrefix` blob bit). The handle's four varints follow it.
-pub const BLOB_VALUE_PREFIX: u8 = 0x40;
+/// Mask selecting the value-kind bits of a value-prefix byte (Pebble's `valueKindMask`).
+pub const VALUE_KIND_MASK: u8 = 0xC0;
+/// Value-prefix kind bits indicating an in-sstable value-block handle.
+pub const VALUE_KIND_VALUE_BLOCK_HANDLE: u8 = 0x80;
+/// Value-prefix kind bits indicating an inline blob handle (a reference into a native blob file).
+pub const VALUE_KIND_BLOB_HANDLE: u8 = 0x40;
+
+/// Resolves a value stored in a native blob file. `file_num` is the blob file's number (obtained
+/// by mapping an [`InlineHandle::reference_id`] through the sstable's blob references); the handle
+/// locates the value within that file.
+pub trait NativeBlobResolver: Send + Sync {
+    /// Fetches the value at `handle` from blob file `file_num`.
+    fn get(&self, file_num: u64, handle: Handle) -> Result<Vec<u8>>;
+}
 
 /// Decodes an inline blob handle: four uvarints `(reference_id, value_len, block_id, value_id)`.
 /// `src` must start at the first varint (i.e. after any value-prefix byte).

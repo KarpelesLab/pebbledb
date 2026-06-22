@@ -4664,3 +4664,47 @@ fn reads_pebble_v2_table_format_v7_inline_fixture() {
         assert_eq!(got.as_deref(), Some(format!("value{i}").as_bytes()), "{k}");
     }
 }
+
+/// Reads a real Pebble v2 table-format-v7 sstable whose values are *separated* into a native blob
+/// file, resolving them via the columnar reader's native-blob resolver. Fixtures: a v7 sstable
+/// (`pebble_v2_v7_separated.sst`) whose value column holds inline blob handles, and its blob file
+/// (`pebble_v2_v7_separated.blob`). All five values (key00000..key00004 => "V<i>-"*20) are stored
+/// out-of-line and must resolve through the handle → reference → blob-file chain.
+#[test]
+fn reads_pebble_v2_separated_v7_sstable_with_native_blob() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::sstable::columnar::ColumnarReader;
+    use pebbledb::sstable::pebble_blob::{Handle, NativeBlobResolver, PebbleBlobReader};
+    use std::sync::Arc;
+
+    // A resolver backed by the single blob file. The reference list maps reference_id 0 -> this
+    // file's number; the resolver fetches by (block_id, value_id).
+    struct OneFileResolver {
+        file_num: u64,
+        reader: PebbleBlobReader,
+    }
+    impl NativeBlobResolver for OneFileResolver {
+        fn get(&self, file_num: u64, handle: Handle) -> pebbledb::Result<Vec<u8>> {
+            assert_eq!(file_num, self.file_num);
+            self.reader.get(handle)
+        }
+    }
+
+    let blob_bytes = include_bytes!("fixtures/pebble_v2_v7_separated.blob").to_vec();
+    let resolver = Arc::new(OneFileResolver {
+        file_num: 6,
+        reader: PebbleBlobReader::open(blob_bytes).expect("open blob"),
+    });
+
+    let sst = include_bytes!("fixtures/pebble_v2_v7_separated.sst").to_vec();
+    let mut cr = ColumnarReader::open(sst, Arc::new(DefaultComparer)).expect("open sst");
+    // reference_id 0 -> blob file number 6.
+    cr.attach_blob_resolver(vec![6], resolver);
+
+    let all = cr.iter_all().expect("iter_all");
+    assert_eq!(all.len(), 5);
+    for (i, (_ik, v)) in all.iter().enumerate() {
+        let want = format!("V{i}-").repeat(20);
+        assert_eq!(v.as_slice(), want.as_bytes(), "separated value {i}");
+    }
+}
