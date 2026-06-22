@@ -92,9 +92,8 @@ impl TableFormat {
         matches!(self, TableFormat::Pebble(v) if v >= 3)
     }
 
-    /// Whether the table uses the columnar block format (Pebble format v5+), which this
-    /// reader does not yet support.
-    fn is_columnar(self) -> bool {
+    /// Whether the table uses the columnar block format (Pebble format v5+).
+    pub fn is_columnar(self) -> bool {
         matches!(self, TableFormat::Pebble(v) if v >= 5)
     }
 }

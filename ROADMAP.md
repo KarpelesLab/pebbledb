@@ -161,10 +161,19 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     fixes made Pebble accept the output — emitting the schema name under the `pebble.colblk.schema`
     property tag Pebble reads, and writing the index block's fourth (block-properties) column its
     reader requires. Verified by a `columnar_sst_gen` example + a `verify-columnar-sst` interop
-    command/CI step (Go reads the points and the keyspans). Remaining: wiring the columnar writer
-    into the **engine's** flush/compaction so whole databases are written columnar (the writer
-    byte-parity it builds on is now in place); out-of-line value-block *writing* is also optional
-    (Pebble does not require value separation).
+    command/CI step (Go reads the points and the keyspans).
+  - [x] **Engine columnar flush.** At a columnar format major version
+    (`FormatMajorVersion::COLUMNAR_BLOCKS`, 19) the engine flushes each memtable to a columnar
+    sstable (points, range deletions, and range keys; values inline — value-block / blob
+    separation is an optional space optimization Pebble does not require for correctness). Lower
+    formats still flush row sstables, matching Pebble's format-gated behavior. Verified by an
+    end-to-end test (flushed file is columnar; reads round-trip with the range deletion applied)
+    and a Rust→Go interop step where the engine writes a columnar database that Pebble v2 opens
+    and reads.
+  - [ ] **Columnar compaction output.** Compaction still writes row sstables, so a columnar
+    database becomes mixed-format after compaction (valid — both formats read fine in either
+    engine). Emitting columnar from compaction (and optional value-block separation) is the last
+    columnar step.
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
   `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
   encoding. (No longer blocked — v2 is tagged.)

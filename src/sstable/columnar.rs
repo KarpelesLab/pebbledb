@@ -213,9 +213,7 @@ impl ColumnarWriter {
     /// are sorted in increasing internal-key order, grouping consecutive entries sharing a
     /// `[start, end)` fragment into one span (each becomes a keyspan key). Returns the encoded
     /// block, or `None` if there are no entries.
-    fn build_keyspan_block(
-        entries: &[KeyspanWriteEntry],
-    ) -> Option<Vec<u8>> {
+    fn build_keyspan_block(entries: &[KeyspanWriteEntry]) -> Option<Vec<u8>> {
         if entries.is_empty() {
             return None;
         }

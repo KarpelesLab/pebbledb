@@ -4506,3 +4506,62 @@ fn reads_pebble_v2_columnar_value_block_fixture() {
         "older (out-of-line value-block) value resolved"
     );
 }
+
+/// At a columnar format major version the engine flushes to columnar sstables. This verifies the
+/// flushed file is genuinely columnar, that point keys + a range deletion round-trip through a
+/// reopen, and that the engine reads its own columnar output back correctly.
+#[test]
+fn engine_flushes_columnar_sstables_at_columnar_format() {
+    use pebbledb::FormatMajorVersion;
+    use pebbledb::sstable::Reader;
+
+    let dir = temp_dir("columnar-flush");
+    let opts = Options {
+        format_major_version: FormatMajorVersion::COLUMNAR_BLOCKS,
+        ..Default::default()
+    };
+
+    {
+        let db = Db::open(&dir, opts.clone()).unwrap();
+        for i in 0..50u32 {
+            db.set(
+                format!("key{i:04}").as_bytes(),
+                format!("value{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        // A range deletion exercises the columnar keyspan write path.
+        db.delete_range(b"key0010", b"key0020").unwrap();
+        db.flush().unwrap();
+    }
+
+    // The flushed sstable(s) must be in the columnar block format.
+    let mut found_columnar = false;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sst") {
+            let bytes = std::fs::read(&path).unwrap();
+            let r = Reader::open(bytes, Arc::new(pebbledb::DefaultComparer)).unwrap();
+            assert!(
+                r.format().is_columnar(),
+                "flushed sstable should be columnar"
+            );
+            found_columnar = true;
+        }
+    }
+    assert!(found_columnar, "expected at least one flushed sstable");
+
+    // Reopen and verify the engine reads its own columnar output, with the range deletion applied.
+    {
+        let db = Db::open(&dir, opts).unwrap();
+        for i in 0..50u32 {
+            let k = format!("key{i:04}");
+            let got = db.get(k.as_bytes()).unwrap();
+            if (10..20).contains(&i) {
+                assert_eq!(got, None, "{k} should be removed by the range deletion");
+            } else {
+                assert_eq!(got.as_deref(), Some(format!("value{i}").as_bytes()));
+            }
+        }
+    }
+}

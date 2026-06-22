@@ -16,11 +16,21 @@
 use pebbledb::{Db, FormatMajorVersion, Options};
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: interop_gen <dir>");
-    let opts = Options {
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: interop_gen <dir> [columnar]");
+    // An optional second argument "columnar" opens the database at the columnar format major
+    // version, so the engine flushes columnar sstables that Pebble v2 then reads back.
+    let columnar = std::env::args().nth(2).as_deref() == Some("columnar");
+    let format_major_version = if columnar {
+        FormatMajorVersion::COLUMNAR_BLOCKS
+    } else {
         // Pebble v2 dropped the oldest formats; FLUSHABLE_INGEST (13) is its minimum and is
         // still the classic row sstable layout, which Pebble v2 reads back.
-        format_major_version: FormatMajorVersion::FLUSHABLE_INGEST,
+        FormatMajorVersion::FLUSHABLE_INGEST
+    };
+    let opts = Options {
+        format_major_version,
         ..Default::default()
     };
     let db = Db::open(&dir, opts).expect("open db");

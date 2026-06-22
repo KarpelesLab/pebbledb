@@ -2042,19 +2042,30 @@ impl DbInner {
             l.on_flush_begin();
         }
 
-        // Write the sstable(s) without holding the state lock, splitting large point-only
-        // memtables at the target file size.
-        let metas = write_memtable_to_sstables(
-            self.fs.as_ref(),
-            &self.dir,
-            &self.cmp,
-            &file_nums,
-            &mem,
-            &self.block_property_collectors,
-            self.target_file_size,
-            self.value_block_threshold,
-            self.blob_value_threshold,
-        )?;
+        // Write the sstable(s) without holding the state lock. At a columnar format major version
+        // the memtable is flushed to a single columnar sstable; otherwise to row sstable(s),
+        // splitting large point-only memtables at the target file size.
+        let metas = if self.format_major_version() >= FormatMajorVersion::COLUMNAR_BLOCKS {
+            write_memtable_to_columnar_sstable(
+                self.fs.as_ref(),
+                &self.dir,
+                &self.cmp,
+                file_nums[0],
+                &mem,
+            )?
+        } else {
+            write_memtable_to_sstables(
+                self.fs.as_ref(),
+                &self.dir,
+                &self.cmp,
+                &file_nums,
+                &mem,
+                &self.block_property_collectors,
+                self.target_file_size,
+                self.value_block_threshold,
+                self.blob_value_threshold,
+            )?
+        };
         // Move freshly-flushed tables to shared storage when create_on_shared is enabled.
         for m in &metas {
             self.upload_if_shared(m.file_num)?;
@@ -3725,6 +3736,126 @@ fn write_memtable_to_sstables(
         has_spans: Some(has_spans),
     });
     Ok(outputs)
+}
+
+/// Flushes a memtable to a single **columnar** sstable, used when the database's format major
+/// version selects the columnar block layout (Pebble's `FormatColumnarBlocks`). Values are stored
+/// inline (no value-block / blob separation — a valid, if less compact, columnar table) and the
+/// whole memtable goes to one file (no target-size splitting); both are correctness-preserving
+/// simplifications of the row path. Point keys, range deletions, and range keys are all written.
+fn write_memtable_to_columnar_sstable(
+    fs: &dyn Fs,
+    dir: &Path,
+    cmp: &Arc<dyn Comparer>,
+    file_num: u64,
+    mem: &Arc<MemTable>,
+) -> Result<Vec<FileMetadata>> {
+    use crate::sstable::TableFormat;
+    use crate::sstable::columnar::ColumnarWriter;
+    use std::io::Write;
+
+    let has_spans = !mem.range_tombstones().is_empty() || !mem.range_keys().is_empty();
+    let mut w = ColumnarWriter::new(
+        cmp.clone(),
+        WriterOptions {
+            table_format: TableFormat::Pebble(5),
+            ..Default::default()
+        },
+    );
+
+    let mut smallest: Option<Vec<u8>> = None;
+    let mut largest: Vec<u8> = Vec::new();
+    let mut smallest_seq = u64::MAX;
+    let mut largest_seq = 0u64;
+
+    let mut it = mem.iter();
+    it.first();
+    let mut key_buf = Vec::new();
+    while it.valid() {
+        key_buf.clear();
+        key_buf.extend_from_slice(it.user_key());
+        key_buf.extend_from_slice(&it.trailer().to_le_bytes());
+        w.add(&key_buf, it.value())?;
+        if smallest.is_none() {
+            smallest = Some(key_buf.clone());
+        }
+        largest.clear();
+        largest.extend_from_slice(&key_buf);
+        let seq = it.trailer() >> 8;
+        smallest_seq = smallest_seq.min(seq);
+        largest_seq = largest_seq.max(seq);
+        it.next();
+    }
+
+    // Range tombstones, in start-key order; each extends the file's key range.
+    let mut tombstones = mem.range_tombstones();
+    tombstones.sort_by(|a, b| {
+        cmp.compare(&a.start, &b.start)
+            .then(b.seqnum.cmp(&a.seqnum))
+    });
+    for t in &tombstones {
+        let start_ikey =
+            InternalKey::new(t.start.clone(), t.seqnum, InternalKeyKind::RangeDelete).encode();
+        w.add(&start_ikey, &t.end)?;
+        if smallest.is_none()
+            || cmp.compare(&t.start, encoded_user_key(smallest.as_ref().unwrap()))
+                == std::cmp::Ordering::Less
+        {
+            smallest = Some(start_ikey.clone());
+        }
+        if largest.is_empty()
+            || cmp.compare(&t.end, encoded_user_key(&largest)) == std::cmp::Ordering::Greater
+        {
+            largest =
+                InternalKey::new(t.end.clone(), t.seqnum, InternalKeyKind::RangeDelete).encode();
+        }
+        smallest_seq = smallest_seq.min(t.seqnum);
+        largest_seq = largest_seq.max(t.seqnum);
+    }
+
+    // Range keys, in internal-key order.
+    let mut range_keys = mem.range_keys();
+    range_keys.sort_by(|a, b| {
+        cmp.compare(&a.start, &b.start)
+            .then(b.seqnum.cmp(&a.seqnum))
+            .then(b.kind.as_u8().cmp(&a.kind.as_u8()))
+    });
+    for rk in &range_keys {
+        let start_ikey = InternalKey::new(rk.start.clone(), rk.seqnum, rk.kind).encode();
+        w.add(&start_ikey, &rk.value)?;
+        if smallest.is_none()
+            || cmp.compare(&rk.start, encoded_user_key(smallest.as_ref().unwrap()))
+                == std::cmp::Ordering::Less
+        {
+            smallest = Some(start_ikey.clone());
+        }
+        if let Ok(end) = rk.end()
+            && (largest.is_empty()
+                || cmp.compare(&end, encoded_user_key(&largest)) == std::cmp::Ordering::Greater)
+        {
+            largest = InternalKey::new(end, rk.seqnum, rk.kind).encode();
+        }
+        smallest_seq = smallest_seq.min(rk.seqnum);
+        largest_seq = largest_seq.max(rk.seqnum);
+    }
+
+    let bytes = w.finish()?;
+    let path = dir.join(filenames::table(file_num));
+    let mut file = fs.create(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+
+    Ok(vec![FileMetadata {
+        file_num,
+        size: fs.size(&path)?,
+        smallest: smallest.unwrap_or_default(),
+        largest,
+        smallest_seqnum: smallest_seq.min(largest_seq),
+        largest_seqnum: largest_seq,
+        blob_refs: Vec::new(),
+        backing: None,
+        has_spans: Some(has_spans),
+    }])
 }
 
 /// Writes a new `manifest` marker pointing at `value`, with an `iter` one greater than
