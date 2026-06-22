@@ -1228,6 +1228,7 @@ impl OutputBuilder {
             smallest_seqnum: self.smallest_seq.min(self.largest_seq),
             largest_seqnum: self.largest_seq,
             blob_refs,
+            pebble_blob_refs: Vec::new(),
             backing: None,
             // Set by `run_compaction` once it knows whether the outputs carry spans.
             has_spans: None,

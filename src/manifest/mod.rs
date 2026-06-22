@@ -77,6 +77,11 @@ pub struct VersionSet {
     pub last_sequence: u64,
     /// The current version.
     pub current: Version,
+    /// Native blob files (Pebble `FormatValueSeparation`): blob file ID → physical `<num>.blob`
+    /// file number. Populated from `NewBlobFile` / `DeletedBlobFile` MANIFEST records; used to
+    /// resolve an sstable's blob references (an inline handle's `reference_id` → blob file ID →
+    /// this map → file number). Empty for databases that do not separate values into blob files.
+    pub blob_files: std::collections::HashMap<u64, u64>,
 }
 
 impl VersionSet {
@@ -90,6 +95,7 @@ impl VersionSet {
             next_file_number: 1,
             last_sequence: 0,
             current: Version::default(),
+            blob_files: std::collections::HashMap::new(),
         }
     }
 
@@ -112,6 +118,12 @@ impl VersionSet {
         }
         for nf in &edit.new_files {
             self.current.levels[nf.level].push(Arc::new(nf.meta.clone()));
+        }
+        for (file_id, file_num) in &edit.new_blob_files {
+            self.blob_files.insert(*file_id, *file_num);
+        }
+        for (file_id, _file_num) in &edit.deleted_blob_files {
+            self.blob_files.remove(file_id);
         }
         // Re-sort affected levels.
         let touched: std::collections::BTreeSet<usize> = edit
@@ -216,6 +228,7 @@ mod tests {
             smallest_seqnum: ss,
             largest_seqnum: ls,
             blob_refs: Vec::new(),
+            pebble_blob_refs: Vec::new(),
             backing: None,
             has_spans: None,
         }

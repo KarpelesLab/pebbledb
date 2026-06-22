@@ -38,8 +38,16 @@ impl FormatMajorVersion {
     /// columnar tables; it still writes the row format, which a columnar-format database may also
     /// contain.
     pub const COLUMNAR_BLOCKS: FormatMajorVersion = FormatMajorVersion(19);
-    /// The newest format this implementation understands (can open / read).
+    /// Pebble's `FormatValueSeparation` (value separation into native blob files; table format
+    /// v6/v7). This engine can **read** such databases — including resolving separated values from
+    /// native blob files — but does not yet write value separation.
+    pub const VALUE_SEPARATION: FormatMajorVersion = FormatMajorVersion(24);
+    /// The newest format this implementation can **write** / ratchet to.
     pub const NEWEST: FormatMajorVersion = FormatMajorVersion::COLUMNAR_BLOCKS;
+    /// The newest format this implementation can **open / read**. Higher than [`Self::NEWEST`] because
+    /// the engine reads upstream-Pebble databases up to `FormatValueSeparation` (it just does not
+    /// write the newer formats).
+    pub const MAX_READABLE: FormatMajorVersion = FormatMajorVersion::VALUE_SEPARATION;
 
     /// The default format for a freshly created database: the row layout, which is the most
     /// broadly compatible format current Pebble still reads and writes.
@@ -128,11 +136,11 @@ impl OptionsFile {
                 self.comparer_name, comparer_name
             )));
         }
-        if self.format_major_version > FormatMajorVersion::NEWEST {
+        if self.format_major_version > FormatMajorVersion::MAX_READABLE {
             return Err(Error::InvalidState(format!(
                 "options: format_major_version {} is newer than this implementation supports ({})",
                 self.format_major_version.as_u32(),
-                FormatMajorVersion::NEWEST.as_u32()
+                FormatMajorVersion::MAX_READABLE.as_u32()
             )));
         }
         Ok(())

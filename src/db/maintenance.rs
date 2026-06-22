@@ -345,6 +345,7 @@ impl DbInner {
             smallest_seqnum: seqnum,
             largest_seqnum: seqnum,
             blob_refs,
+            pebble_blob_refs: Vec::new(),
             backing: None,
             // Rewritten external table: leave the span hint unknown so it is opened (correct).
             has_spans: None,

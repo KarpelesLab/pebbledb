@@ -96,6 +96,12 @@ pub struct FileMetadata {
     /// serialized to the MANIFEST; repopulated at open by scanning the sstable's metaindex.
     /// Empty for tables that reference no blob files.
     pub blob_refs: Vec<u64>,
+    /// For a table written by upstream Pebble at `FormatValueSeparation`, the ordered list of
+    /// **blob file IDs** this sstable references (decoded from the `customTagBlobReferences`
+    /// custom tag on a `NewFile4`/`NewFile5` record). An inline blob handle's `reference_id`
+    /// indexes this list; each ID is mapped to a physical blob file number via the version's blob
+    /// file registry. Empty for tables pebbledb wrote (which do not separate values this way).
+    pub pebble_blob_refs: Vec<u64>,
     /// For a **virtual sstable**, the file number of the physical backing sstable it is a
     /// bounded view of (`<backing>.sst` on disk); the view is restricted to `[smallest,
     /// largest]`. `None` for an ordinary physical table (which is its own backing). Persisted
@@ -407,11 +413,12 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
         (0, 0)
     };
 
-    let (backing, has_spans, blob_refs) = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
-        decode_custom_tags(d)?
-    } else {
-        (None, None, Vec::new())
-    };
+    let (backing, has_spans, blob_refs, pebble_blob_refs) =
+        if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
+            decode_custom_tags(d)?
+        } else {
+            (None, None, Vec::new(), Vec::new())
+        };
 
     Ok(NewFileEntry {
         level,
@@ -425,6 +432,9 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             // From our private blob-refs tag if present; otherwise empty (the engine falls back
             // to scanning the sstable's metaindex at open, e.g. for upstream-Pebble records).
             blob_refs,
+            // Upstream Pebble's blob references (ordered blob file IDs), from the standard
+            // customTagBlobReferences tag; empty for pebbledb-written tables.
+            pebble_blob_refs,
             backing,
             has_spans,
         },
@@ -436,10 +446,14 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
 /// blob-file numbers (all pebbledb-private where applicable). Each tag's payload is parsed
 /// exactly so the stream stays aligned; payloads for features this engine does not model are
 /// discarded.
-fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>, Vec<u64>)> {
+#[allow(clippy::type_complexity)]
+fn decode_custom_tags(
+    d: &mut Decoder<'_>,
+) -> Result<(Option<u64>, Option<bool>, Vec<u64>, Vec<u64>)> {
     let mut backing = None;
     let mut has_spans = None;
     let mut blob_refs = Vec::new();
+    let mut pebble_blob_refs = Vec::new();
     loop {
         let custom = d.uvarint()?;
         match custom {
@@ -474,14 +488,18 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>,
                 let _field = d.bytes()?;
             }
             CUSTOM_TAG_BLOB_REFERENCES | CUSTOM_TAG_BLOB_REFERENCES2 => {
+                // Pebble's standard blob-reference tag: depth, count, then per-reference
+                // (blob_file_id, value_size) [+ backing_value_size for the v2 tag]. We keep the
+                // ordered blob file IDs so an inline handle's reference_id can be resolved.
                 let _depth = d.uvarint()?;
                 let n = d.uvarint()?;
                 for _ in 0..n {
-                    let _file_id = d.uvarint()?;
+                    let file_id = d.uvarint()?;
                     let _value_size = d.uvarint()?;
                     if custom == CUSTOM_TAG_BLOB_REFERENCES2 {
                         let _backing_value_size = d.uvarint()?;
                     }
+                    pebble_blob_refs.push(file_id);
                 }
             }
             CUSTOM_TAG_PATH_ID => {
@@ -500,7 +518,7 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>,
             }
         }
     }
-    Ok((backing, has_spans, blob_refs))
+    Ok((backing, has_spans, blob_refs, pebble_blob_refs))
 }
 
 #[cfg(test)]
@@ -518,6 +536,7 @@ mod tests {
             smallest_seqnum: ss,
             largest_seqnum: ls,
             blob_refs: Vec::new(),
+            pebble_blob_refs: Vec::new(),
             backing: None,
             has_spans: None,
         }

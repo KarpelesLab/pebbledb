@@ -455,6 +455,38 @@ impl crate::sstable::BlobResolver for BlobStore {
     }
 }
 
+/// Opens and caches Pebble **native** blob files (`<num>.blob` in `FormatValueSeparation`),
+/// resolving separated columnar values. Distinct from [`BlobStore`], which serves pebbledb's own
+/// sibling-file blobs.
+struct NativeBlobStore {
+    fs: Arc<dyn Fs>,
+    dir: PathBuf,
+    remote: Option<Arc<dyn crate::objstorage::RemoteStorage>>,
+    cache: Mutex<HashMap<u64, Arc<crate::sstable::pebble_blob::PebbleBlobReader>>>,
+}
+
+impl NativeBlobStore {
+    fn reader(&self, file_num: u64) -> Result<Arc<crate::sstable::pebble_blob::PebbleBlobReader>> {
+        if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
+            return Ok(Arc::clone(r));
+        }
+        let name = filenames::blob(file_num);
+        let bytes = match &self.remote {
+            Some(remote) if remote.exists(&name) => remote.get(&name)?,
+            _ => self.fs.read(&self.dir.join(&name))?,
+        };
+        let r = Arc::new(crate::sstable::pebble_blob::PebbleBlobReader::open(bytes)?);
+        self.cache.lock().unwrap().insert(file_num, Arc::clone(&r));
+        Ok(r)
+    }
+}
+
+impl crate::sstable::pebble_blob::NativeBlobResolver for NativeBlobStore {
+    fn get(&self, file_num: u64, handle: crate::sstable::pebble_blob::Handle) -> Result<Vec<u8>> {
+        self.reader(file_num)?.get(handle)
+    }
+}
+
 /// A lock-free accumulator for one operation's latency: call count, summed nanoseconds, and
 /// the maximum seen. Recorded off any lock so it never adds contention.
 #[derive(Default)]
@@ -615,6 +647,14 @@ pub struct DbInner {
     blob_value_threshold: Option<usize>,
     /// Opens and caches blob files, resolving blob-referenced values for sstable readers.
     blob_store: Arc<BlobStore>,
+    /// Opens and caches Pebble native blob files (`FormatValueSeparation`).
+    native_blob_store: Arc<NativeBlobStore>,
+    /// For sstables written by upstream Pebble with separated values: maps the sstable's file
+    /// number to its resolved native blob file numbers (one per blob reference, in reference-id
+    /// order). Precomputed at open from the MANIFEST's blob-file registry + each file's blob
+    /// references; empty for databases pebbledb wrote (which store values inline or in sibling
+    /// blob files). Read lock-free by `open_reader`, so it never contends with the state lock.
+    native_blob_refs: HashMap<u64, Vec<u64>>,
     /// Per-level output-sstable size targets; falls back to `target_file_size` past its end.
     level_target_file_sizes: Vec<u64>,
     /// Bytes/second deletion-pacing rate; `0` deletes inline (no pacer thread).
@@ -1138,6 +1178,13 @@ impl DbInner {
                 remote: opts.remote_storage.clone(),
                 cache: Mutex::new(HashMap::new()),
             });
+            let native_blob_store = Arc::new(NativeBlobStore {
+                fs: Arc::clone(&fs),
+                dir: dir.clone(),
+                remote: opts.remote_storage.clone(),
+                cache: Mutex::new(HashMap::new()),
+            });
+            let native_blob_refs = native_blob_refs_from_version(&state.vs);
             // Seed the span hint from the loaded files so a first scan can skip span-free ones.
             let span_seed = span_hints_from_version(&state.vs.current);
             return Ok(DbInner {
@@ -1145,6 +1192,8 @@ impl DbInner {
                 cmp,
                 wal_dirs,
                 blob_store,
+                native_blob_store,
+                native_blob_refs,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
                 wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
@@ -1309,6 +1358,13 @@ impl DbInner {
             remote: opts.remote_storage.clone(),
             cache: Mutex::new(HashMap::new()),
         });
+        let native_blob_store = Arc::new(NativeBlobStore {
+            fs: Arc::clone(&fs),
+            dir: dir.clone(),
+            remote: opts.remote_storage.clone(),
+            cache: Mutex::new(HashMap::new()),
+        });
+        let native_blob_refs = native_blob_refs_from_version(&state.vs);
         // Seed the span hint from the loaded files (recovered files are already in the version
         // with their hint set); merge any recovery-flush hints for completeness.
         let mut span_seed = span_hints_from_version(&state.vs.current);
@@ -1318,6 +1374,8 @@ impl DbInner {
             cmp,
             wal_dirs,
             blob_store,
+            native_blob_store,
+            native_blob_refs,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
             wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
@@ -1570,6 +1628,7 @@ impl DbInner {
                                 smallest_seqnum: f.smallest_seqnum,
                                 largest_seqnum: f.largest_seqnum,
                                 blob_refs: f.blob_refs.clone(),
+                                pebble_blob_refs: f.pebble_blob_refs.clone(),
                                 backing: Some(phys),
                                 // A virtual view's spans depend on the backing clipped to its
                                 // bounds; leave unknown so it is opened (correct, unoptimized).
@@ -1600,6 +1659,7 @@ impl DbInner {
                                 smallest_seqnum: f.smallest_seqnum,
                                 largest_seqnum: f.largest_seqnum,
                                 blob_refs: f.blob_refs.clone(),
+                                pebble_blob_refs: f.pebble_blob_refs.clone(),
                                 backing: Some(phys),
                                 has_spans: None,
                             },
@@ -2630,11 +2690,27 @@ impl DbInner {
             return Ok(Arc::clone(r));
         }
         let bytes = self.read_object(&filenames::table(file_num))?;
+        // A table written by upstream Pebble with separated values resolves them against native
+        // blob files; pass its blob references + resolver so resolution happens during the
+        // columnar reader's up-front materialization.
+        let native_blob = self.native_blob_refs.get(&file_num).map(|refs| {
+            (
+                refs.clone(),
+                Arc::clone(&self.native_blob_store)
+                    as Arc<dyn crate::sstable::pebble_blob::NativeBlobResolver>,
+            )
+        });
         let reader = Arc::new(
-            Reader::open_with_cache(bytes, self.cmp.clone(), file_num, self.block_cache.clone())?
-                .with_blob_resolver(
-                    Arc::clone(&self.blob_store) as Arc<dyn crate::sstable::BlobResolver>
-                ),
+            Reader::open_with_cache(
+                bytes,
+                self.cmp.clone(),
+                file_num,
+                self.block_cache.clone(),
+                native_blob,
+            )?
+            .with_blob_resolver(
+                Arc::clone(&self.blob_store) as Arc<dyn crate::sstable::BlobResolver>
+            ),
         );
         let mut cache = self.cache.lock().unwrap();
         // Bound the number of open readers. Once at capacity, drop entries that are not
@@ -3499,6 +3575,31 @@ fn span_hints_from_version(version: &crate::manifest::Version) -> HashMap<u64, b
     hints
 }
 
+/// Builds the `sstable file_num -> resolved native blob file numbers` map from a loaded version:
+/// for each file that records upstream-Pebble blob references (`pebble_blob_refs`, ordered blob
+/// file IDs), each ID is mapped through the version's blob-file registry to a physical `<num>.blob`
+/// file number. Files with no such references (everything pebbledb writes) are omitted, so the map
+/// is empty unless the database was written by Pebble with separated values.
+fn native_blob_refs_from_version(vs: &crate::manifest::VersionSet) -> HashMap<u64, Vec<u64>> {
+    let mut out = HashMap::new();
+    for level in vs.current.levels.iter() {
+        for f in level {
+            if f.pebble_blob_refs.is_empty() {
+                continue;
+            }
+            let nums: Vec<u64> = f
+                .pebble_blob_refs
+                .iter()
+                .filter_map(|id| vs.blob_files.get(id).copied())
+                .collect();
+            if nums.len() == f.pebble_blob_refs.len() {
+                out.insert(f.file_num, nums);
+            }
+        }
+    }
+    out
+}
+
 /// Groups the L0 files into **sublevels** (Pebble's read-amplification structure for L0):
 /// L0 files can overlap, so they are greedily packed — newest first — into the fewest layers
 /// of mutually non-overlapping files. Within one sublevel a read touches at most one file. Each
@@ -3650,6 +3751,7 @@ fn write_memtable_to_sstables(
                 smallest_seqnum: smallest_seq.min(largest_seq),
                 largest_seqnum: largest_seq,
                 blob_refs,
+                pebble_blob_refs: Vec::new(),
                 backing: None,
                 // This split branch only runs for a point-only memtable, so no spans here.
                 has_spans: Some(false),
@@ -3731,6 +3833,7 @@ fn write_memtable_to_sstables(
         smallest_seqnum: smallest_seq.min(largest_seq),
         largest_seqnum: largest_seq,
         blob_refs,
+        pebble_blob_refs: Vec::new(),
         backing: None,
         // The final output carries the memtable's range tombstones / range keys (written above).
         has_spans: Some(has_spans),
@@ -3853,6 +3956,7 @@ fn write_memtable_to_columnar_sstable(
         smallest_seqnum: smallest_seq.min(largest_seq),
         largest_seqnum: largest_seq,
         blob_refs: Vec::new(),
+        pebble_blob_refs: Vec::new(),
         backing: None,
         has_spans: Some(has_spans),
     }])

@@ -342,23 +342,30 @@ pub trait BlobResolver: Send + Sync {
 impl Reader {
     /// Opens an sstable held entirely in `file`, comparing user keys with `cmp`.
     pub fn open(file: impl Into<Arc<[u8]>>, cmp: Arc<dyn Comparer>) -> Result<Reader> {
-        Reader::open_with_cache(file, cmp, 0, None)
+        Reader::open_with_cache(file, cmp, 0, None, None)
     }
 
     /// Opens an sstable, tagging cached blocks with `file_num` and consulting the optional
-    /// shared block cache.
+    /// shared block cache. `native_blob`, when present, supplies the table's native blob-file
+    /// references (an inline blob handle's `reference_id` → blob file number) and a resolver, so a
+    /// columnar `FormatValueSeparation` table's separated values are resolved during the up-front
+    /// materialization (which must happen before the resolver could otherwise be attached).
     pub fn open_with_cache(
         file: impl Into<Arc<[u8]>>,
         cmp: Arc<dyn Comparer>,
         file_num: u64,
         block_cache: Option<Arc<crate::cache::BlockCache>>,
+        native_blob: Option<(Vec<u64>, Arc<dyn pebble_blob::NativeBlobResolver>)>,
     ) -> Result<Reader> {
         let file: Arc<[u8]> = file.into();
         let footer = parse_footer(&file)?;
         if footer.format.is_columnar() {
             // Decode the whole columnar table up front and serve reads from the decoded rows;
             // the columnar block format shares nothing with the row block cursor.
-            let cr = columnar::ColumnarReader::open(Arc::clone(&file), cmp.clone())?;
+            let mut cr = columnar::ColumnarReader::open(Arc::clone(&file), cmp.clone())?;
+            if let Some((refs, resolver)) = native_blob {
+                cr.attach_blob_resolver(refs, resolver);
+            }
             let rows: Arc<[(Vec<u8>, Vec<u8>)]> = cr.iter_all()?.into();
             let (range_dels, range_keys) = cr.keyspans()?;
             return Ok(Reader {

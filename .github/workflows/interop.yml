@@ -79,6 +79,15 @@ jobs:
           PEBBLEDB_INTEROP_VALUEBLOCK_DIR: ${{ runner.temp }}/from-go-columnar-vb
         run: cargo test --test interop -- --nocapture
 
+      # Value separation: Go writes a FormatValueSeparation (format 24) DB with native blob files.
+      - name: Go generates a value-separated Pebble database
+        run: ./target/interop-tool generate-separated "$RUNNER_TEMP/from-go-separated"
+
+      - name: Rust reads the Go-written value-separated database
+        env:
+          PEBBLEDB_INTEROP_SEPARATED_DIR: ${{ runner.temp }}/from-go-separated
+        run: cargo test --test interop -- --nocapture
+
       # Reverse: the Rust engine writes a DB, Go Pebble reads it back.
       - name: Rust generates a pebbledb database
         run: cargo run --example interop_gen -- "$RUNNER_TEMP/from-rust"

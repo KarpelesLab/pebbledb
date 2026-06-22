@@ -84,3 +84,30 @@ fn reads_columnar_value_block_database_written_by_go_pebble() {
         );
     }
 }
+
+/// Opens a Go-written **`FormatValueSeparation` (format 24)** database whose values are separated
+/// into native blob files, and reads them through the full engine. Gated on
+/// `PEBBLEDB_INTEROP_SEPARATED_DIR`. Exercises the whole value-separation read path: format-24
+/// MANIFEST replay (blob-file registry + per-file blob references), v6/v7 columnar sstable reading,
+/// inline blob handle decode, and native-blob-file resolution. Keys key00000..key00029 hold
+/// "V<i>-" repeated 20 times (each > the separation threshold, so all are out-of-line).
+#[test]
+fn reads_separated_value_database_written_by_go_pebble() {
+    let Ok(dir) = std::env::var("PEBBLEDB_INTEROP_SEPARATED_DIR") else {
+        eprintln!(
+            "PEBBLEDB_INTEROP_SEPARATED_DIR unset; skipping Go value-separation interop test"
+        );
+        return;
+    };
+
+    let db = Db::open_read_only(&dir, Options::default()).expect("open Go-written separated DB");
+    for i in 0..30u32 {
+        let k = format!("key{i:05}");
+        let want = format!("V{i}-").repeat(20);
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(want.as_bytes()),
+            "separated value for {k}"
+        );
+    }
+}

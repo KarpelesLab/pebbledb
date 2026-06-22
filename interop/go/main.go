@@ -9,6 +9,7 @@
 //	interop generate-columnar     <dir>   write known keys in the columnar sstable format
 //	interop generate-columnar-spans <dir> columnar keys + a range deletion and a range key
 //	interop generate-columnar-valueblock <dir> columnar table with an out-of-line value block
+//	interop generate-separated    <dir>   FormatValueSeparation DB with native blob files
 //	interop verify                <dir>   open <dir> read-only and verify the known keys
 //	interop verify-columnar-sst   <file>  read a Rust-written columnar .sst and verify the keys
 //
@@ -53,6 +54,10 @@ func main() {
 		// A columnar table with an out-of-line value: a key written twice with a snapshot
 		// pinning the older version, so the older SET's value is stored in a value block.
 		generateColumnarValueBlock(dir)
+	case "generate-separated":
+		// A FormatValueSeparation (format 24) database whose values are separated into native
+		// blob files.
+		generateSeparated(dir)
 	case "verify":
 		verify(dir)
 	case "verify-columnar-sst":
@@ -115,6 +120,30 @@ func generateColumnarValueBlock(dir string) {
 	must(snap.Close())
 	must(db.Close())
 	fmt.Printf("generated columnar value-block table in %s\n", dir)
+}
+
+// generateSeparated writes a FormatValueSeparation (format 24) database with value separation
+// enabled, so values are stored out-of-line in native blob files. Keys key00000..key00029 hold
+// "V<i>-" repeated 20 times (each above the separation threshold).
+func generateSeparated(dir string) {
+	opts := &pebble.Options{FormatMajorVersion: pebble.FormatValueSeparation}
+	opts.Experimental.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
+		return pebble.ValueSeparationPolicy{
+			Enabled:               true,
+			MinimumSize:           20,
+			MaxBlobReferenceDepth: 10,
+			TargetGarbageRatio:    1.0,
+		}
+	}
+	db, err := pebble.Open(dir, opts)
+	must(err)
+	for i := 0; i < 30; i++ {
+		v := strings.Repeat(fmt.Sprintf("V%d-", i), 20)
+		must(db.Set([]byte(fmt.Sprintf("key%05d", i)), []byte(v), pebble.Sync))
+	}
+	must(db.Flush())
+	must(db.Close())
+	fmt.Printf("generated value-separated database in %s\n", dir)
 }
 
 func verify(dir string) {

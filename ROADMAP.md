@@ -209,9 +209,16 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     maps `reference_id` through an attached blob-reference list to a blob file number, and fetches
     the value through a `pebble_blob::NativeBlobResolver`. Verified by checked-in real Pebble v7
     fixtures (`pebble_v2_v7_separated.{sst,blob}`): all five separated values resolve.
-  - [ ] Engine glue for full DB open: `NewFile5` blob-reference + `tagNewBlobFile` MANIFEST decode
-    (reference_id → FileID → physical blob file number), raising the read format ceiling to open a
-    format-24 database, and attaching the native-blob resolver from the MANIFEST at table open.
+  - [x] **Full value-separation database read (`FormatValueSeparation`).** The engine opens a
+    Pebble format-24 database whose values are separated into native blob files and reads them
+    end-to-end. The MANIFEST decoder captures each sstable's blob references
+    (`customTagBlobReferences`) and the `NewBlobFile`/`DeletedBlobFile` records into a version-level
+    blob-file registry (blob file ID → physical `<num>.blob`); a `NativeBlobStore` opens those files
+    via `PebbleBlobReader`; and at table open the engine resolves each file's `reference_id`s to blob
+    file numbers and passes them + the resolver into the columnar reader (before its up-front
+    materialization). The read format ceiling rises to `MAX_READABLE` = 24 (distinct from the
+    writable `NEWEST` = 19). Verified by a Rust→Go interop step: Go writes a value-separated
+    database, the engine opens it read-only and reads every separated value.
   - [ ] The value-separation **write** path (emit v6/v7 + separate values into native blob files).
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
