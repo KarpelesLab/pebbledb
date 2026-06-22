@@ -32,6 +32,7 @@ use crate::base::range_del::RangeTombstone;
 use crate::base::range_key::{
     RangeKeyEntry, SuffixValue, encode_del_value, encode_set_value, encode_unset_value,
 };
+use crate::base::varint::put_uvarint;
 use crate::{Error, Result};
 
 use super::block::{BlockHandle, BlockIter, ChecksumType, CompressionType, read_block};
@@ -53,6 +54,10 @@ const TARGET_DATA_BLOCK_SIZE: usize = 32 * 1024;
 /// use empty suffix/value; a range-key SET/UNSET with several suffixes contributes one per suffix.
 type KeyspanWriteEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>, Vec<u8>);
 
+/// A finished columnar table: `(sstable_bytes, blob_file_bytes, blob_file_refs)`. The blob is
+/// `Some` only when value separation was enabled and at least one value was separated.
+pub type ColumnarOutput = (Vec<u8>, Option<Vec<u8>>, Vec<u64>);
+
 /// v7 footer attribute bits (Pebble's `sstable.Attributes`), in iota order: ValueBlocks=1<<0,
 /// RangeKeySets=1<<1, RangeKeyUnsets=1<<2, RangeKeyDels=1<<3, RangeDels=1<<4, TwoLevelIndex=1<<5,
 /// BlobValues=1<<6, PointKeys=1<<7.
@@ -71,9 +76,19 @@ pub struct ColumnarWriter {
     opts: WriterOptions,
     buf: Vec<u8>,
     offset: u64,
-    /// The current data block's rows, encoded through the key schema at flush time.
-    data: Vec<(Vec<u8>, u64, Vec<u8>)>,
+    /// The current data block's rows: `(user_key, trailer, value-or-reference, is_external)`.
+    /// When `is_external`, the third element is the out-of-line reference (value-prefix + handle).
+    data: Vec<(Vec<u8>, u64, Vec<u8>, bool)>,
     approx_block_bytes: usize,
+    /// When set, point values at least this large are written out-of-line into `blob_writer` and
+    /// referenced by an inline blob handle. Requires a v6/v7 table format.
+    value_separation_threshold: Option<usize>,
+    /// The blob file accumulating separated values (used only when separation is enabled).
+    blob_writer: super::pebble_blob::PebbleBlobWriter,
+    /// The blob file's number (also used as its blob-file ID); referenced by the sstable.
+    blob_file_num: u64,
+    /// Whether any value was separated into `blob_writer`.
+    separated_any: bool,
     index: colblk::IndexBlockBuilder,
     last_key: Vec<u8>,
     num_entries: u64,
@@ -107,9 +122,32 @@ impl ColumnarWriter {
             last_key: Vec::new(),
             num_entries: 0,
             num_data_blocks: 0,
+            value_separation_threshold: None,
+            blob_writer: super::pebble_blob::PebbleBlobWriter::new(
+                CompressionType::None,
+                ChecksumType::Crc32c,
+                0,
+            ),
+            blob_file_num: 0,
+            separated_any: false,
             range_dels: Vec::new(),
             range_keys: Vec::new(),
         }
+    }
+
+    /// Enables value separation: point values at least `threshold` bytes are written out-of-line
+    /// into a native blob file (numbered `blob_file_num`) and referenced by an inline handle. The
+    /// table format must be v6/v7 (separated values use the is-value-external column). After
+    /// [`finish_columnar`](Self::finish_columnar), the blob file bytes are returned alongside the
+    /// table.
+    pub fn enable_value_separation(&mut self, threshold: usize, blob_file_num: u64) {
+        self.value_separation_threshold = Some(threshold);
+        self.blob_file_num = blob_file_num;
+        self.blob_writer = super::pebble_blob::PebbleBlobWriter::new(
+            self.opts.compression,
+            self.opts.checksum,
+            blob_file_num,
+        );
     }
 
     /// An estimate of the bytes written so far: flushed blocks plus the pending data block. Used
@@ -143,8 +181,27 @@ impl ColumnarWriter {
             return Ok(());
         }
 
-        self.data.push((user_key.to_vec(), trailer, value.to_vec()));
-        self.approx_block_bytes += user_key.len() + value.len() + 16;
+        // Separate large point values into the blob file, storing an inline handle in their place.
+        let separate = matches!(self.value_separation_threshold, Some(t) if value.len() >= t)
+            && kind == InternalKeyKind::Set;
+        if separate {
+            let h = self.blob_writer.add_value(value);
+            self.separated_any = true;
+            // Inline blob handle: value-prefix 0x40 then uvarint(reference_id=0, value_len,
+            // block_id, value_id). reference_id 0 indexes this sstable's single blob reference.
+            let mut reference = vec![super::pebble_blob::VALUE_KIND_BLOB_HANDLE];
+            put_uvarint(&mut reference, 0);
+            put_uvarint(&mut reference, value.len() as u64);
+            put_uvarint(&mut reference, u64::from(h.block_id));
+            put_uvarint(&mut reference, u64::from(h.value_id));
+            self.approx_block_bytes += user_key.len() + reference.len() + 16;
+            self.data
+                .push((user_key.to_vec(), trailer, reference, true));
+        } else {
+            self.approx_block_bytes += user_key.len() + value.len() + 16;
+            self.data
+                .push((user_key.to_vec(), trailer, value.to_vec(), false));
+        }
         self.last_key = internal_key.to_vec();
         self.num_entries += 1;
         if self.approx_block_bytes >= TARGET_DATA_BLOCK_SIZE {
@@ -208,8 +265,12 @@ impl ColumnarWriter {
             return Ok(());
         }
         let mut builder = colblk::SchemaDataBlockBuilder::new(&self.schema);
-        for (user_key, trailer, value) in &self.data {
-            builder.add(user_key, *trailer, value);
+        for (user_key, trailer, value, is_external) in &self.data {
+            if *is_external {
+                builder.add_external(user_key, *trailer, value);
+            } else {
+                builder.add(user_key, *trailer, value);
+            }
         }
         let block = builder.finish();
         let handle = write_block(
@@ -256,7 +317,22 @@ impl ColumnarWriter {
     }
 
     /// Finishes the table, returning the complete sstable bytes.
-    pub fn finish(mut self) -> Result<Vec<u8>> {
+    /// Finishes the table without value separation, returning the sstable bytes. Use
+    /// [`finish_columnar`](Self::finish_columnar) when separation may be enabled.
+    pub fn finish(self) -> Result<Vec<u8>> {
+        let (table, blob, _refs) = self.finish_columnar()?;
+        debug_assert!(
+            blob.is_none(),
+            "finish() called on a value-separating writer"
+        );
+        Ok(table)
+    }
+
+    /// Finishes the table, returning `(sstable_bytes, blob_file_bytes, blob_file_refs)`. When value
+    /// separation is enabled and any value was separated, `blob_file_bytes` is the native blob file
+    /// and `blob_file_refs` is the sstable's ordered blob-file references (here, the single blob
+    /// file number); otherwise the blob is `None` and refs are empty.
+    pub fn finish_columnar(mut self) -> Result<ColumnarOutput> {
         self.flush_data_block()?;
 
         // Columnar index block.
@@ -396,7 +472,14 @@ impl ColumnarWriter {
             attributes,
         )?;
         self.buf.extend_from_slice(&footer);
-        Ok(self.buf)
+
+        // Finalize the blob file, if any values were separated.
+        let (blob, refs) = if self.separated_any {
+            (Some(self.blob_writer.finish()?), vec![self.blob_file_num])
+        } else {
+            (None, Vec::new())
+        };
+        Ok((self.buf, blob, refs))
     }
 }
 
@@ -699,6 +782,57 @@ mod tests {
 
     fn ikey(user: &[u8], seq: u64) -> Vec<u8> {
         InternalKey::new(user.to_vec(), seq, InternalKeyKind::Set).encode()
+    }
+
+    #[test]
+    fn columnar_v7_value_separation_roundtrips() {
+        use super::super::pebble_blob::{Handle, NativeBlobResolver, PebbleBlobReader};
+        use crate::Result as PResult;
+
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let mut w = ColumnarWriter::new(
+            cmp.clone(),
+            WriterOptions {
+                table_format: TableFormat::Pebble(7),
+                compression: CompressionType::None,
+                ..Default::default()
+            },
+        );
+        w.enable_value_separation(16, 6);
+        // Large values separate; the short one stays inline.
+        let big: Vec<String> = (0..8)
+            .map(|i| format!("bigvalue-{i}-{}", "x".repeat(30)))
+            .collect();
+        for (i, v) in big.iter().enumerate() {
+            w.add(
+                &ikey(format!("key{i:05}").as_bytes(), (100 - i) as u64),
+                v.as_bytes(),
+            )
+            .unwrap();
+        }
+        w.add(&ikey(b"key00008", 50), b"tiny").unwrap();
+
+        let (table, blob, refs) = w.finish_columnar().unwrap();
+        let blob = blob.expect("a blob file (values were separated)");
+        assert_eq!(refs, vec![6]);
+
+        struct R(PebbleBlobReader);
+        impl NativeBlobResolver for R {
+            fn get(&self, file_num: u64, handle: Handle) -> PResult<Vec<u8>> {
+                assert_eq!(file_num, 6);
+                self.0.get(handle)
+            }
+        }
+        let resolver = Arc::new(R(PebbleBlobReader::open(blob).unwrap()));
+        let mut r = ColumnarReader::open(table, cmp).unwrap();
+        r.attach_blob_resolver(refs, resolver);
+
+        let all = r.iter_all().unwrap();
+        assert_eq!(all.len(), 9);
+        for (i, v) in big.iter().enumerate() {
+            assert_eq!(all[i].1.as_slice(), v.as_bytes(), "separated value {i}");
+        }
+        assert_eq!(all[8].1.as_slice(), b"tiny");
     }
 
     #[test]
