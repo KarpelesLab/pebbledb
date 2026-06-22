@@ -100,9 +100,10 @@ gated on the Go interop CI is under **Byte-parity & interop**.
   (Pebble's L0 score: sublevel threshold 4, file-count safety cap 500) — so a flat L0 of many
   disjoint files (one sublevel) no longer over-compacts, while overlapping flushes still trigger
   at the sublevel threshold.
-  - [ ] Optional: persist the per-file span hint in the MANIFEST so files written by a prior
-    session (or upstream Pebble) also skip the eager open on cold reopen instead of being opened
-    once to learn it.
+  - [x] Persist the per-file span hint in the MANIFEST (a pebbledb-private, safe-to-ignore
+    `NewFile4` custom tag that upstream Pebble skips — verified by the interop workflow) so a
+    cold reopen seeds the hint from file metadata and the first scan skips span-free files
+    without opening them to learn it.
 
 - [ ] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
   recovery, match `pebble/wal`'s manager surface.

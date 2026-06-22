@@ -1117,6 +1117,8 @@ impl DbInner {
                 remote: opts.remote_storage.clone(),
                 cache: Mutex::new(HashMap::new()),
             });
+            // Seed the span hint from the loaded files so a first scan can skip span-free ones.
+            let span_seed = span_hints_from_version(&state.vs.current);
             return Ok(DbInner {
                 dir,
                 cmp,
@@ -1130,8 +1132,7 @@ impl DbInner {
                 work_cv: Condvar::new(),
                 drained_cv: Condvar::new(),
                 cache: Mutex::new(HashMap::new()),
-                // Read-only never flushes recovered data to files, so there is nothing to hint.
-                span_hint: Mutex::new(HashMap::new()),
+                span_hint: Mutex::new(span_seed),
                 self_weak: std::sync::OnceLock::new(),
                 snapshots: Mutex::new(Vec::new()),
                 efos: Mutex::new(Vec::new()),
@@ -1281,6 +1282,10 @@ impl DbInner {
             remote: opts.remote_storage.clone(),
             cache: Mutex::new(HashMap::new()),
         });
+        // Seed the span hint from the loaded files (recovered files are already in the version
+        // with their hint set); merge any recovery-flush hints for completeness.
+        let mut span_seed = span_hints_from_version(&state.vs.current);
+        span_seed.extend(recovered_span_hint);
         Ok(DbInner {
             dir,
             cmp,
@@ -1294,7 +1299,7 @@ impl DbInner {
             work_cv: Condvar::new(),
             drained_cv: Condvar::new(),
             cache: Mutex::new(HashMap::new()),
-            span_hint: Mutex::new(recovered_span_hint),
+            span_hint: Mutex::new(span_seed),
             self_weak: std::sync::OnceLock::new(),
             snapshots: Mutex::new(Vec::new()),
             efos: Mutex::new(Vec::new()),
@@ -1534,6 +1539,9 @@ impl DbInner {
                                 largest_seqnum: f.largest_seqnum,
                                 blob_refs: f.blob_refs.clone(),
                                 backing: Some(phys),
+                                // A virtual view's spans depend on the backing clipped to its
+                                // bounds; leave unknown so it is opened (correct, unoptimized).
+                                has_spans: None,
                             },
                         });
                     }
@@ -1561,6 +1569,7 @@ impl DbInner {
                                 largest_seqnum: f.largest_seqnum,
                                 blob_refs: f.blob_refs.clone(),
                                 backing: Some(phys),
+                                has_spans: None,
                             },
                         });
                     }
@@ -3397,6 +3406,22 @@ fn clone_commit_result(r: &Result<()>) -> Result<()> {
     }
 }
 
+/// Seeds the in-memory span hint from a recovered/loaded [`Version`]: every file whose MANIFEST
+/// record carried a `has_spans` value contributes it, so a scan right after open can skip
+/// opening span-free files without first learning the hint. Files with no recorded hint (older
+/// pebbledb, upstream Pebble, virtuals) are simply absent (treated as unknown → opened once).
+fn span_hints_from_version(version: &crate::manifest::Version) -> HashMap<u64, bool> {
+    let mut hints = HashMap::new();
+    for level in version.levels.iter() {
+        for f in level {
+            if let Some(b) = f.has_spans {
+                hints.insert(f.file_num, b);
+            }
+        }
+    }
+    hints
+}
+
 /// Groups the L0 files into **sublevels** (Pebble's read-amplification structure for L0):
 /// L0 files can overlap, so they are greedily packed — newest first — into the fewest layers
 /// of mutually non-overlapping files. Within one sublevel a read touches at most one file. Each
@@ -3549,6 +3574,8 @@ fn write_memtable_to_sstables(
                 largest_seqnum: largest_seq,
                 blob_refs,
                 backing: None,
+                // This split branch only runs for a point-only memtable, so no spans here.
+                has_spans: Some(false),
             });
             let next = start_writer(&mut nfi)?;
             file_num = next.0;
@@ -3628,6 +3655,8 @@ fn write_memtable_to_sstables(
         largest_seqnum: largest_seq,
         blob_refs,
         backing: None,
+        // The final output carries the memtable's range tombstones / range keys (written above).
+        has_spans: Some(has_spans),
     });
     Ok(outputs)
 }

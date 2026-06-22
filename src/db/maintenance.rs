@@ -346,6 +346,8 @@ impl DbInner {
             largest_seqnum: seqnum,
             blob_refs,
             backing: None,
+            // Rewritten external table: leave the span hint unknown so it is opened (correct).
+            has_spans: None,
         })
     }
 }

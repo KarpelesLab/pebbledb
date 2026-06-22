@@ -49,6 +49,11 @@ const CUSTOM_TAG_TERMINATE: u64 = 1;
 const CUSTOM_TAG_NEEDS_COMPACTION: u64 = 2;
 const CUSTOM_TAG_CREATION_TIME: u64 = 6;
 const CUSTOM_TAG_NO_RANGE_KEY_SETS: u64 = 7;
+/// pebbledb-private hint: whether the file carries range tombstones / range keys (one payload
+/// byte, 0 or 1). Chosen in the safe-to-ignore range (no [`CUSTOM_TAG_NON_SAFE_IGNORE_MASK`]
+/// bit) and encoded length-prefixed, so a reader that does not recognize it — including
+/// upstream Pebble — skips it via its default custom-tag handling. Not a Pebble tag.
+const CUSTOM_TAG_SPAN_HINT: u64 = 8;
 const CUSTOM_TAG_NON_SAFE_IGNORE_MASK: u64 = 1 << 6;
 const CUSTOM_TAG_PATH_ID: u64 = 65;
 const CUSTOM_TAG_VIRTUAL: u64 = 66;
@@ -87,6 +92,15 @@ pub struct FileMetadata {
     /// largest]`. `None` for an ordinary physical table (which is its own backing). Persisted
     /// in the MANIFEST via the `CUSTOM_TAG_VIRTUAL` custom tag.
     pub backing: Option<u64>,
+    /// Whether the file carries range tombstones and/or range keys: `Some(true)`/`Some(false)`
+    /// when known, `None` when unknown (a file from upstream Pebble, an older pebbledb, or one
+    /// whose hint was not recorded). A read iterator must collect every file's spans up front
+    /// (they shadow keys in other levels), but a `Some(false)` file can be skipped without
+    /// opening it. Persisted in the MANIFEST via the pebbledb-private, safe-to-ignore
+    /// `CUSTOM_TAG_SPAN_HINT` custom tag (a reader that does not understand it — including
+    /// Pebble — simply ignores it). Purely an optimization: an absent or wrong-toward-`true`
+    /// value only costs an extra file open, never correctness.
+    pub has_spans: Option<bool>,
 }
 
 impl FileMetadata {
@@ -261,9 +275,10 @@ impl VersionEdit {
             put_uvarint(&mut buf, *file_num);
         }
         for nf in &self.new_files {
-            // A virtual table carries a backing-file custom tag, so it must use the
-            // custom-tag-capable NewFile4 layout; physical tables stay on NewFile2.
-            let tag = if nf.meta.backing.is_some() {
+            // A virtual table (backing tag) or a recorded span hint needs the custom-tag-capable
+            // NewFile4 layout; plain physical tables with no hint stay on NewFile2.
+            let needs_custom = nf.meta.backing.is_some() || nf.meta.has_spans.is_some();
+            let tag = if needs_custom {
                 TAG_NEW_FILE4
             } else {
                 TAG_NEW_FILE2
@@ -276,9 +291,16 @@ impl VersionEdit {
             put_bytes(&mut buf, &nf.meta.largest);
             put_uvarint(&mut buf, nf.meta.smallest_seqnum);
             put_uvarint(&mut buf, nf.meta.largest_seqnum);
-            if let Some(backing) = nf.meta.backing {
-                put_uvarint(&mut buf, CUSTOM_TAG_VIRTUAL);
-                put_uvarint(&mut buf, backing);
+            if needs_custom {
+                if let Some(backing) = nf.meta.backing {
+                    put_uvarint(&mut buf, CUSTOM_TAG_VIRTUAL);
+                    put_uvarint(&mut buf, backing);
+                }
+                if let Some(has_spans) = nf.meta.has_spans {
+                    // Length-prefixed single byte so unknown readers skip it cleanly.
+                    put_uvarint(&mut buf, CUSTOM_TAG_SPAN_HINT);
+                    put_bytes(&mut buf, &[u8::from(has_spans)]);
+                }
                 put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
             }
         }
@@ -343,10 +365,10 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
         (0, 0)
     };
 
-    let backing = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
+    let (backing, has_spans) = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
         decode_custom_tags(d)?
     } else {
-        None
+        (None, None)
     };
 
     Ok(NewFileEntry {
@@ -361,15 +383,18 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             // Not serialized; the engine repopulates this from the sstable at open.
             blob_refs: Vec::new(),
             backing,
+            has_spans,
         },
     })
 }
 
-/// Consumes the custom-tag stream of a `NewFile4`/`NewFile5` record up to the terminator.
+/// Consumes the custom-tag stream of a `NewFile4`/`NewFile5` record up to the terminator,
+/// returning the backing-file number (virtual tables) and the span hint (pebbledb-private).
 /// Each tag's payload is parsed exactly so the stream stays aligned; payloads for features
 /// this engine does not model are discarded.
-fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<Option<u64>> {
+fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>)> {
     let mut backing = None;
+    let mut has_spans = None;
     loop {
         let custom = d.uvarint()?;
         match custom {
@@ -378,6 +403,11 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<Option<u64>> {
             | CUSTOM_TAG_NO_RANGE_KEY_SETS
             | CUSTOM_TAG_NEEDS_COMPACTION => {
                 let _field = d.bytes()?;
+            }
+            CUSTOM_TAG_SPAN_HINT => {
+                // pebbledb-private: a single byte, 0 or 1.
+                let field = d.bytes()?;
+                has_spans = Some(field.first().copied().unwrap_or(0) != 0);
             }
             CUSTOM_TAG_VIRTUAL => {
                 // Virtual table: the backing file's disk number follows.
@@ -413,7 +443,7 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<Option<u64>> {
             }
         }
     }
-    Ok(backing)
+    Ok((backing, has_spans))
 }
 
 #[cfg(test)]
@@ -432,6 +462,7 @@ mod tests {
             largest_seqnum: ls,
             blob_refs: Vec::new(),
             backing: None,
+            has_spans: None,
         }
     }
 
@@ -458,6 +489,45 @@ mod tests {
         let bytes = edit.encode();
         let got = VersionEdit::decode(&bytes).unwrap();
         assert_eq!(got, edit);
+    }
+
+    #[test]
+    fn span_hint_roundtrips() {
+        // A file with a recorded span hint encodes the pebbledb-private custom tag and decodes
+        // back to the same value; absent hints stay absent (plain NewFile2).
+        for hint in [Some(true), Some(false), None] {
+            let mut m = meta(10, "a", "m", 100, 200);
+            m.has_spans = hint;
+            let edit = VersionEdit {
+                new_files: vec![NewFileEntry { level: 2, meta: m }],
+                ..Default::default()
+            };
+            let got = VersionEdit::decode(&edit.encode()).unwrap();
+            assert_eq!(got.new_files[0].meta.has_spans, hint);
+            assert_eq!(got, edit);
+        }
+    }
+
+    #[test]
+    fn unknown_safe_custom_tag_is_ignored() {
+        // A NewFile4 record carrying an unknown safe-to-ignore custom tag (length-prefixed)
+        // decodes without error, mirroring how upstream Pebble skips our span-hint tag.
+        let mut buf = Vec::new();
+        put_uvarint(&mut buf, TAG_NEW_FILE4);
+        put_uvarint(&mut buf, 1); // level
+        put_uvarint(&mut buf, 42); // file_num
+        put_uvarint(&mut buf, 100); // size
+        put_bytes(&mut buf, b"aaaaaaaa"); // smallest (encoded internal key, opaque here)
+        put_bytes(&mut buf, b"zzzzzzzz"); // largest
+        put_uvarint(&mut buf, 5); // smallest seqnum
+        put_uvarint(&mut buf, 9); // largest seqnum
+        put_uvarint(&mut buf, 9); // an unknown safe-to-ignore tag (no non-safe bit)
+        put_bytes(&mut buf, b"whatever"); // its length-prefixed payload
+        put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
+        let got = VersionEdit::decode(&buf).unwrap();
+        assert_eq!(got.new_files.len(), 1);
+        assert_eq!(got.new_files[0].meta.file_num, 42);
+        assert_eq!(got.new_files[0].meta.has_spans, None);
     }
 
     #[test]

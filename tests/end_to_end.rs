@@ -4005,3 +4005,119 @@ fn bounded_scan_opens_only_the_files_it_touches() {
          lazy open should touch at most the boundary file or two"
     );
 }
+
+/// The per-file "has spans" hint is persisted in the MANIFEST, so even a *cold reopen* (whose
+/// in-memory hint starts empty) can skip opening span-free files on the very first scan — it is
+/// seeded from the loaded file metadata. Without persistence the first post-reopen scan would
+/// open every file in the run to learn the hint.
+#[test]
+fn span_hint_persists_across_reopen() {
+    use std::io;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+
+    struct CountingFs {
+        inner: Arc<dyn Fs>,
+        sst_reads: Arc<AtomicUsize>,
+    }
+    impl Fs for CountingFs {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.create(path)
+        }
+        fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.reuse(path)
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if path.extension().is_some_and(|e| e == "sst") {
+                self.sst_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.inner.read(path)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn size(&self, path: &Path) -> io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(path)
+        }
+    }
+
+    let sst_reads = Arc::new(AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(CountingFs {
+        inner: Arc::new(MemFs::new()),
+        sst_reads: Arc::clone(&sst_reads),
+    });
+    let opts = || Options {
+        fs: Arc::clone(&fs),
+        mem_table_size: 8 * 1024,
+        target_file_size: 1024,
+        max_concurrent_compactions: 1,
+        ..Default::default()
+    };
+
+    // Build a run of many small, span-free, non-overlapping bottom-level files.
+    const N: u32 = 600;
+    let val = vec![b'x'; 200];
+    {
+        let db = Db::open("/span-persist", opts()).unwrap();
+        for i in 0..N {
+            db.set(format!("key{i:04}").as_bytes(), &val).unwrap();
+        }
+        db.flush().unwrap();
+        db.compact_range(None, None).unwrap();
+        drop(db);
+    }
+
+    // Cold reopen: the in-memory hint starts empty and is seeded from the MANIFEST.
+    let db = Db::open("/span-persist", opts()).unwrap();
+    let total_files: usize = db.level_file_counts().iter().sum();
+    assert!(total_files >= 10, "expected many files, got {total_files}");
+
+    sst_reads.store(0, AtomicOrdering::Relaxed);
+    let mut it = db
+        .iter_with_options(IterOptions {
+            lower_bound: Some(b"key0100".to_vec()),
+            upper_bound: Some(b"key0103".to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push(it.key().to_vec());
+        it.next().unwrap();
+    }
+    let reads = sst_reads.load(AtomicOrdering::Relaxed);
+    assert_eq!(
+        got,
+        vec![
+            b"key0100".to_vec(),
+            b"key0101".to_vec(),
+            b"key0102".to_vec()
+        ],
+    );
+    assert!(
+        reads <= 2,
+        "after a cold reopen, a 3-key bounded scan opened {reads} sstables ({total_files} in \
+         the run); the persisted span hint should let it skip the rest without opening them"
+    );
+}

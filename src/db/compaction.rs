@@ -927,7 +927,8 @@ impl DbInner {
         // `new_output` writes the retained tombstones / range keys into every output file, so the
         // span hint is the same for all of them. Lets a later scan skip opening span-free outputs.
         let outputs_have_spans = write_tombstones || write_range_keys;
-        for meta in outputs {
+        for mut meta in outputs {
+            meta.has_spans = Some(outputs_have_spans); // persisted in the MANIFEST
             self.record_span_hint(meta.file_num, outputs_have_spans);
             edit.new_files.push(NewFileEntry {
                 level: c.output_level,
@@ -1159,6 +1160,8 @@ impl OutputBuilder {
             largest_seqnum: self.largest_seq,
             blob_refs,
             backing: None,
+            // Set by `run_compaction` once it knows whether the outputs carry spans.
+            has_spans: None,
         })
     }
 }

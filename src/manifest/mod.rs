@@ -217,6 +217,7 @@ mod tests {
             largest_seqnum: ls,
             blob_refs: Vec::new(),
             backing: None,
+            has_spans: None,
         }
     }
 
