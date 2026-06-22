@@ -235,6 +235,30 @@ mod tests {
     }
 
     #[test]
+    fn load_populates_blob_file_registry() {
+        // Replaying a MANIFEST whose edit records native blob files and a file's blob references
+        // must populate both the blob-file registry and the file's pebble_blob_refs.
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let mut m = meta(5, "a", "z", 1, 2);
+        m.pebble_blob_refs = vec![6];
+        let edit = VersionEdit {
+            comparer_name: Some(cmp.name().to_string()),
+            next_file_number: Some(10),
+            new_files: vec![NewFileEntry { level: 0, meta: m }],
+            new_blob_files: vec![(6, 6)],
+            ..Default::default()
+        };
+        let mut manifest = Vec::new();
+        let mut w = crate::record::Writer::new(&mut manifest);
+        w.write_record(&edit.encode()).unwrap();
+        w.finish().unwrap();
+
+        let vs = VersionSet::load(&manifest, cmp).unwrap();
+        assert_eq!(vs.blob_files.get(&6), Some(&6), "blob-file registry populated");
+        assert_eq!(vs.current.levels[0][0].pebble_blob_refs, vec![6]);
+    }
+
+    #[test]
     fn apply_adds_and_removes_files() {
         let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
         let mut vs = VersionSet::new(cmp);
