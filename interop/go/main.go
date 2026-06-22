@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -163,7 +164,46 @@ func verifyColumnarSST(path string) {
 		fmt.Fprintf(os.Stderr, "expected %d keys, got %d\n", n, count)
 		os.Exit(1)
 	}
-	fmt.Printf("verified %d keys in columnar sstable %s\n", count, path)
+
+	// Verify the keyspans the Rust writer emitted (range deletion + range key set), proving the
+	// columnar keyspan blocks are byte-parseable by Pebble too.
+	rdi, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
+	must(err)
+	rdCount := 0
+	if rdi != nil {
+		s, err := rdi.First()
+		for ; err == nil && s != nil; s, err = rdi.Next() {
+			if string(s.Start) != "key0030" || string(s.End) != "key0040" {
+				fmt.Fprintf(os.Stderr, "unexpected range del [%s,%s)\n", s.Start, s.End)
+				os.Exit(1)
+			}
+			rdCount++
+		}
+		must(err)
+	}
+	rki, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
+	must(err)
+	rkCount := 0
+	if rki != nil {
+		s, err := rki.First()
+		for ; err == nil && s != nil; s, err = rki.Next() {
+			for _, k := range s.Keys {
+				if string(s.Start) != "key0050" || string(s.End) != "key0060" ||
+					string(k.Suffix) != "@1" || string(k.Value) != "rkval" {
+					fmt.Fprintf(os.Stderr, "unexpected range key [%s,%s) %s=%s\n", s.Start, s.End, k.Suffix, k.Value)
+					os.Exit(1)
+				}
+				rkCount++
+			}
+		}
+		must(err)
+	}
+	if rdCount != 1 || rkCount != 1 {
+		fmt.Fprintf(os.Stderr, "expected 1 range del + 1 range key, got %d + %d\n", rdCount, rkCount)
+		os.Exit(1)
+	}
+	fmt.Printf("verified %d keys + %d range del + %d range key in columnar sstable %s\n",
+		count, rdCount, rkCount, path)
 }
 
 func must(err error) {

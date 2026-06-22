@@ -155,8 +155,16 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     instead of decoding to a truncated key. Verified by a checked-in Pebble value-block fixture
     (key written twice under a snapshot → older value separated) + a `generate-columnar-valueblock`
     interop CI step, regenerating the fixture byte-for-byte.
-  - [ ] **Columnar write path:** the engine still flushes/compacts to the row format; emitting
-    columnar tables (and a Rust→Go columnar interop direction) is a separate step.
+  - [x] **Columnar writer byte-parity (Rust→Go).** The `ColumnarWriter` now emits sstables that
+    upstream Pebble v2.1.6 reads back byte-for-byte: point keys, range deletions, and range keys
+    (the `add` method routes by kind into keyspan-block builders, as the row writer does). Two
+    fixes made Pebble accept the output — emitting the schema name under the `pebble.colblk.schema`
+    property tag Pebble reads, and writing the index block's fourth (block-properties) column its
+    reader requires. Verified by a `columnar_sst_gen` example + a `verify-columnar-sst` interop
+    command/CI step (Go reads the points and the keyspans). Remaining: wiring the columnar writer
+    into the **engine's** flush/compaction so whole databases are written columnar (the writer
+    byte-parity it builds on is now in place); out-of-line value-block *writing* is also optional
+    (Pebble does not require value separation).
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
   `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
   encoding. (No longer blocked — v2 is tagged.)

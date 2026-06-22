@@ -48,6 +48,10 @@ use super::{TableFormat, parse_footer};
 /// Target uncompressed size of a columnar data block before it is flushed.
 const TARGET_DATA_BLOCK_SIZE: usize = 32 * 1024;
 
+/// A pending keyspan key for the writer: `(start, end, trailer, suffix, value)`. Range deletions
+/// use empty suffix/value; a range-key SET/UNSET with several suffixes contributes one per suffix.
+type KeyspanWriteEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>, Vec<u8>);
+
 /// Property key under which the columnar key-schema name is recorded. Pebble reads its
 /// `Properties.KeySchemaName` from this exact tag to select the matching key decomposition,
 /// so emitting it lets Pebble v2 read tables this writer produces.
@@ -66,6 +70,11 @@ pub struct ColumnarWriter {
     index: colblk::IndexBlockBuilder,
     last_key: Vec<u8>,
     num_entries: u64,
+    /// Collected range deletions as `(start, end, trailer)`, in add order.
+    range_dels: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    /// Collected range keys as `(start, end, trailer, suffix, value)`, in add order. A row-format
+    /// `RANGEKEYSET`/`RANGEKEYUNSET` carrying several suffixes expands to one entry per suffix.
+    range_keys: Vec<KeyspanWriteEntry>,
 }
 
 impl ColumnarWriter {
@@ -87,20 +96,92 @@ impl ColumnarWriter {
             index: colblk::IndexBlockBuilder::new(),
             last_key: Vec::new(),
             num_entries: 0,
+            range_dels: Vec::new(),
+            range_keys: Vec::new(),
         }
     }
 
-    /// Adds a point entry. `internal_key` is the encoded internal key (user key + trailer);
-    /// keys must be added in ascending internal-key order.
+    /// Adds an entry. `internal_key` is the encoded internal key (user key + trailer). Point
+    /// keys must be added in ascending internal-key order; range deletions and range keys form
+    /// their own sorted streams (routed to keyspan blocks), exactly like the row writer's `add`.
     pub fn add(&mut self, internal_key: &[u8], value: &[u8]) -> Result<()> {
-        let user_key = encoded_user_key(internal_key);
+        use crate::base::internal_key::{InternalKeyKind, trailer_kind};
         let trailer = encoded_trailer(internal_key);
+        let kind = trailer_kind(trailer);
+        let user_key = encoded_user_key(internal_key);
+
+        if kind == InternalKeyKind::RangeDelete {
+            // value is the end user key.
+            self.range_dels
+                .push((user_key.to_vec(), value.to_vec(), trailer));
+            return Ok(());
+        }
+        if matches!(
+            kind,
+            InternalKeyKind::RangeKeySet
+                | InternalKeyKind::RangeKeyUnset
+                | InternalKeyKind::RangeKeyDelete
+        ) {
+            self.add_range_key(user_key, kind, trailer, value)?;
+            return Ok(());
+        }
+
         self.data.push((user_key.to_vec(), trailer, value.to_vec()));
         self.approx_block_bytes += user_key.len() + value.len() + 16;
         self.last_key = internal_key.to_vec();
         self.num_entries += 1;
         if self.approx_block_bytes >= TARGET_DATA_BLOCK_SIZE {
             self.flush_data_block()?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a row-format range-key value (`varstr(end) | payload`) into one or more columnar
+    /// keyspan keys (one per suffix for SET/UNSET).
+    fn add_range_key(
+        &mut self,
+        start: &[u8],
+        kind: crate::base::internal_key::InternalKeyKind,
+        trailer: u64,
+        value: &[u8],
+    ) -> Result<()> {
+        use crate::base::internal_key::InternalKeyKind;
+        use crate::base::range_key::{decode_end, decode_set_suffix_values, decode_unset_suffixes};
+        let (end, payload) = decode_end(kind, value)?;
+        let end = end.to_vec();
+        match kind {
+            InternalKeyKind::RangeKeySet => {
+                for sv in decode_set_suffix_values(payload)? {
+                    self.range_keys.push((
+                        start.to_vec(),
+                        end.clone(),
+                        trailer,
+                        sv.suffix,
+                        sv.value,
+                    ));
+                }
+            }
+            InternalKeyKind::RangeKeyUnset => {
+                for suffix in decode_unset_suffixes(payload)? {
+                    self.range_keys.push((
+                        start.to_vec(),
+                        end.clone(),
+                        trailer,
+                        suffix,
+                        Vec::new(),
+                    ));
+                }
+            }
+            InternalKeyKind::RangeKeyDelete => {
+                self.range_keys.push((
+                    start.to_vec(),
+                    end.clone(),
+                    trailer,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            _ => unreachable!("add_range_key called with non-range-key kind"),
         }
         Ok(())
     }
@@ -128,6 +209,36 @@ impl ColumnarWriter {
         Ok(())
     }
 
+    /// Builds a columnar keyspan block from entries `(start, end, trailer, suffix, value)` that
+    /// are sorted in increasing internal-key order, grouping consecutive entries sharing a
+    /// `[start, end)` fragment into one span (each becomes a keyspan key). Returns the encoded
+    /// block, or `None` if there are no entries.
+    fn build_keyspan_block(
+        entries: &[KeyspanWriteEntry],
+    ) -> Option<Vec<u8>> {
+        if entries.is_empty() {
+            return None;
+        }
+        let mut kb = colblk::KeyspanBlockBuilder::new();
+        let mut i = 0;
+        while i < entries.len() {
+            let (start, end, ..) = &entries[i];
+            let mut keys = Vec::new();
+            let mut j = i;
+            while j < entries.len() && &entries[j].0 == start && &entries[j].1 == end {
+                keys.push(colblk::KeyspanKey {
+                    trailer: entries[j].2,
+                    suffix: entries[j].3.clone(),
+                    value: entries[j].4.clone(),
+                });
+                j += 1;
+            }
+            kb.add_span(start, end, &keys);
+            i = j;
+        }
+        Some(kb.finish())
+    }
+
     /// Finishes the table, returning the complete sstable bytes.
     pub fn finish(mut self) -> Result<Vec<u8>> {
         self.flush_data_block()?;
@@ -141,6 +252,33 @@ impl ColumnarWriter {
             self.opts.compression,
             self.opts.checksum,
         )?;
+
+        // Keyspan blocks (range deletions / range keys), if any.
+        let range_del_entries: Vec<_> = self
+            .range_dels
+            .iter()
+            .map(|(s, e, t)| (s.clone(), e.clone(), *t, Vec::new(), Vec::new()))
+            .collect();
+        let range_del_handle = match Self::build_keyspan_block(&range_del_entries) {
+            Some(block) => Some(write_block(
+                &mut self.buf,
+                &mut self.offset,
+                &block,
+                CompressionType::None,
+                self.opts.checksum,
+            )?),
+            None => None,
+        };
+        let range_key_handle = match Self::build_keyspan_block(&self.range_keys) {
+            Some(block) => Some(write_block(
+                &mut self.buf,
+                &mut self.offset,
+                &block,
+                CompressionType::None,
+                self.opts.checksum,
+            )?),
+            None => None,
+        };
 
         // Properties block (uncompressed), referenced from the metaindex.
         let mut user_properties = std::collections::BTreeMap::new();
@@ -170,11 +308,22 @@ impl ColumnarWriter {
             self.opts.checksum,
         )?;
 
-        // Metaindex block (uncompressed): one entry for the properties block.
+        // Metaindex block (uncompressed). Entries must be in sorted key order; the keyspan and
+        // properties names sort as: pebble.range_key < rocksdb.properties < rocksdb.range_del2.
         let mut mi = BlockBuilder::new(1);
+        if let Some(h) = range_key_handle {
+            let mut b = Vec::new();
+            h.encode_to(&mut b);
+            mi.add(META_RANGE_KEY_NAME.as_bytes(), &b);
+        }
         let mut ph = Vec::new();
         props_handle.encode_to(&mut ph);
         mi.add(META_PROPERTIES_NAME.as_bytes(), &ph);
+        if let Some(h) = range_del_handle {
+            let mut b = Vec::new();
+            h.encode_to(&mut b);
+            mi.add(META_RANGE_DEL_NAME.as_bytes(), &b);
+        }
         let metaindex_handle = write_block(
             &mut self.buf,
             &mut self.offset,
@@ -533,6 +682,63 @@ mod tests {
         assert_eq!(r.num_data_blocks(), 0);
         assert!(r.iter_all().unwrap().is_empty());
         assert_eq!(r.get(b"anything").unwrap(), None);
+    }
+
+    #[test]
+    fn columnar_writer_roundtrips_keyspans() {
+        use crate::base::range_key::{SuffixValue, encode_set_value};
+
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let mut w = ColumnarWriter::new(
+            cmp.clone(),
+            WriterOptions {
+                compression: CompressionType::None,
+                ..Default::default()
+            },
+        );
+        // Points.
+        for i in 0..10u32 {
+            w.add(&ikey(format!("key{i:05}").as_bytes(), 100 - i as u64), b"v")
+                .unwrap();
+        }
+        // A range deletion [key00003, key00007) at seq 50.
+        let rd = InternalKey::new(b"key00003".to_vec(), 50, InternalKeyKind::RangeDelete).encode();
+        w.add(&rd, b"key00007").unwrap();
+        // A range key set [key00012, key00015)@1 = "rk" at seq 60.
+        let rk = InternalKey::new(b"key00012".to_vec(), 60, InternalKeyKind::RangeKeySet).encode();
+        let rk_val = encode_set_value(
+            b"key00015",
+            &[SuffixValue {
+                suffix: b"@1".to_vec(),
+                value: b"rk".to_vec(),
+            }],
+        );
+        w.add(&rk, &rk_val).unwrap();
+
+        let bytes = w.finish().unwrap();
+        let r = ColumnarReader::open(bytes, cmp).unwrap();
+
+        // Points still read.
+        assert_eq!(r.iter_all().unwrap().len(), 10);
+
+        // Keyspans round-trip through the reader's conversion.
+        let (dels, keys) = r.keyspans().unwrap();
+        assert_eq!(dels.len(), 1);
+        assert_eq!(dels[0].start, b"key00003");
+        assert_eq!(dels[0].end, b"key00007");
+        assert_eq!(dels[0].seqnum, 50);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kind, InternalKeyKind::RangeKeySet);
+        assert_eq!(keys[0].start, b"key00012");
+        assert_eq!(keys[0].seqnum, 60);
+        let (end, payload) =
+            crate::base::range_key::decode_end(keys[0].kind, &keys[0].value).unwrap();
+        assert_eq!(end, b"key00015");
+        let svs = crate::base::range_key::decode_set_suffix_values(payload).unwrap();
+        assert_eq!(svs.len(), 1);
+        assert_eq!(svs[0].suffix, b"@1");
+        assert_eq!(svs[0].value, b"rk");
     }
 
     #[test]

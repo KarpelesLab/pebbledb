@@ -17,13 +17,18 @@ use std::sync::Arc;
 
 use pebbledb::DefaultComparer;
 use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+use pebbledb::base::range_key::{SuffixValue, encode_set_value};
 use pebbledb::sstable::WriterOptions;
 use pebbledb::sstable::columnar::ColumnarWriter;
 
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .expect("usage: columnar_sst_gen <file.sst>");
+        .expect("usage: columnar_sst_gen <file.sst> [spans]");
+    // Optional second arg "spans" also writes a range deletion and a range key, so the Rust→Go
+    // columnar direction exercises keyspan blocks too.
+    let with_spans = std::env::args().nth(2).as_deref() == Some("spans");
+
     let cmp = Arc::new(DefaultComparer);
     let mut w = ColumnarWriter::new(cmp, WriterOptions::default());
     let n = 100u64;
@@ -36,6 +41,20 @@ fn main() {
         .encode();
         let v = format!("value{i}");
         w.add(&k, v.as_bytes()).expect("add");
+    }
+    if with_spans {
+        // Range deletion [key0030, key0040) and range key set [key0050, key0060)@1 = "rkval".
+        let rd = InternalKey::new(b"key0030".to_vec(), 1, InternalKeyKind::RangeDelete).encode();
+        w.add(&rd, b"key0040").expect("add range del");
+        let rk = InternalKey::new(b"key0050".to_vec(), 1, InternalKeyKind::RangeKeySet).encode();
+        let rk_val = encode_set_value(
+            b"key0060",
+            &[SuffixValue {
+                suffix: b"@1".to_vec(),
+                value: b"rkval".to_vec(),
+            }],
+        );
+        w.add(&rk, &rk_val).expect("add range key");
     }
     let bytes = w.finish().expect("finish");
     std::fs::write(&path, &bytes).expect("write sst");
