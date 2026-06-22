@@ -62,9 +62,18 @@ fn full_lifecycle_with_reopen_and_compaction() {
             db.delete(format!("key{i:06}").as_bytes()).unwrap();
         }
 
-        // Compaction should have kept L0 bounded.
-        let m = db.metrics();
-        assert!(m.level_files[0] < 4, "L0 not drained: {:?}", m.level_files);
+        // Compaction keeps L0 bounded; the background worker drains it asynchronously, so poll
+        // for the eventual drained state rather than asserting it synchronously (the check would
+        // otherwise race a just-reached file-count trigger, as seen on slower CI runners).
+        let mut drained = false;
+        for _ in 0..200 {
+            if db.metrics().level_files[0] < 4 {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(drained, "L0 not drained: {:?}", db.metrics().level_files);
 
         // Reads reflect the latest state.
         assert_eq!(db.get(b"key000000").unwrap(), Some(b"overwritten".to_vec()));
