@@ -32,7 +32,7 @@ use crate::sstable::columnar::ColumnarWriter;
 use crate::vfs::{Fs, WritableFile};
 
 use super::merging_iter::{BoundedIter, InternalIter, MergingIter};
-use super::{DbInner, State, filenames};
+use super::{DbInner, NewBlobFileRecord, State, filenames};
 
 /// Safety cap on compactions per `maybe_compact` call.
 const MAX_COMPACTIONS_PER_CALL: usize = 100;
@@ -590,7 +590,7 @@ impl DbInner {
         // Phase A (locked): a single non-overlapping file is relevelled by a MANIFEST edit
         // alone (move compaction); otherwise reserve enough output file numbers — output
         // bytes never exceed total input bytes — and snapshot the open-snapshot list.
-        let (output_nums, snapshots, external) = {
+        let (output_nums, blob_nums, snapshots, external) = {
             let mut state = self.state.lock().unwrap();
             if c.inputs.len() == 1
                 && c.overlap.is_empty()
@@ -609,6 +609,16 @@ impl DbInner {
             let target = self.target_file_size_for(c.output_level).max(1);
             let n = (total_in / target + 2) as usize;
             let nums: Vec<u64> = (0..n).map(|_| state.vs.allocate_file_number()).collect();
+            // When value separation is active, reserve a second number per output to back its
+            // native blob file (used only by outputs that actually separate a value).
+            let separate = self.format_major_version()
+                >= crate::FormatMajorVersion::VALUE_SEPARATION
+                && self.blob_value_threshold.is_some();
+            let blob_nums: Vec<u64> = if separate {
+                (0..n).map(|_| state.vs.allocate_file_number()).collect()
+            } else {
+                Vec::new()
+            };
             // User-key bounds of every live file NOT part of this compaction. A tombstone may
             // only be elided if none of these could hold an older version it shadows: because
             // tombstones travel down independently of the keys they cover (and move
@@ -634,7 +644,7 @@ impl DbInner {
                     }
                 }
             }
-            (nums, self.open_snapshots(), external)
+            (nums, blob_nums, self.open_snapshots(), external)
         };
         // An external file overlaps point key `k` (inclusive bounds).
         let ext_covers_key = |k: &[u8]| -> bool {
@@ -651,6 +661,9 @@ impl DbInner {
             })
         };
         let mut output_nums = output_nums.into_iter();
+        let mut blob_nums = blob_nums.into_iter();
+        // `NewBlobFile` MANIFEST records for outputs that re-separated values into a blob file.
+        let mut new_blob_files: Vec<NewBlobFileRecord> = Vec::new();
 
         let input_count = c.inputs.len() + c.mid.len() + c.overlap.len();
         if !c.mid.is_empty() {
@@ -827,7 +840,9 @@ impl DbInner {
                 && let Some(b) = builder.as_ref()
                 && b.writer.estimated_size() >= self.target_file_size_for(c.output_level)
             {
-                outputs.push(builder.take().unwrap().finish()?);
+                let (meta, blob_rec) = builder.take().unwrap().finish()?;
+                outputs.push(meta);
+                new_blob_files.extend(blob_rec);
             }
 
             if builder.is_none() {
@@ -836,8 +851,10 @@ impl DbInner {
                         "compaction: out of preallocated file numbers".into(),
                     )
                 })?;
+                let blob_num = blob_nums.next().unwrap_or(num);
                 builder = Some(self.new_output(
                     num,
+                    blob_num,
                     &retained_tombstones,
                     write_tombstones,
                     &range_keys,
@@ -853,7 +870,9 @@ impl DbInner {
             }
         }
         if let Some(b) = builder.take() {
-            outputs.push(b.finish()?);
+            let (meta, blob_rec) = b.finish()?;
+            outputs.push(meta);
+            new_blob_files.extend(blob_rec);
         }
 
         // If the compaction produced only range deletions/keys (no surviving point keys),
@@ -862,14 +881,18 @@ impl DbInner {
             let num = output_nums.next().ok_or_else(|| {
                 crate::Error::InvalidState("compaction: out of preallocated file numbers".into())
             })?;
+            let blob_num = blob_nums.next().unwrap_or(num);
             let b = self.new_output(
                 num,
+                blob_num,
                 &retained_tombstones,
                 write_tombstones,
                 &range_keys,
                 write_range_keys,
             )?;
-            outputs.push(b.finish()?);
+            let (meta, blob_rec) = b.finish()?;
+            outputs.push(meta);
+            new_blob_files.extend(blob_rec);
         }
 
         // Move compaction outputs to shared storage when create_on_shared is enabled (off lock).
@@ -935,17 +958,40 @@ impl DbInner {
         }
         let num_outputs = outputs.len();
         let output_bytes: u64 = outputs.iter().map(|m| m.size).sum();
+        // Map each new blob file's reference ID to its file number, so an output's
+        // `pebble_blob_refs` (ordered by reference ID) can be turned into the blob file numbers a
+        // read resolves against. Outputs that re-separated values carry such references.
+        let id_to_num: std::collections::HashMap<u64, u64> = new_blob_files
+            .iter()
+            .map(|&(id, num, _, _)| (id, num))
+            .collect();
         // `new_output` writes the retained tombstones / range keys into every output file, so the
         // span hint is the same for all of them. Lets a later scan skip opening span-free outputs.
         let outputs_have_spans = write_tombstones || write_range_keys;
         for mut meta in outputs {
             meta.has_spans = Some(outputs_have_spans); // persisted in the MANIFEST
             self.record_span_hint(meta.file_num, outputs_have_spans);
+            // Record this output's native blob references so reads in this same instance (e.g. a
+            // follow-up compaction) resolve them; a reopen re-seeds from the MANIFEST.
+            if !meta.pebble_blob_refs.is_empty() {
+                let nums: Vec<u64> = meta
+                    .pebble_blob_refs
+                    .iter()
+                    .filter_map(|(id, _)| id_to_num.get(id).copied())
+                    .collect();
+                if nums.len() == meta.pebble_blob_refs.len() {
+                    self.native_blob_refs
+                        .lock()
+                        .unwrap()
+                        .insert(meta.file_num, nums);
+                }
+            }
             edit.new_files.push(NewFileEntry {
                 level: c.output_level,
                 meta,
             });
         }
+        edit.new_blob_files = new_blob_files;
 
         state.vs.apply(&edit)?;
         if let Some(mw) = state.manifest.as_mut() {
@@ -1017,12 +1063,13 @@ impl DbInner {
     fn new_output(
         &self,
         file_num: u64,
+        blob_file_num: u64,
         tombstones: &[RangeTombstone],
         write_tombstones: bool,
         range_keys: &[RangeKeyEntry],
         write_range_keys: bool,
     ) -> Result<OutputBuilder> {
-        let mut b = OutputBuilder::new(self, file_num)?;
+        let mut b = OutputBuilder::new(self, file_num, blob_file_num)?;
         if write_tombstones {
             for t in tombstones {
                 b.add_range_del(&t.start, &t.end, t.seqnum)?;
@@ -1065,6 +1112,10 @@ impl CompactionWriter {
 /// key-range and sequence-number bounds across both point keys and range tombstones.
 struct OutputBuilder {
     file_num: u64,
+    /// Preallocated number for this output's native blob file, used only when value
+    /// separation is active (format >= VALUE_SEPARATION). The blob file is written, and its
+    /// `NewBlobFile` MANIFEST record emitted, only if `finish` actually separated a value.
+    blob_file_num: u64,
     path: std::path::PathBuf,
     writer: CompactionWriter,
     cmp_dyn: Arc<dyn crate::base::comparer::Comparer>,
@@ -1076,17 +1127,28 @@ struct OutputBuilder {
 }
 
 impl OutputBuilder {
-    fn new(db: &DbInner, file_num: u64) -> Result<OutputBuilder> {
+    fn new(db: &DbInner, file_num: u64, blob_file_num: u64) -> Result<OutputBuilder> {
         let path = db.dir.join(filenames::table(file_num));
+        // At a value-separation format major version with a blob threshold, a compaction output is
+        // a table-format-v7 columnar table that re-separates large values into its own native blob
+        // file — so a value-separated database stays separated across compactions rather than
+        // de-separating to inline. Otherwise a v5 inline columnar table.
+        let separate = db.format_major_version() >= crate::FormatMajorVersion::VALUE_SEPARATION
+            && db.blob_value_threshold.is_some();
         let writer = if db.format_major_version() >= crate::FormatMajorVersion::COLUMNAR_BLOCKS {
-            // Columnar output: values inline, whole table buffered then written at finish.
-            CompactionWriter::Columnar(Box::new(ColumnarWriter::new(
+            // Columnar output: whole table buffered then written at finish. Values are stored
+            // inline (v5) or re-separated into a native blob file (v7) per `separate`.
+            let mut w = ColumnarWriter::new(
                 db.cmp.clone(),
                 crate::sstable::WriterOptions {
-                    table_format: crate::sstable::TableFormat::Pebble(5),
+                    table_format: crate::sstable::TableFormat::Pebble(if separate { 7 } else { 5 }),
                     ..Default::default()
                 },
-            )))
+            );
+            if separate {
+                w.enable_value_separation(db.blob_value_threshold.unwrap(), blob_file_num);
+            }
+            CompactionWriter::Columnar(Box::new(w))
         } else {
             let mut writer = Writer::new(
                 db.fs.create(&path)?,
@@ -1108,6 +1170,7 @@ impl OutputBuilder {
         };
         Ok(OutputBuilder {
             file_num,
+            blob_file_num,
             path,
             writer,
             cmp_dyn: db.cmp.clone(),
@@ -1194,11 +1257,16 @@ impl OutputBuilder {
         Ok(())
     }
 
-    fn finish(self) -> Result<FileMetadata> {
-        let blob_refs = match self.writer {
+    /// Writes the output sstable (and any blob file) and returns its metadata, plus a
+    /// `NewBlobFile` MANIFEST record when columnar value separation produced a native blob file.
+    fn finish(self) -> Result<(FileMetadata, Option<NewBlobFileRecord>)> {
+        let mut blob_refs = Vec::new();
+        let mut pebble_blob_refs = Vec::new();
+        let mut new_blob_record = None;
+        match self.writer {
             CompactionWriter::Row(mut w) => {
                 let blob_bytes = w.take_blob_file()?;
-                let blob_refs = w.blob_refs().to_vec();
+                blob_refs = w.blob_refs().to_vec();
                 let mut file = w.finish()?;
                 file.sync_all()?;
                 // Write this output's sibling blob file, if blob rewrite separated any new values.
@@ -1208,31 +1276,49 @@ impl OutputBuilder {
                     bf.write_all(b)?;
                     bf.sync_all()?;
                 }
-                blob_refs
             }
             CompactionWriter::Columnar(w) => {
-                // Columnar output buffers the whole table; write it out now. No blob files.
-                let bytes = w.finish()?;
+                // Columnar output buffers the whole table; write it out now. With value separation
+                // it also emits a native blob file (and the blob references / MANIFEST record that
+                // let Pebble and this engine resolve those values).
+                let (bytes, blob_bytes, refs) = w.finish_columnar()?;
                 let mut file = self.fs.create(&self.path)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                Vec::new()
+                if let Some((blob, value_size)) = blob_bytes {
+                    let blob_path = self
+                        .path
+                        .with_file_name(filenames::blob(self.blob_file_num));
+                    let mut bf = self.fs.create(&blob_path)?;
+                    bf.write_all(&blob)?;
+                    bf.sync_all()?;
+                    new_blob_record = Some((
+                        self.blob_file_num,
+                        self.blob_file_num,
+                        blob.len() as u64,
+                        value_size,
+                    ));
+                    pebble_blob_refs = refs.iter().map(|&id| (id, value_size)).collect();
+                }
             }
         };
         let size = self.fs.size(&self.path)?;
-        Ok(FileMetadata {
-            file_num: self.file_num,
-            size,
-            smallest: self.smallest.unwrap_or_default(),
-            largest: self.largest.unwrap_or_default(),
-            smallest_seqnum: self.smallest_seq.min(self.largest_seq),
-            largest_seqnum: self.largest_seq,
-            blob_refs,
-            pebble_blob_refs: Vec::new(),
-            backing: None,
-            // Set by `run_compaction` once it knows whether the outputs carry spans.
-            has_spans: None,
-        })
+        Ok((
+            FileMetadata {
+                file_num: self.file_num,
+                size,
+                smallest: self.smallest.unwrap_or_default(),
+                largest: self.largest.unwrap_or_default(),
+                smallest_seqnum: self.smallest_seq.min(self.largest_seq),
+                largest_seqnum: self.largest_seq,
+                blob_refs,
+                pebble_blob_refs,
+                backing: None,
+                // Set by `run_compaction` once it knows whether the outputs carry spans.
+                has_spans: None,
+            },
+            new_blob_record,
+        ))
     }
 }
 

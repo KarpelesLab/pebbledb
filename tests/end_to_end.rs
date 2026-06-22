@@ -4665,6 +4665,94 @@ fn engine_writes_and_reads_value_separated_database() {
     }
 }
 
+/// At the value-separation format major version, a compaction of value-separated inputs must
+/// stay separated: the merged columnar output is table-format-v7 and re-separates large values
+/// into its own native blob file, rather than de-separating them inline. Verified by forcing
+/// several separated L0 flushes, compacting them together, and reading the values back after a
+/// reopen — which resolves them purely from the compacted file's MANIFEST-persisted blob
+/// references and the blob file the compaction wrote.
+#[test]
+fn compaction_keeps_values_separated() {
+    use pebbledb::FormatMajorVersion;
+
+    let dir = temp_dir("value-separation-compact");
+    let opts = Options {
+        format_major_version: FormatMajorVersion::VALUE_SEPARATION,
+        blob_value_threshold: Some(20),
+        mem_table_size: 4 * 1024, // small, to force multiple separated L0 flushes
+        ..Default::default()
+    };
+
+    let big = |i: u32| format!("bigvalue-{i}-{}", "x".repeat(60));
+    let db = Db::open(&dir, opts.clone()).unwrap();
+    // Several flushes, each producing its own value-separated L0 table + blob file.
+    for batch in 0..4u32 {
+        for i in 0..30u32 {
+            let k = batch * 30 + i;
+            db.set(format!("key{k:05}").as_bytes(), big(k).as_bytes())
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    // Merge the separated L0 tables into the output level.
+    db.compact_range(None, None).unwrap();
+
+    // After a full-range compaction the only sstables left are the compaction's outputs. Each must
+    // be a table-format-v7 table (footer version 7 + Pebble magic) — proving the compaction stayed
+    // separated rather than de-separating to a v5 inline table — and a native blob file must be
+    // present. Reading the v7 footer directly avoids materializing the table (which would need the
+    // blob resolver the standalone `Reader::open` has no way to attach).
+    const PEBBLE_MAGIC: &[u8; 8] = b"\xf0\x9f\xaa\xb3\xf0\x9f\xaa\xb3";
+    let mut blob_files = 0;
+    let mut sst_files = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("blob") => blob_files += 1,
+            Some("sst") => {
+                let bytes = std::fs::read(&path).unwrap();
+                let n = bytes.len();
+                assert_eq!(&bytes[n - 8..], PEBBLE_MAGIC, "pebble magic in {path:?}");
+                let version = u32::from_le_bytes(bytes[n - 12..n - 8].try_into().unwrap());
+                assert_eq!(
+                    version, 7,
+                    "compacted sstable {path:?} should be table-format-v7 (value-separated)"
+                );
+                sst_files += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(sst_files > 0, "expected sstables after compaction");
+    assert!(
+        blob_files > 0,
+        "compaction should keep values separated in a native blob file"
+    );
+
+    // Same-instance read after compaction (native_blob_refs updated in place).
+    for k in 0..120u32 {
+        assert_eq!(
+            db.get(format!("key{k:05}").as_bytes()).unwrap().as_deref(),
+            Some(big(k).as_bytes()),
+            "separated value for key{k:05} same-instance after compaction"
+        );
+    }
+
+    // Reopen and read every value back — resolution comes from the compacted file's
+    // MANIFEST-persisted blob references, proving the compaction wrote them correctly.
+    drop(db);
+    let db = Db::open(&dir, opts).unwrap();
+    for k in 0..120u32 {
+        assert_eq!(
+            db.get(format!("key{k:05}").as_bytes()).unwrap().as_deref(),
+            Some(big(k).as_bytes()),
+            "separated value for key{k:05} after compaction + reopen"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reads a real Pebble v2 native blob file (`FormatValueSeparation`, format 24) — checked in as a
 /// fixture — through `pebble_blob::PebbleBlobReader`, proving byte-parity with Pebble's blob file
 /// format. The fixture holds the separated values for keys key00000..key00029, each value being

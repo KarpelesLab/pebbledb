@@ -40,15 +40,24 @@ fn main() {
         ..Default::default()
     };
     let db = Db::open(&dir, opts).expect("open db");
-    for i in 0..100 {
-        let k = format!("key{i:04}");
-        let v = format!("value{i}");
-        db.set(k.as_bytes(), v.as_bytes()).expect("set");
+    // Write the 100 keys in four flushed batches, so the columnar / value-separated modes produce
+    // several L0 tables (each with its own native blob file when separating) that the compaction
+    // below must merge — exercising compaction output, not just freshly-flushed L0 tables.
+    for batch in 0..4 {
+        for i in (batch * 25)..(batch * 25 + 25) {
+            let k = format!("key{i:04}");
+            let v = format!("value{i}");
+            db.set(k.as_bytes(), v.as_bytes()).expect("set");
+        }
+        if columnar || separated {
+            db.flush().expect("flush");
+        }
     }
     db.flush().expect("flush");
-    if columnar {
-        // Force a compaction so the columnar interop also covers compaction output (not just
-        // freshly-flushed L0 tables).
+    if columnar || separated {
+        // Force a compaction so the interop also covers compaction output. For the value-separated
+        // mode this proves a re-separating compaction (v7 output + a fresh native blob file) is
+        // readable by upstream Pebble.
         db.compact_range(None, None).expect("compact");
     }
     println!("wrote 100 keys to {dir}");
