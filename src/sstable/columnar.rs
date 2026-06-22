@@ -355,12 +355,38 @@ pub struct ColumnarReader {
     checksum: ChecksumType,
     /// The metaindex block handle, used to locate the keyspan (range-del / range-key) blocks.
     metaindex: BlockHandle,
+    /// Whether the metaindex is a columnar key-value block (Pebble table format v6+) rather than
+    /// the legacy row block format (v5).
+    meta_columnar: bool,
     /// Handles of the table's value blocks (from the `pebble.value_index` metaindex entry),
     /// used to resolve out-of-line (is-value-external) columnar values. Empty if the table
     /// has no value blocks.
     value_block_handles: Vec<BlockHandle>,
     /// Index entries: each data block's last user key and its handle.
     index: Vec<(Vec<u8>, BlockHandle)>,
+}
+
+/// Reads a table's metaindex into `(name, handle-bytes)` rows. The metaindex is a legacy row
+/// block in table format v5 and a columnar key-value block in v6+.
+fn read_metaindex_entries(
+    file: &[u8],
+    handle: BlockHandle,
+    checksum: ChecksumType,
+    columnar: bool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let block = read_block(file, handle, checksum)?;
+    if columnar {
+        colblk::decode_key_value_block(&block)
+    } else {
+        let mut it = BlockIter::new(block)?;
+        let mut out = Vec::new();
+        it.first();
+        while it.valid() {
+            out.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        Ok(out)
+    }
 }
 
 impl ColumnarReader {
@@ -386,21 +412,22 @@ impl ColumnarReader {
             })
             .collect();
         let schema = DefaultKeySchema::with_default_bundle_size(cmp.clone());
+        // Pebble table format v6+ stores the metaindex (and properties) as a columnar key-value
+        // block; v5 uses the legacy row block format.
+        let meta_columnar = matches!(footer.format, TableFormat::Pebble(v) if v >= 6);
 
         // Read the value-block index (if any) from the metaindex so out-of-line columnar values
         // can be resolved. Absent for tables that store every value inline.
         let mut value_block_handles = Vec::new();
-        let metaindex_block = read_block(&file, footer.metaindex, footer.checksum)?;
-        let mut mit = BlockIter::new(metaindex_block)?;
-        mit.first();
-        while mit.valid() {
-            if mit.key() == META_VALUE_INDEX_NAME.as_bytes() {
-                let ih = valblk::decode_index_handle(mit.value())?;
+        let entries =
+            read_metaindex_entries(&file, footer.metaindex, footer.checksum, meta_columnar)?;
+        for (name, value) in &entries {
+            if name == META_VALUE_INDEX_NAME.as_bytes() {
+                let ih = valblk::decode_index_handle(value)?;
                 let index_block = read_block(&file, ih.handle, footer.checksum)?;
                 value_block_handles = valblk::decode_index(&index_block, &ih)?;
                 break;
             }
-            mit.next();
         }
 
         Ok(ColumnarReader {
@@ -409,6 +436,7 @@ impl ColumnarReader {
             schema,
             checksum: footer.checksum,
             metaindex: footer.metaindex,
+            meta_columnar,
             value_block_handles,
             index,
         })
@@ -450,19 +478,20 @@ impl ColumnarReader {
     /// row-format payload (`varstr(end) | …`) the rest of the engine consumes, so a columnar
     /// table with spans surfaces them identically to a row table.
     pub fn keyspans(&self) -> Result<(Vec<RangeTombstone>, Vec<RangeKeyEntry>)> {
-        let metaindex = read_block(&self.file, self.metaindex, self.checksum)?;
-        let mut it = BlockIter::new(metaindex)?;
-        it.first();
+        let entries = read_metaindex_entries(
+            &self.file,
+            self.metaindex,
+            self.checksum,
+            self.meta_columnar,
+        )?;
         let mut range_del_handle = None;
         let mut range_key_handle = None;
-        while it.valid() {
-            let key = it.key();
-            if key == META_RANGE_DEL_NAME.as_bytes() {
-                range_del_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
-            } else if key == META_RANGE_KEY_NAME.as_bytes() {
-                range_key_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+        for (name, value) in &entries {
+            if name == META_RANGE_DEL_NAME.as_bytes() {
+                range_del_handle = BlockHandle::decode(value).map(|(h, _)| h);
+            } else if name == META_RANGE_KEY_NAME.as_bytes() {
+                range_key_handle = BlockHandle::decode(value).map(|(h, _)| h);
             }
-            it.next();
         }
 
         let mut range_dels = Vec::new();

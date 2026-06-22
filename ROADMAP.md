@@ -194,8 +194,17 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     `countVirtualBlocks` header + a `colblk` offsets column of `countBlocks + 1` entries), and each
     value block (a `colblk` single RawBytes column), resolving values by `(block_id, value_id)`.
     Verified by a checked-in real Pebble v2.1.6 blob fixture (`pebble_v2_blobfile.blob`).
-  - [ ] v6 sstable table format (61-byte footer + attributes), the in-sstable `blob-reference-index`
-    block, `NewFile5` blob-reference MANIFEST encoding, and the value-separation write path.
+  - [x] **Table format v6/v7 sstable reading (inline values).** The engine reads Pebble table
+    format v6 (57-byte footer + footer checksum) and v7 (61-byte footer + attributes word)
+    sstables. The footer-length handling already covered these; the remaining gap was that v6+
+    stores the metaindex (and properties) as a **columnar key-value block** (`colblk` two RawBytes
+    columns) rather than the legacy row block — `colblk::decode_key_value_block` + a format-aware
+    metaindex reader handle both. Verified by a checked-in real Pebble v7 fixture
+    (`pebble_v2_v7_inline.sst`, written at `FormatValueSeparation` with values inline). A v6/v7
+    table whose values are *separated* additionally needs the items below.
+  - [ ] The in-sstable `blob-reference-index` block + per-row blob handles (so a v6/v7 table with
+    *separated* values resolves them against the native blob files), `NewFile5` blob-reference
+    MANIFEST encoding, and the value-separation write path.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the

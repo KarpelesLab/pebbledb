@@ -4641,3 +4641,26 @@ fn reads_pebble_v2_native_blob_file_fixture() {
         assert_eq!(v.as_slice(), want.as_bytes(), "blob value {i}");
     }
 }
+
+/// Reads a real Pebble v2 table-format-v7 sstable (written at `FormatValueSeparation` but with
+/// values stored inline — no value separation). The v7 footer is 61 bytes (it adds an attributes
+/// word and a footer checksum over the v5 columnar footer); the data blocks are still columnar, so
+/// the engine reads it through the same columnar path once the footer length is recognized.
+#[test]
+fn reads_pebble_v2_table_format_v7_inline_fixture() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::sstable::Reader;
+
+    let bytes = include_bytes!("fixtures/pebble_v2_v7_inline.sst").to_vec();
+    let reader = Arc::new(Reader::open(bytes, Arc::new(DefaultComparer)).expect("open v7 sstable"));
+    assert!(reader.format().is_columnar());
+
+    for i in 0..50u32 {
+        let k = format!("key{i:04}");
+        let got = reader
+            .get(k.as_bytes(), u64::MAX)
+            .expect("lookup")
+            .map(|(_, v)| v);
+        assert_eq!(got.as_deref(), Some(format!("value{i}").as_bytes()), "{k}");
+    }
+}

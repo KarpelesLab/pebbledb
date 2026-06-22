@@ -958,6 +958,24 @@ impl IndexBlockBuilder {
     }
 }
 
+/// Reads a columnar key-value block, returning its `(key, value)` rows. Pebble's table format v6+
+/// stores the metaindex and properties blocks in this format (a `colblk` block with two RawBytes
+/// columns: key, value) rather than the legacy row block format.
+pub fn decode_key_value_block(block: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let header = BlockHeader::parse(block)?;
+    if header.columns.len() < 2 {
+        return Err(Error::corruption(
+            "colblk: unexpected key-value-block column count",
+        ));
+    }
+    let rows = header.rows as usize;
+    let (keys, _) = decode_raw_bytes(block, header.columns[0].page_offset as usize, rows)?;
+    let (values, _) = decode_raw_bytes(block, header.columns[1].page_offset as usize, rows)?;
+    Ok((0..rows)
+        .map(|i| (keys[i].to_vec(), values[i].to_vec()))
+        .collect())
+}
+
 /// Reads a columnar index block, returning its entries.
 pub fn decode_index_block(block: &[u8]) -> Result<Vec<IndexEntry>> {
     let header = BlockHeader::parse(block)?;
