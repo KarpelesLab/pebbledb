@@ -134,8 +134,19 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   lookups + iteration, and the open ceiling is raised to `COLUMNAR_BLOCKS` (19). Verified by a
   checked-in Pebble columnar sstable fixture and a `generate-columnar` interop CI step (Go writes
   columnar → Rust reads). New databases still default to the row format.
-  - [ ] **Columnar keyspan + out-of-line values:** decode columnar range-del / range-key blocks
-    and out-of-line (value-block) columnar values so a columnar table using those reads fully.
+  - [x] **Columnar keyspan blocks (range-del / range-key).** The `colblk` keyspan block matches
+    Pebble v2.1.6's boundary-based layout (a 4-byte custom header carrying the unique-boundary-key
+    count, then five columns: boundary user keys, boundary key indices, key trailers, suffixes,
+    values), and `ColumnarReader::keyspans` reads them via the metaindex (`rocksdb.range_del2` /
+    `pebble.range_key`), reconstructs fragmented spans, and re-encodes them into the engine's
+    `RangeTombstone` / `RangeKeyEntry` representation so the full read path applies them. Also
+    fixed: the `colblk` bool-bitmap encoding bytes (`default = 0`, `zero = 1`) now match Pebble,
+    so the data block's is-value-external column decodes correctly and out-of-line columnar values
+    are detected and rejected (read support pending below). Verified by a checked-in Pebble
+    columnar-spans fixture, the `generate-columnar-spans` interop CI step (Go writes → Rust reads),
+    and a byte-identical regeneration of the fixture from the Go tool.
+  - [ ] **Out-of-line columnar values:** decode out-of-line (value-block) columnar values — flagged
+    by the is-value-external column — so a columnar table that separates large values reads fully.
   - [ ] **Columnar write path:** the engine still flushes/compacts to the row format; emitting
     columnar tables (and a Rust→Go columnar interop direction) is a separate step.
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff

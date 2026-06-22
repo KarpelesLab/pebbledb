@@ -4409,3 +4409,54 @@ fn reads_pebble_v2_columnar_sstable_fixture() {
     }
     assert_eq!(n, 100, "columnar scan should yield 100 keys");
 }
+
+/// Reads a real Pebble v2 columnar sstable that carries keyspans — a range deletion and a range
+/// key — proving the columnar keyspan (boundary-based) block decodes byte-for-byte. The fixture
+/// was produced by Pebble v2.1.6 with keys key00000..key00019 => value0..value19, a
+/// `DeleteRange[key00005, key00010)`, and a `RangeKeySet[key00012, key00015)@1 = "rkval"`.
+#[test]
+fn reads_pebble_v2_columnar_keyspans_fixture() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::base::internal_key::InternalKeyKind;
+    use pebbledb::base::range_key::{decode_end, decode_set_suffix_values};
+    use pebbledb::sstable::Reader;
+
+    let bytes = include_bytes!("fixtures/pebble_v2_columnar_spans.sst").to_vec();
+    let reader = Arc::new(Reader::open(bytes, Arc::new(DefaultComparer)).expect("open columnar"));
+
+    // Point keys still read back — except key00005..key00009, which Pebble elided during the
+    // flush because the DeleteRange[key00005, key00010) covers them at a higher sequence number.
+    for i in 0..20u32 {
+        let k = format!("key{i:05}");
+        let got = reader
+            .get(k.as_bytes(), u64::MAX)
+            .expect("lookup")
+            .map(|(_, v)| v);
+        if (5..10).contains(&i) {
+            assert_eq!(
+                got, None,
+                "{k} should have been elided by the range deletion"
+            );
+        } else {
+            assert_eq!(got.as_deref(), Some(format!("value{i}").as_bytes()));
+        }
+    }
+
+    // The range deletion [key00005, key00010) is surfaced.
+    let dels = reader.range_tombstones();
+    assert_eq!(dels.len(), 1, "one range deletion");
+    assert_eq!(dels[0].start, b"key00005");
+    assert_eq!(dels[0].end, b"key00010");
+
+    // The range key set [key00012, key00015)@1 = "rkval" is surfaced.
+    let rks = reader.range_keys();
+    assert_eq!(rks.len(), 1, "one range key");
+    assert_eq!(rks[0].kind, InternalKeyKind::RangeKeySet);
+    assert_eq!(rks[0].start, b"key00012");
+    let (end, payload) = decode_end(rks[0].kind, &rks[0].value).expect("decode end");
+    assert_eq!(end, b"key00015");
+    let svs = decode_set_suffix_values(payload).expect("decode set suffix/values");
+    assert_eq!(svs.len(), 1);
+    assert_eq!(svs[0].suffix, b"@1");
+    assert_eq!(svs[0].value, b"rkval");
+}

@@ -25,13 +25,21 @@
 use std::sync::Arc;
 
 use crate::base::comparer::Comparer;
-use crate::base::internal_key::{encoded_trailer, encoded_user_key};
+use crate::base::internal_key::{
+    InternalKeyKind, encoded_trailer, encoded_user_key, trailer_kind, trailer_seqnum,
+};
+use crate::base::range_del::RangeTombstone;
+use crate::base::range_key::{
+    RangeKeyEntry, SuffixValue, encode_del_value, encode_set_value, encode_unset_value,
+};
 use crate::{Error, Result};
 
-use super::block::{BlockHandle, ChecksumType, CompressionType, read_block};
+use super::block::{BlockHandle, BlockIter, ChecksumType, CompressionType, read_block};
 use super::colblk;
 use super::keyschema::{DefaultKeySchema, KeySchema};
-use super::properties::{META_PROPERTIES_NAME, Properties};
+use super::properties::{
+    META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME, Properties,
+};
 use super::writer::{BlockBuilder, WriterOptions, encode_footer, write_block};
 use super::{TableFormat, parse_footer};
 
@@ -188,6 +196,8 @@ pub struct ColumnarReader {
     cmp: Arc<dyn Comparer>,
     schema: DefaultKeySchema,
     checksum: ChecksumType,
+    /// The metaindex block handle, used to locate the keyspan (range-del / range-key) blocks.
+    metaindex: BlockHandle,
     /// Index entries: each data block's last user key and its handle.
     index: Vec<(Vec<u8>, BlockHandle)>,
 }
@@ -220,8 +230,83 @@ impl ColumnarReader {
             cmp,
             schema,
             checksum: footer.checksum,
+            metaindex: footer.metaindex,
             index,
         })
+    }
+
+    /// Reads the metaindex and decodes the columnar keyspan blocks (range deletions and range
+    /// keys), converting them to the engine's `RangeTombstone` / `RangeKeyEntry` representation.
+    ///
+    /// Columnar range-del / range-key blocks use the boundary-based keyspan layout
+    /// ([`colblk::decode_keyspan_block`]); each fragment's keys are re-encoded into the same
+    /// row-format payload (`varstr(end) | …`) the rest of the engine consumes, so a columnar
+    /// table with spans surfaces them identically to a row table.
+    pub fn keyspans(&self) -> Result<(Vec<RangeTombstone>, Vec<RangeKeyEntry>)> {
+        let metaindex = read_block(&self.file, self.metaindex, self.checksum)?;
+        let mut it = BlockIter::new(metaindex)?;
+        it.first();
+        let mut range_del_handle = None;
+        let mut range_key_handle = None;
+        while it.valid() {
+            let key = it.key();
+            if key == META_RANGE_DEL_NAME.as_bytes() {
+                range_del_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+            } else if key == META_RANGE_KEY_NAME.as_bytes() {
+                range_key_handle = BlockHandle::decode(it.value()).map(|(h, _)| h);
+            }
+            it.next();
+        }
+
+        let mut range_dels = Vec::new();
+        if let Some(handle) = range_del_handle {
+            let block = read_block(&self.file, handle, self.checksum)?;
+            for span in colblk::decode_keyspan_block(&block)? {
+                for k in &span.keys {
+                    range_dels.push(RangeTombstone::new(
+                        span.start.clone(),
+                        span.end.clone(),
+                        trailer_seqnum(k.trailer),
+                    ));
+                }
+            }
+        }
+
+        let mut range_keys = Vec::new();
+        if let Some(handle) = range_key_handle {
+            let block = read_block(&self.file, handle, self.checksum)?;
+            for span in colblk::decode_keyspan_block(&block)? {
+                for k in &span.keys {
+                    let kind = trailer_kind(k.trailer);
+                    let value = match kind {
+                        InternalKeyKind::RangeKeySet => encode_set_value(
+                            &span.end,
+                            &[SuffixValue {
+                                suffix: k.suffix.clone(),
+                                value: k.value.clone(),
+                            }],
+                        ),
+                        InternalKeyKind::RangeKeyUnset => {
+                            encode_unset_value(&span.end, std::slice::from_ref(&k.suffix))
+                        }
+                        InternalKeyKind::RangeKeyDelete => encode_del_value(&span.end),
+                        _ => {
+                            return Err(Error::corruption(
+                                "columnar: unexpected range-key kind in keyspan block",
+                            ));
+                        }
+                    };
+                    range_keys.push(RangeKeyEntry {
+                        kind,
+                        start: span.start.clone(),
+                        seqnum: trailer_seqnum(k.trailer),
+                        value,
+                    });
+                }
+            }
+        }
+
+        Ok((range_dels, range_keys))
     }
 
     /// Reads and decodes the columnar data block at `handle` into its rows.

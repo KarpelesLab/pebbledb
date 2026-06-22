@@ -29,3 +29,31 @@ fn reads_database_written_by_go_pebble() {
         );
     }
 }
+
+/// Reads a Go-written **columnar** database that carries keyspans (a range deletion and a range
+/// key). Gated on `PEBBLEDB_INTEROP_SPANS_DIR`. Verifies that the columnar keyspan blocks decode
+/// through the full read path: the range deletion `[key00005, key00010)` removes those point keys,
+/// while the surrounding keys remain. (The offline fixture test
+/// `reads_pebble_v2_columnar_keyspans_fixture` additionally checks the range key payload.)
+#[test]
+fn reads_columnar_spans_database_written_by_go_pebble() {
+    let Ok(dir) = std::env::var("PEBBLEDB_INTEROP_SPANS_DIR") else {
+        eprintln!("PEBBLEDB_INTEROP_SPANS_DIR unset; skipping Go columnar-spans interop test");
+        return;
+    };
+
+    let db = Db::open_read_only(&dir, Options::default()).expect("open Go-written spans DB");
+    for i in 0..20u32 {
+        let k = format!("key{i:05}");
+        let got = db.get(k.as_bytes()).unwrap();
+        if (5..10).contains(&i) {
+            assert_eq!(got, None, "{k} should be removed by the range deletion");
+        } else {
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("value{i}").as_bytes()),
+                "key {k} read from Go-written columnar DB"
+            );
+        }
+    }
+}

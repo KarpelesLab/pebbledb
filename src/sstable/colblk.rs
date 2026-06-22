@@ -964,21 +964,54 @@ pub fn decode_index_block(block: &[u8]) -> Result<Vec<IndexEntry>> {
 // ---------------------------------------------------------------------------
 // Columnar keyspan block
 //
-// Encodes fragmented key spans (range deletions / range keys). Columns: start user key
-// (raw bytes), end user key (raw bytes), trailer (uint), value (raw bytes).
+// Encodes fragmented key spans (range deletions / range keys) in Pebble v2's boundary-based
+// layout. A 4-byte custom header holds the count of unique boundary user keys; the shared
+// columnar header's row count is the number of `keyspan.Key`s. Five columns:
+//   0 boundary user keys (bytes)         — userKeyCount entries
+//   1 boundary key indices (uint)        — userKeyCount entries; the key-array index at which
+//                                          the span starting at this boundary begins
+//   2 key trailers (uint)                — keyCount entries
+//   3 key suffixes (bytes)               — keyCount entries
+//   4 key values (bytes)                 — keyCount entries
+// Span i covers `[boundary[i], boundary[i+1])` and owns keys `[indices[i], indices[i+1])`;
+// a boundary whose index range is empty is a gap between non-abutting spans.
 // ---------------------------------------------------------------------------
 
-const KEYSPAN_BLOCK_COLUMNS: usize = 4;
+const KEYSPAN_BLOCK_COLUMNS: usize = 5;
+/// The keyspan block's 4-byte custom header holds the boundary-user-key count.
+const KEYSPAN_HEADER_SIZE: usize = 4;
 
-/// One key span: `(start, end, trailer, value)`.
-pub type KeyspanEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>);
+/// One key within a span: its trailer (sequence number + kind), suffix, and value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspanKey {
+    /// The internal-key trailer (`seqnum << 8 | kind`).
+    pub trailer: u64,
+    /// The optional suffix the key is associated with (empty for range deletions).
+    pub suffix: Vec<u8>,
+    /// The key's value (empty for range deletions).
+    pub value: Vec<u8>,
+}
+
+/// A decoded fragmented span `[start, end)` and the keys it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspanSpan {
+    /// The span's inclusive start user key.
+    pub start: Vec<u8>,
+    /// The span's exclusive end user key.
+    pub end: Vec<u8>,
+    /// The keys (range deletion / range key operations) over this span.
+    pub keys: Vec<KeyspanKey>,
+}
 
 /// Builds a columnar keyspan block.
 #[derive(Default)]
 pub struct KeyspanBlockBuilder {
-    starts: Vec<Vec<u8>>,
-    ends: Vec<Vec<u8>>,
+    /// Boundary user keys, in sorted order (abutting spans share a boundary).
+    boundary_keys: Vec<Vec<u8>>,
+    /// For each boundary key, the key-array index at which its span begins.
+    boundary_indices: Vec<u64>,
     trailers: Vec<u64>,
+    suffixes: Vec<Vec<u8>>,
     values: Vec<Vec<u8>>,
 }
 
@@ -988,42 +1021,62 @@ impl KeyspanBlockBuilder {
         KeyspanBlockBuilder::default()
     }
 
-    /// Adds a fragmented span `[start, end)` with the given trailer and value.
-    pub fn add(&mut self, start: &[u8], end: &[u8], trailer: u64, value: &[u8]) {
-        self.starts.push(start.to_vec());
-        self.ends.push(end.to_vec());
-        self.trailers.push(trailer);
-        self.values.push(value.to_vec());
+    /// Appends a fragmented span `[start, end)` with its keys. Spans must be added in sorted,
+    /// non-overlapping order. When a span abuts the previous one (its start equals the previous
+    /// span's end), the shared boundary user key is encoded only once, matching Pebble.
+    pub fn add_span(&mut self, start: &[u8], end: &[u8], keys: &[KeyspanKey]) {
+        let key_count = self.trailers.len() as u64;
+        let abuts = self
+            .boundary_keys
+            .last()
+            .is_some_and(|last| last.as_slice() == start);
+        if !abuts {
+            self.boundary_indices.push(key_count);
+            self.boundary_keys.push(start.to_vec());
+        }
+        self.boundary_indices.push(key_count + keys.len() as u64);
+        self.boundary_keys.push(end.to_vec());
+        for k in keys {
+            self.trailers.push(k.trailer);
+            self.suffixes.push(k.suffix.clone());
+            self.values.push(k.value.clone());
+        }
     }
 
     /// Serializes the keyspan block.
     pub fn finish(&self) -> Vec<u8> {
-        let rows = self.trailers.len();
+        let key_count = self.trailers.len();
         let mut buf = Vec::new();
+        // 4-byte custom header: the number of boundary user keys.
+        buf.extend_from_slice(&(self.boundary_keys.len() as u32).to_le_bytes());
+        // Shared columnar header; its row count is the keyspan.Key count.
         buf.push(DATA_BLOCK_VERSION);
         buf.extend_from_slice(&(KEYSPAN_BLOCK_COLUMNS as u16).to_le_bytes());
-        buf.extend_from_slice(&(rows as u32).to_le_bytes());
+        buf.extend_from_slice(&(key_count as u32).to_le_bytes());
         let headers_at = buf.len();
         buf.resize(headers_at + KEYSPAN_BLOCK_COLUMNS * COLUMN_HEADER_LEN, 0);
 
-        let start_refs: Vec<&[u8]> = self.starts.iter().map(|s| s.as_slice()).collect();
-        let end_refs: Vec<&[u8]> = self.ends.iter().map(|s| s.as_slice()).collect();
-        let val_refs: Vec<&[u8]> = self.values.iter().map(|s| s.as_slice()).collect();
+        let boundary_refs: Vec<&[u8]> = self.boundary_keys.iter().map(|s| s.as_slice()).collect();
+        let suffix_refs: Vec<&[u8]> = self.suffixes.iter().map(|s| s.as_slice()).collect();
+        let value_refs: Vec<&[u8]> = self.values.iter().map(|s| s.as_slice()).collect();
 
-        let start_off = buf.len();
-        encode_raw_bytes(&start_refs, start_off, &mut buf);
-        let end_off = buf.len();
-        encode_raw_bytes(&end_refs, end_off, &mut buf);
+        let boundary_off = buf.len();
+        encode_raw_bytes(&boundary_refs, boundary_off, &mut buf);
+        let indices_off = buf.len();
+        encode_uint_column(&self.boundary_indices, indices_off, &mut buf);
         let trailer_off = buf.len();
         encode_uint_column(&self.trailers, trailer_off, &mut buf);
+        let suffix_off = buf.len();
+        encode_raw_bytes(&suffix_refs, suffix_off, &mut buf);
         let value_off = buf.len();
-        encode_raw_bytes(&val_refs, value_off, &mut buf);
-        buf.push(0);
+        encode_raw_bytes(&value_refs, value_off, &mut buf);
+        buf.push(0); // trailing padding byte
 
         for (i, (ty, off)) in [
-            (3u8, start_off),
-            (3u8, end_off),
+            (3u8, boundary_off),
+            (2u8, indices_off),
             (2u8, trailer_off),
+            (3u8, suffix_off),
             (3u8, value_off),
         ]
         .iter()
@@ -1037,29 +1090,61 @@ impl KeyspanBlockBuilder {
     }
 }
 
-/// Reads a columnar keyspan block, returning its spans.
-pub fn decode_keyspan_block(block: &[u8]) -> Result<Vec<KeyspanEntry>> {
-    let header = BlockHeader::parse(block)?;
+/// Reads a columnar keyspan block, reconstructing its fragmented spans.
+pub fn decode_keyspan_block(block: &[u8]) -> Result<Vec<KeyspanSpan>> {
+    if block.len() < KEYSPAN_HEADER_SIZE {
+        return Err(Error::corruption(
+            "colblk: keyspan block smaller than header",
+        ));
+    }
+    let user_key_count = u32::from_le_bytes([block[0], block[1], block[2], block[3]]) as usize;
+    let header = BlockHeader::parse_at(block, KEYSPAN_HEADER_SIZE)?;
     if header.columns.len() != KEYSPAN_BLOCK_COLUMNS {
         return Err(Error::corruption(
             "colblk: unexpected keyspan-block column count",
         ));
     }
-    let rows = header.rows as usize;
-    let (starts, _) = decode_raw_bytes(block, header.columns[0].page_offset as usize, rows)?;
-    let (ends, _) = decode_raw_bytes(block, header.columns[1].page_offset as usize, rows)?;
-    let (trailers, _) = decode_uint_column(block, header.columns[2].page_offset as usize, rows)?;
-    let (values, _) = decode_raw_bytes(block, header.columns[3].page_offset as usize, rows)?;
-    Ok((0..rows)
-        .map(|i| {
-            (
-                starts[i].to_vec(),
-                ends[i].to_vec(),
-                trailers[i],
-                values[i].to_vec(),
-            )
-        })
-        .collect())
+    let key_count = header.rows as usize;
+    let (boundary_keys, _) = decode_raw_bytes(
+        block,
+        header.columns[0].page_offset as usize,
+        user_key_count,
+    )?;
+    let (indices, _) = decode_uint_column(
+        block,
+        header.columns[1].page_offset as usize,
+        user_key_count,
+    )?;
+    let (trailers, _) =
+        decode_uint_column(block, header.columns[2].page_offset as usize, key_count)?;
+    let (suffixes, _) = decode_raw_bytes(block, header.columns[3].page_offset as usize, key_count)?;
+    let (values, _) = decode_raw_bytes(block, header.columns[4].page_offset as usize, key_count)?;
+
+    let mut spans = Vec::new();
+    for i in 0..user_key_count.saturating_sub(1) {
+        let klo = indices[i] as usize;
+        let khi = indices[i + 1] as usize;
+        if klo >= khi {
+            // Gap between non-abutting spans: this boundary owns no keys.
+            continue;
+        }
+        if khi > key_count {
+            return Err(Error::corruption("colblk: keyspan key index out of range"));
+        }
+        let keys = (klo..khi)
+            .map(|k| KeyspanKey {
+                trailer: trailers[k],
+                suffix: suffixes[k].to_vec(),
+                value: values[k].to_vec(),
+            })
+            .collect();
+        spans.push(KeyspanSpan {
+            start: boundary_keys[i].to_vec(),
+            end: boundary_keys[i + 1].to_vec(),
+            keys,
+        });
+    }
+    Ok(spans)
 }
 
 #[cfg(test)]
@@ -1087,15 +1172,81 @@ mod block_tests {
     #[test]
     fn keyspan_block_roundtrips() {
         let mut b = KeyspanBlockBuilder::new();
-        b.add(b"a", b"e", 0xff00, b"");
-        b.add(b"f", b"g", 0x1234, b"payload");
+        // A range deletion (no suffix/value), an abutting span sharing the "g" boundary, and a
+        // span carrying two keys (e.g. a range-key set + unset over the same fragment).
+        b.add_span(
+            b"a",
+            b"e",
+            &[KeyspanKey {
+                trailer: 0xff00,
+                suffix: b"".to_vec(),
+                value: b"".to_vec(),
+            }],
+        );
+        b.add_span(
+            b"f",
+            b"g",
+            &[KeyspanKey {
+                trailer: 0x1234,
+                suffix: b"".to_vec(),
+                value: b"payload".to_vec(),
+            }],
+        );
+        b.add_span(
+            b"g",
+            b"m",
+            &[
+                KeyspanKey {
+                    trailer: 0x2115,
+                    suffix: b"@5".to_vec(),
+                    value: b"v5".to_vec(),
+                },
+                KeyspanKey {
+                    trailer: 0x2017,
+                    suffix: b"@3".to_vec(),
+                    value: b"".to_vec(),
+                },
+            ],
+        );
         let block = b.finish();
         let got = decode_keyspan_block(&block).unwrap();
         assert_eq!(
             got,
             vec![
-                (b"a".to_vec(), b"e".to_vec(), 0xff00, b"".to_vec()),
-                (b"f".to_vec(), b"g".to_vec(), 0x1234, b"payload".to_vec()),
+                KeyspanSpan {
+                    start: b"a".to_vec(),
+                    end: b"e".to_vec(),
+                    keys: vec![KeyspanKey {
+                        trailer: 0xff00,
+                        suffix: b"".to_vec(),
+                        value: b"".to_vec()
+                    }],
+                },
+                KeyspanSpan {
+                    start: b"f".to_vec(),
+                    end: b"g".to_vec(),
+                    keys: vec![KeyspanKey {
+                        trailer: 0x1234,
+                        suffix: b"".to_vec(),
+                        value: b"payload".to_vec()
+                    }],
+                },
+                KeyspanSpan {
+                    start: b"g".to_vec(),
+                    end: b"m".to_vec(),
+                    keys: vec![
+                        KeyspanKey {
+                            trailer: 0x2115,
+                            suffix: b"@5".to_vec(),
+                            value: b"v5".to_vec()
+                        },
+                        KeyspanKey {
+                            trailer: 0x2017,
+                            suffix: b"@3".to_vec(),
+                            value: b"".to_vec()
+                        },
+                    ],
+                },
             ]
         );
     }

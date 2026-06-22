@@ -360,6 +360,7 @@ impl Reader {
             // the columnar block format shares nothing with the row block cursor.
             let cr = columnar::ColumnarReader::open(Arc::clone(&file), cmp.clone())?;
             let rows: Arc<[(Vec<u8>, Vec<u8>)]> = cr.iter_all()?.into();
+            let (range_dels, range_keys) = cr.keyspans()?;
             return Ok(Reader {
                 file,
                 cmp,
@@ -370,10 +371,8 @@ impl Reader {
                 blob_refs: Vec::new(),
                 props: Properties::default(),
                 filter: None,
-                // TODO: columnar keyspan blocks (range deletions / range keys) are not yet
-                // decoded; a columnar table with spans would surface none here.
-                range_dels: Vec::new(),
-                range_keys: Vec::new(),
+                range_dels,
+                range_keys,
                 two_level: false,
                 file_num,
                 blob_resolver: None,
