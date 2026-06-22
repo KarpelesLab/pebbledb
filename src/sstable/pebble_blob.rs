@@ -52,6 +52,56 @@ pub struct Handle {
     pub value_id: u32,
 }
 
+/// A blob handle as encoded inline within an sstable value column (after the value-prefix byte).
+/// It does not name the blob file directly: `reference_id` indexes into the sstable's ordered blob
+/// references (recorded in the MANIFEST) to find the blob file number; `block_id` / `value_id` then
+/// locate the value within that file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineHandle {
+    /// Index into the sstable's blob references (→ a blob file number).
+    pub reference_id: u32,
+    /// The value's length in bytes.
+    pub value_len: u32,
+    /// The block within the referenced blob file.
+    pub block_id: u32,
+    /// The value within that block.
+    pub value_id: u32,
+}
+
+impl InlineHandle {
+    /// The `(block_id, value_id)` location of this handle's value within its blob file.
+    pub fn location(self) -> Handle {
+        Handle {
+            block_id: self.block_id,
+            value_id: self.value_id,
+        }
+    }
+}
+
+/// The value-prefix byte that marks a columnar value column entry as an inline blob handle
+/// (Pebble's `block.ValuePrefix` blob bit). The handle's four varints follow it.
+pub const BLOB_VALUE_PREFIX: u8 = 0x40;
+
+/// Decodes an inline blob handle: four uvarints `(reference_id, value_len, block_id, value_id)`.
+/// `src` must start at the first varint (i.e. after any value-prefix byte).
+pub fn decode_inline_handle(src: &[u8]) -> Result<InlineHandle> {
+    use crate::base::varint::get_uvarint;
+    let (reference_id, n1) = get_uvarint(src)
+        .ok_or_else(|| Error::corruption("pebble blob: bad inline reference id"))?;
+    let (value_len, n2) = get_uvarint(&src[n1..])
+        .ok_or_else(|| Error::corruption("pebble blob: bad inline value len"))?;
+    let (block_id, n3) = get_uvarint(&src[n1 + n2..])
+        .ok_or_else(|| Error::corruption("pebble blob: bad inline block id"))?;
+    let (value_id, _) = get_uvarint(&src[n1 + n2 + n3..])
+        .ok_or_else(|| Error::corruption("pebble blob: bad inline value id"))?;
+    Ok(InlineHandle {
+        reference_id: reference_id as u32,
+        value_len: value_len as u32,
+        block_id: block_id as u32,
+        value_id: value_id as u32,
+    })
+}
+
 /// Reads values from a Pebble native blob file held in memory.
 pub struct PebbleBlobReader {
     file: Arc<[u8]>,
@@ -158,5 +208,38 @@ impl PebbleBlobReader {
             out.extend(self.read_block_values(b)?);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_inline_handle() {
+        // `00 3c 00 00` = (reference_id=0, value_len=60, block_id=0, value_id=0), the encoding of
+        // a separated 60-byte value observed in a real Pebble v6 data block (after the 0x40 prefix).
+        let h = decode_inline_handle(&[0x00, 0x3c, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            h,
+            InlineHandle {
+                reference_id: 0,
+                value_len: 60,
+                block_id: 0,
+                value_id: 0,
+            }
+        );
+        assert_eq!(
+            h.location(),
+            Handle {
+                block_id: 0,
+                value_id: 0
+            }
+        );
+
+        // value_id 4 in the same block/reference.
+        let h2 = decode_inline_handle(&[0x00, 0x3c, 0x00, 0x04]).unwrap();
+        assert_eq!(h2.value_id, 4);
+        assert_eq!(h2.value_len, 60);
     }
 }
