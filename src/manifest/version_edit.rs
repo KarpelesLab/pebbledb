@@ -315,7 +315,8 @@ impl VersionEdit {
             // NewFile2.
             let needs_custom = nf.meta.backing.is_some()
                 || nf.meta.has_spans.is_some()
-                || !nf.meta.blob_refs.is_empty();
+                || !nf.meta.blob_refs.is_empty()
+                || !nf.meta.pebble_blob_refs.is_empty();
             let tag = if needs_custom {
                 TAG_NEW_FILE4
             } else {
@@ -349,8 +350,35 @@ impl VersionEdit {
                     put_uvarint(&mut buf, CUSTOM_TAG_BLOB_REFS);
                     put_bytes(&mut buf, &payload);
                 }
+                if !nf.meta.pebble_blob_refs.is_empty() {
+                    // Pebble's standard blob-reference tag: depth, count, then (blob_file_id,
+                    // value_size) per reference. We do not track value sizes, so they are encoded
+                    // as 0; reference depth is encoded as 1.
+                    put_uvarint(&mut buf, CUSTOM_TAG_BLOB_REFERENCES);
+                    put_uvarint(&mut buf, 1); // blob reference depth
+                    put_uvarint(&mut buf, nf.meta.pebble_blob_refs.len() as u64);
+                    for &file_id in &nf.meta.pebble_blob_refs {
+                        put_uvarint(&mut buf, file_id);
+                        put_uvarint(&mut buf, 0); // value size (unknown)
+                    }
+                }
                 put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
             }
+        }
+        for (file_id, file_num) in &self.new_blob_files {
+            // tagNewBlobFile: file_id, file_num, size, value_size, creation_time. Sizes are not
+            // tracked here, so they are encoded as 0.
+            put_uvarint(&mut buf, TAG_NEW_BLOB_FILE);
+            put_uvarint(&mut buf, *file_id);
+            put_uvarint(&mut buf, *file_num);
+            put_uvarint(&mut buf, 0); // size
+            put_uvarint(&mut buf, 0); // value size
+            put_uvarint(&mut buf, 0); // creation time
+        }
+        for (file_id, file_num) in &self.deleted_blob_files {
+            put_uvarint(&mut buf, TAG_DELETED_BLOB_FILE);
+            put_uvarint(&mut buf, *file_id);
+            put_uvarint(&mut buf, *file_num);
         }
         buf
     }
@@ -567,6 +595,24 @@ mod tests {
         let bytes = edit.encode();
         let got = VersionEdit::decode(&bytes).unwrap();
         assert_eq!(got, edit);
+    }
+
+    #[test]
+    fn blob_file_records_and_pebble_refs_roundtrip() {
+        // A new file referencing Pebble blob files, plus NewBlobFile/DeletedBlobFile records,
+        // round-trip through encode/decode.
+        let mut m = meta(10, "a", "z", 100, 200);
+        m.pebble_blob_refs = vec![3, 5];
+        let edit = VersionEdit {
+            new_files: vec![NewFileEntry { level: 1, meta: m }],
+            new_blob_files: vec![(3, 6), (5, 7)],
+            deleted_blob_files: vec![(2, 4)],
+            ..Default::default()
+        };
+        let got = VersionEdit::decode(&edit.encode()).unwrap();
+        assert_eq!(got.new_files[0].meta.pebble_blob_refs, vec![3, 5]);
+        assert_eq!(got.new_blob_files, vec![(3, 6), (5, 7)]);
+        assert_eq!(got.deleted_blob_files, vec![(2, 4)]);
     }
 
     #[test]
