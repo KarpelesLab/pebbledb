@@ -1212,6 +1212,10 @@ impl DbInner {
             &names,
             &filenames::manifest(manifest_num),
         )?;
+        // Record the format major version in the marker Pebble treats as authoritative, so
+        // upstream Pebble (which reads the marker, not OPTIONS) can open a database this engine
+        // wrote. Pebble v2 rejects the absent-marker default (format 1).
+        write_format_version_marker(fs.as_ref(), &dir, &names, format_major_version)?;
         fs.sync_dir(&dir)?;
 
         // Persist any data recovered from un-flushed WALs to L0 sstables now (each recovered
@@ -1406,6 +1410,10 @@ impl DbInner {
                 f.write_all(of.encode().as_bytes())?;
                 f.sync_all()?;
             }
+            // Keep the authoritative format-version marker in step with OPTIONS so upstream
+            // Pebble sees the ratcheted version.
+            let names = self.fs.list(&self.dir).unwrap_or_default();
+            write_format_version_marker(self.fs.as_ref(), &self.dir, &names, next)?;
             self.fs.sync_dir(&self.dir)?;
             *cur = next;
             self.log(&format!(
@@ -3753,6 +3761,39 @@ fn update_marker(fs: &dyn Fs, dir: &Path, names: &[String], value: &str) -> Resu
         f.sync_all()?;
     }
     fs.rename(&tmp, &dir.join("CURRENT"))?;
+    Ok(())
+}
+
+/// Writes the `marker.format-version.<iter>.<VVV>` marker (Pebble's authoritative record of the
+/// on-disk format major version, with the value zero-padded to three digits as Pebble formats
+/// it), bumping the iteration past any existing one and removing superseded markers.
+fn write_format_version_marker(
+    fs: &dyn Fs,
+    dir: &Path,
+    names: &[String],
+    version: FormatMajorVersion,
+) -> Result<()> {
+    let mut max_iter = 0u64;
+    let mut old: Vec<&String> = Vec::new();
+    for n in names {
+        if let Some(rest) = n.strip_prefix("marker.format-version.") {
+            old.push(n);
+            if let Some((iter_str, _)) = rest.split_once('.')
+                && let Ok(iter) = iter_str.parse::<u64>()
+            {
+                max_iter = max_iter.max(iter);
+            }
+        }
+    }
+    let new_name = format!(
+        "marker.format-version.{:06}.{:03}",
+        max_iter + 1,
+        version.as_u32()
+    );
+    fs.create(&dir.join(&new_name))?.sync_all()?;
+    for n in old {
+        let _ = fs.remove(&dir.join(n));
+    }
     Ok(())
 }
 

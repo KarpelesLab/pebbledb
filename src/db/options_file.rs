@@ -30,6 +30,10 @@ impl FormatMajorVersion {
     pub const RANGE_KEYS: FormatMajorVersion = FormatMajorVersion(7);
     /// Pebblev3 value blocks (separated values) are permitted on disk.
     pub const VALUE_BLOCKS: FormatMajorVersion = FormatMajorVersion(9);
+    /// Flushable ingestion; the classic row (block-based) sstable layout. This is the minimum
+    /// format major version upstream Pebble v2 still supports, so it is the most compatible
+    /// format for cross-engine interop with current Pebble.
+    pub const FLUSHABLE_INGEST: FormatMajorVersion = FormatMajorVersion(13);
     /// The newest format this implementation understands.
     pub const NEWEST: FormatMajorVersion = FormatMajorVersion(13);
 

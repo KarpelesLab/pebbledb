@@ -9,15 +9,18 @@
 //! cargo run --example interop_gen -- <dir>
 //! ```
 //!
-//! Writes `key0000..key0099` => `value0..value99` at the most-compatible format major
-//! version, then flushes so the data lands in an sstable.
+//! Writes `key0000..key0099` => `value0..value99` at a row (block-based) format major
+//! version that upstream Pebble v2 still supports, then flushes so the data lands in an
+//! sstable.
 
 use pebbledb::{Db, FormatMajorVersion, Options};
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: interop_gen <dir>");
     let opts = Options {
-        format_major_version: FormatMajorVersion::MOST_COMPATIBLE,
+        // Pebble v2 dropped the oldest formats; FLUSHABLE_INGEST (13) is its minimum and is
+        // still the classic row sstable layout, which Pebble v2 reads back.
+        format_major_version: FormatMajorVersion::FLUSHABLE_INGEST,
         ..Default::default()
     };
     let db = Db::open(&dir, opts).expect("open db");

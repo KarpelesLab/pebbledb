@@ -5,11 +5,11 @@
 // Command interop generates and verifies Pebble databases for cross-implementation
 // testing against the Rust pebbledb port.
 //
-//	interop generate <dir>   open <dir> as a fresh Pebble DB, write known keys, flush
-//	interop verify   <dir>   open <dir> read-only and verify the known keys
+//	interop generate          <dir>   write known keys in the row (block) sstable format
+//	interop generate-columnar <dir>   write known keys in the columnar sstable format
+//	interop verify            <dir>   open <dir> read-only and verify the known keys
 //
-// The keys are key0000..key0099 with values value0..value99. A conservative format
-// major version is used so the produced sstables are in a widely-compatible format.
+// The keys are key0000..key0099 with values value0..value99.
 package main
 
 import (
@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 const n = 100
@@ -33,7 +33,12 @@ func main() {
 	cmd, dir := os.Args[1], os.Args[2]
 	switch cmd {
 	case "generate":
-		generate(dir)
+		// FormatMinSupported is the oldest format v2 still supports — the classic row
+		// (block-based) sstable layout.
+		generate(dir, pebble.FormatMinSupported)
+	case "generate-columnar":
+		// FormatColumnarBlocks switches sstables to the columnar block layout.
+		generate(dir, pebble.FormatColumnarBlocks)
 	case "verify":
 		verify(dir)
 	default:
@@ -42,12 +47,9 @@ func main() {
 	}
 }
 
-func generate(dir string) {
-	// FormatMostCompatible keeps the on-disk sstables in the oldest, most broadly
-	// readable format so the Rust reader (which targets the classic row-block layout)
-	// can parse them.
+func generate(dir string, format pebble.FormatMajorVersion) {
 	db, err := pebble.Open(dir, &pebble.Options{
-		FormatMajorVersion: pebble.FormatMostCompatible,
+		FormatMajorVersion: format,
 	})
 	must(err)
 	for i := 0; i < n; i++ {
@@ -55,7 +57,7 @@ func generate(dir string) {
 	}
 	must(db.Flush())
 	must(db.Close())
-	fmt.Printf("generated %d keys in %s\n", n, dir)
+	fmt.Printf("generated %d keys in %s (format %v)\n", n, dir, format)
 }
 
 func verify(dir string) {
