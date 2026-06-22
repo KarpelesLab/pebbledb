@@ -958,6 +958,34 @@ impl IndexBlockBuilder {
     }
 }
 
+/// Encodes a columnar key-value block: two RawBytes columns (key, value), one row per entry.
+/// This is the format Pebble's table format v6+ uses for the metaindex and properties blocks.
+/// `entries` must be in the order the reader expects (e.g. sorted by name for the metaindex).
+pub fn encode_key_value_block(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let rows = entries.len();
+    let mut buf = Vec::new();
+    buf.push(DATA_BLOCK_VERSION);
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&(rows as u32).to_le_bytes());
+    let headers_at = buf.len();
+    buf.resize(headers_at + 2 * COLUMN_HEADER_LEN, 0);
+
+    let key_refs: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+    let val_refs: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
+    let key_off = buf.len();
+    encode_raw_bytes(&key_refs, key_off, &mut buf);
+    let val_off = buf.len();
+    encode_raw_bytes(&val_refs, val_off, &mut buf);
+    buf.push(0); // trailing padding
+
+    for (i, off) in [key_off, val_off].iter().enumerate() {
+        let h = headers_at + i * COLUMN_HEADER_LEN;
+        buf[h] = 3; // Bytes
+        buf[h + 1..h + 5].copy_from_slice(&(*off as u32).to_le_bytes());
+    }
+    buf
+}
+
 /// Reads a columnar key-value block, returning its `(key, value)` rows. Pebble's table format v6+
 /// stores the metaindex and properties blocks in this format (a `colblk` block with two RawBytes
 /// columns: key, value) rather than the legacy row block format.
@@ -1197,6 +1225,17 @@ pub fn decode_keyspan_block(block: &[u8]) -> Result<Vec<KeyspanSpan>> {
 #[cfg(test)]
 mod block_tests {
     use super::*;
+
+    #[test]
+    fn key_value_block_roundtrips() {
+        let entries = vec![
+            (b"pebble.range_key".to_vec(), b"\x01\x02".to_vec()),
+            (b"rocksdb.properties".to_vec(), b"\x03\x04\x05".to_vec()),
+            (b"rocksdb.range_del2".to_vec(), b"".to_vec()),
+        ];
+        let block = encode_key_value_block(&entries);
+        assert_eq!(decode_key_value_block(&block).unwrap(), entries);
+    }
 
     #[test]
     fn index_block_roundtrips() {
