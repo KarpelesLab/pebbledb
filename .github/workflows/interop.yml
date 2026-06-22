@@ -123,3 +123,11 @@ jobs:
 
       - name: Go reads the Rust-written columnar database
         run: ./target/interop-tool verify "$RUNNER_TEMP/from-rust-columnar-db"
+
+      # Reverse value separation: the engine writes a format-24 DB with native blob files; Go Pebble
+      # opens it and reads the separated values back.
+      - name: Rust generates a value-separated pebbledb database
+        run: cargo run --example interop_gen -- "$RUNNER_TEMP/from-rust-separated-db" separated
+
+      - name: Go reads the Rust-written value-separated database
+        run: ./target/interop-tool verify "$RUNNER_TEMP/from-rust-separated-db"

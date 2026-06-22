@@ -64,6 +64,7 @@ pub type ColumnarOutput = (Vec<u8>, Option<(Vec<u8>, u64)>, Vec<u64>);
 /// RangeKeySets=1<<1, RangeKeyUnsets=1<<2, RangeKeyDels=1<<3, RangeDels=1<<4, TwoLevelIndex=1<<5,
 /// BlobValues=1<<6, PointKeys=1<<7.
 const ATTRIBUTE_RANGE_DELS: u32 = 1 << 4;
+const ATTRIBUTE_BLOB_VALUES: u32 = 1 << 6;
 const ATTRIBUTE_POINT_KEYS: u32 = 1 << 7;
 
 /// Property key under which the columnar key-schema name is recorded. Pebble reads its
@@ -93,6 +94,9 @@ pub struct ColumnarWriter {
     separated_any: bool,
     /// Total bytes of values written out-of-line (the blob file's value size).
     separated_value_bytes: u64,
+    /// Count of values written out-of-line (recorded as a property so a v7 reader derives the
+    /// blob-values attribute consistently with the footer).
+    separated_value_count: u64,
     index: colblk::IndexBlockBuilder,
     last_key: Vec<u8>,
     num_entries: u64,
@@ -135,6 +139,7 @@ impl ColumnarWriter {
             blob_file_num: 0,
             separated_any: false,
             separated_value_bytes: 0,
+            separated_value_count: 0,
             range_dels: Vec::new(),
             range_keys: Vec::new(),
         }
@@ -193,6 +198,7 @@ impl ColumnarWriter {
             let h = self.blob_writer.add_value(value);
             self.separated_any = true;
             self.separated_value_bytes += value.len() as u64;
+            self.separated_value_count += 1;
             // Inline blob handle: value-prefix 0x40 then uvarint(reference_id=0, value_len,
             // block_id, value_id). reference_id 0 indexes this sstable's single blob reference.
             let mut reference = vec![super::pebble_blob::VALUE_KIND_BLOB_HANDLE];
@@ -388,6 +394,7 @@ impl ColumnarWriter {
         let props = Properties {
             num_entries: self.num_entries,
             num_data_blocks: self.num_data_blocks,
+            num_values_in_blob_files: self.separated_value_count,
             num_range_deletions: self.range_dels.len() as u64,
             comparer_name: self.cmp.name().to_string(),
             merger_name: "nullptr".to_string(),
@@ -469,6 +476,9 @@ impl ColumnarWriter {
         }
         if !self.range_dels.is_empty() {
             attributes |= ATTRIBUTE_RANGE_DELS;
+        }
+        if self.separated_value_count > 0 {
+            attributes |= ATTRIBUTE_BLOB_VALUES;
         }
         let footer = encode_footer(
             self.opts.table_format,

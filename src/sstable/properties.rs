@@ -23,6 +23,7 @@ const RAW_VALUE_SIZE: &str = "rocksdb.raw.value.size";
 const NUM_DELETIONS: &str = "rocksdb.deleted.keys";
 const NUM_RANGE_DELETIONS: &str = "rocksdb.num.range-deletions";
 const NUM_DATA_BLOCKS: &str = "rocksdb.num.data.blocks";
+const NUM_VALUES_IN_BLOB_FILES: &str = "pebble.num.values.in.blob-files";
 const DATA_SIZE: &str = "rocksdb.data.size";
 const INDEX_SIZE: &str = "rocksdb.index.size";
 const INDEX_TYPE: &str = "rocksdb.block.based.table.index.type";
@@ -56,6 +57,9 @@ pub struct Properties {
     pub num_range_deletions: u64,
     /// Number of data blocks.
     pub num_data_blocks: u64,
+    /// Number of values stored out-of-line in native blob files (Pebble `FormatValueSeparation`).
+    /// Non-zero implies the table carries the blob-values attribute.
+    pub num_values_in_blob_files: u64,
     /// Total size of the data blocks.
     pub data_size: u64,
     /// Size of the index block.
@@ -114,6 +118,12 @@ impl Properties {
         ));
 
         // Optional integer properties: written only when non-zero.
+        if self.num_values_in_blob_files != 0 {
+            m.push((
+                NUM_VALUES_IN_BLOB_FILES.to_string(),
+                uvarint_bytes(self.num_values_in_blob_files),
+            ));
+        }
         if self.index_size != 0 {
             m.push((INDEX_SIZE.to_string(), uvarint_bytes(self.index_size)));
         }
@@ -171,6 +181,7 @@ impl Properties {
             NUM_DELETIONS,
             NUM_RANGE_DELETIONS,
             NUM_DATA_BLOCKS,
+            NUM_VALUES_IN_BLOB_FILES,
             DATA_SIZE,
             INDEX_SIZE,
             INDEX_TYPE,
@@ -198,6 +209,7 @@ impl Properties {
             n if n == NUM_DELETIONS.as_bytes() => self.num_deletions = uv(),
             n if n == NUM_RANGE_DELETIONS.as_bytes() => self.num_range_deletions = uv(),
             n if n == NUM_DATA_BLOCKS.as_bytes() => self.num_data_blocks = uv(),
+            n if n == NUM_VALUES_IN_BLOB_FILES.as_bytes() => self.num_values_in_blob_files = uv(),
             n if n == DATA_SIZE.as_bytes() => self.data_size = uv(),
             n if n == INDEX_SIZE.as_bytes() => self.index_size = uv(),
             n if n == INDEX_TYPE.as_bytes() => {
@@ -269,6 +281,7 @@ mod tests {
             num_deletions: 5,
             num_range_deletions: 0,
             num_data_blocks: 7,
+            num_values_in_blob_files: 3,
             data_size: 40000,
             index_size: 256,
             index_type: TWO_LEVEL_INDEX,

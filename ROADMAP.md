@@ -242,9 +242,11 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
       `native_blob_refs` map (seeded at open from the MANIFEST, extended on flush) lets reads in the
       same instance and after reopen resolve separated values. Verified by an end-to-end test (write
       a value-separated database, confirm a blob file is written, reopen and read every separated
-      value) and by the `VersionSet::load` blob-registry test. pebbledb reads its own value-separated
-      output fully; upstream Pebble opens the database and reads point keys, with resolving our
-      *separated* values through Pebble's reader being a remaining Pebble-side wiring detail.
+      value), by the `VersionSet::load` blob-registry test, and by a Rust→Go interop step: upstream
+      Pebble v2.1.6 opens the database and reads every separated value back. (Pebble wires blob
+      resolution only when the table footer carries the blob-values attribute and the
+      `pebble.num.values.in.blob-files` property is set, so the writer emits both.) Value separation
+      now round-trips **in both directions**.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
