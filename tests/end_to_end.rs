@@ -4260,3 +4260,100 @@ fn slow_wal_write_triggers_latency_failover() {
         );
     }
 }
+
+/// Blob references are persisted in the MANIFEST, so a reopen recovers them from file metadata
+/// instead of re-reading every sstable's metaindex — verified by counting sstable reads during
+/// the reopen — and blob-backed values stay readable (their blob files are not GC'd).
+#[test]
+fn blob_refs_persist_across_reopen_skipping_rescan() {
+    use std::io;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+
+    struct CountingFs {
+        inner: Arc<dyn Fs>,
+        sst_reads: Arc<AtomicUsize>,
+    }
+    impl Fs for CountingFs {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.create(path)
+        }
+        fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.reuse(path)
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if path.extension().is_some_and(|e| e == "sst") {
+                self.sst_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.inner.read(path)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn size(&self, path: &Path) -> io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(path)
+        }
+    }
+
+    let sst_reads = Arc::new(AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(CountingFs {
+        inner: Arc::new(MemFs::new()),
+        sst_reads: Arc::clone(&sst_reads),
+    });
+    let opts = || Options {
+        fs: Arc::clone(&fs),
+        mem_table_size: 8 * 1024,
+        // Separate large values into blob files so the sstables carry blob references.
+        blob_value_threshold: Some(64),
+        ..Default::default()
+    };
+
+    let big = vec![b'b'; 500];
+    {
+        let db = Db::open("/blob-persist", opts()).unwrap();
+        for i in 0..40u32 {
+            db.set(format!("k{i:03}").as_bytes(), &big).unwrap();
+        }
+        db.flush().unwrap();
+        for i in 40..80u32 {
+            db.set(format!("k{i:03}").as_bytes(), &big).unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+    }
+
+    // Reopen: blob references should come from the MANIFEST, so the open performs no sstable
+    // reads to rediscover them.
+    sst_reads.store(0, AtomicOrdering::Relaxed);
+    let db = Db::open("/blob-persist", opts()).unwrap();
+    let reads = sst_reads.load(AtomicOrdering::Relaxed);
+    assert_eq!(
+        reads, 0,
+        "reopen re-read {reads} sstables for blob refs; they should come from the MANIFEST"
+    );
+
+    // The blob-backed values survive (their blob files were recognized as referenced).
+    db.compact_range(None, None).unwrap();
+    assert_eq!(db.get(b"k000").unwrap(), Some(big.clone()));
+    assert_eq!(db.get(b"k079").unwrap(), Some(big.clone()));
+}

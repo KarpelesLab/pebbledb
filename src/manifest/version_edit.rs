@@ -54,6 +54,13 @@ const CUSTOM_TAG_NO_RANGE_KEY_SETS: u64 = 7;
 /// bit) and encoded length-prefixed, so a reader that does not recognize it — including
 /// upstream Pebble — skips it via its default custom-tag handling. Not a Pebble tag.
 const CUSTOM_TAG_SPAN_HINT: u64 = 8;
+/// pebbledb-private hint: the blob-file numbers this sstable references, as concatenated
+/// uvarints in one length-prefixed field. Lets blob-file GC learn an sstable's references from
+/// the MANIFEST at open instead of re-reading the sstable's metaindex. Safe-to-ignore range,
+/// length-prefixed, so upstream Pebble skips it (Pebble records its own richer blob references
+/// under `CUSTOM_TAG_BLOB_REFERENCES`, from which we also recover the file numbers). Not a
+/// Pebble tag.
+const CUSTOM_TAG_BLOB_REFS: u64 = 9;
 const CUSTOM_TAG_NON_SAFE_IGNORE_MASK: u64 = 1 << 6;
 const CUSTOM_TAG_PATH_ID: u64 = 65;
 const CUSTOM_TAG_VIRTUAL: u64 = 66;
@@ -275,9 +282,12 @@ impl VersionEdit {
             put_uvarint(&mut buf, *file_num);
         }
         for nf in &self.new_files {
-            // A virtual table (backing tag) or a recorded span hint needs the custom-tag-capable
-            // NewFile4 layout; plain physical tables with no hint stay on NewFile2.
-            let needs_custom = nf.meta.backing.is_some() || nf.meta.has_spans.is_some();
+            // A virtual table (backing tag), a span hint, or recorded blob references need the
+            // custom-tag-capable NewFile4 layout; plain physical tables with none stay on
+            // NewFile2.
+            let needs_custom = nf.meta.backing.is_some()
+                || nf.meta.has_spans.is_some()
+                || !nf.meta.blob_refs.is_empty();
             let tag = if needs_custom {
                 TAG_NEW_FILE4
             } else {
@@ -300,6 +310,16 @@ impl VersionEdit {
                     // Length-prefixed single byte so unknown readers skip it cleanly.
                     put_uvarint(&mut buf, CUSTOM_TAG_SPAN_HINT);
                     put_bytes(&mut buf, &[u8::from(has_spans)]);
+                }
+                if !nf.meta.blob_refs.is_empty() {
+                    // pebbledb-private: the referenced blob-file numbers as concatenated
+                    // uvarints inside one length-prefixed field, so unknown readers skip it.
+                    let mut payload = Vec::new();
+                    for &num in &nf.meta.blob_refs {
+                        put_uvarint(&mut payload, num);
+                    }
+                    put_uvarint(&mut buf, CUSTOM_TAG_BLOB_REFS);
+                    put_bytes(&mut buf, &payload);
                 }
                 put_uvarint(&mut buf, CUSTOM_TAG_TERMINATE);
             }
@@ -365,10 +385,10 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
         (0, 0)
     };
 
-    let (backing, has_spans) = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
+    let (backing, has_spans, blob_refs) = if tag == TAG_NEW_FILE4 || tag == TAG_NEW_FILE5 {
         decode_custom_tags(d)?
     } else {
-        (None, None)
+        (None, None, Vec::new())
     };
 
     Ok(NewFileEntry {
@@ -380,8 +400,9 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
             largest,
             smallest_seqnum,
             largest_seqnum,
-            // Not serialized; the engine repopulates this from the sstable at open.
-            blob_refs: Vec::new(),
+            // From our private blob-refs tag if present; otherwise empty (the engine falls back
+            // to scanning the sstable's metaindex at open, e.g. for upstream-Pebble records).
+            blob_refs,
             backing,
             has_spans,
         },
@@ -389,12 +410,14 @@ fn decode_new_file(d: &mut Decoder<'_>, tag: u64) -> Result<NewFileEntry> {
 }
 
 /// Consumes the custom-tag stream of a `NewFile4`/`NewFile5` record up to the terminator,
-/// returning the backing-file number (virtual tables) and the span hint (pebbledb-private).
-/// Each tag's payload is parsed exactly so the stream stays aligned; payloads for features
-/// this engine does not model are discarded.
-fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>)> {
+/// returning the backing-file number (virtual tables), the span hint, and the referenced
+/// blob-file numbers (all pebbledb-private where applicable). Each tag's payload is parsed
+/// exactly so the stream stays aligned; payloads for features this engine does not model are
+/// discarded.
+fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>, Vec<u64>)> {
     let mut backing = None;
     let mut has_spans = None;
+    let mut blob_refs = Vec::new();
     loop {
         let custom = d.uvarint()?;
         match custom {
@@ -408,6 +431,18 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>)
                 // pebbledb-private: a single byte, 0 or 1.
                 let field = d.bytes()?;
                 has_spans = Some(field.first().copied().unwrap_or(0) != 0);
+            }
+            CUSTOM_TAG_BLOB_REFS => {
+                // pebbledb-private: concatenated uvarint blob-file numbers in one field.
+                let field = d.bytes()?;
+                let mut off = 0;
+                while off < field.len() {
+                    let (num, used) = get_uvarint(&field[off..]).ok_or_else(|| {
+                        Error::corruption("version edit: malformed blob-refs custom tag")
+                    })?;
+                    blob_refs.push(num);
+                    off += used;
+                }
             }
             CUSTOM_TAG_VIRTUAL => {
                 // Virtual table: the backing file's disk number follows.
@@ -443,7 +478,7 @@ fn decode_custom_tags(d: &mut Decoder<'_>) -> Result<(Option<u64>, Option<bool>)
             }
         }
     }
-    Ok((backing, has_spans))
+    Ok((backing, has_spans, blob_refs))
 }
 
 #[cfg(test)]
@@ -506,6 +541,33 @@ mod tests {
             assert_eq!(got.new_files[0].meta.has_spans, hint);
             assert_eq!(got, edit);
         }
+    }
+
+    #[test]
+    fn blob_refs_roundtrip() {
+        // Blob references encode the private custom tag and decode back to the same list;
+        // an empty list stays empty (and keeps the file on NewFile2).
+        let mut m = meta(10, "a", "m", 100, 200);
+        m.blob_refs = vec![3, 7, 42];
+        let edit = VersionEdit {
+            new_files: vec![NewFileEntry { level: 1, meta: m }],
+            ..Default::default()
+        };
+        let got = VersionEdit::decode(&edit.encode()).unwrap();
+        assert_eq!(got.new_files[0].meta.blob_refs, vec![3, 7, 42]);
+        assert_eq!(got, edit);
+
+        // Empty refs: no tag, plain round-trip.
+        let edit2 = VersionEdit {
+            new_files: vec![NewFileEntry {
+                level: 1,
+                meta: meta(11, "n", "z", 5, 9),
+            }],
+            ..Default::default()
+        };
+        let got2 = VersionEdit::decode(&edit2.encode()).unwrap();
+        assert!(got2.new_files[0].meta.blob_refs.is_empty());
+        assert_eq!(got2, edit2);
     }
 
     #[test]

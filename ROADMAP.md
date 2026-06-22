@@ -135,9 +135,12 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     (`FormatColumnarBlocks`+) table both ways.
 - [ ] **Blob file format byte-parity.** Diff `sstable::blob` output against a Pebble-written
   blob file in the interop workflow; reconcile magic/footer/handle encoding.
-- [ ] **Persist blob references in the MANIFEST.** Record `FileMetadata::blob_refs` in the
-  MANIFEST (the `NewFile5` blob-reference custom tag) instead of rescanning the metaindex at
-  open; keep open-rescan as a fallback.
+- [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
+  pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
+  sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
+  open-rescan remains as a fallback for legacy / upstream-Pebble records. (Byte-parity with
+  Pebble's own richer `NewFile5` blob-reference encoding — value sizes, reference depth — stays
+  under the blocked columnar/blob work above.)
 - [ ] **objstorage catalog byte-format.** Match Pebble's shared-object catalog on-disk format
   so a disaggregated store round-trips through the interop workflow.
 - [ ] **Port Pebble's `testdata` corpus.** Vendor a subset of upstream data-driven fixtures

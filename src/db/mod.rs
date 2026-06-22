@@ -1069,7 +1069,13 @@ impl DbInner {
         if !opts.read_only && any_blob_files {
             for level in vs.current.levels.iter_mut() {
                 for f in level.iter_mut() {
-                    if !f.blob_refs.is_empty() {
+                    // Skip the metaindex rescan when the file's blob references are already
+                    // known: recorded in the MANIFEST (non-empty), authoritatively absent on a
+                    // modern pebbledb record (a span hint is written alongside blob refs, so its
+                    // presence means the empty list is real, not just unread), or a virtual
+                    // table (refs cloned from its backing and persisted with it). Only legacy /
+                    // upstream-Pebble records — no span hint, no refs — fall back to a rescan.
+                    if !f.blob_refs.is_empty() || f.has_spans.is_some() || f.backing.is_some() {
                         continue;
                     }
                     // Source the table from the shared backend when it lives there.
