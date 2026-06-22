@@ -295,13 +295,14 @@ impl PebbleBlobWriter {
         buf.extend_from_slice(&(count_blocks as u32).to_le_bytes());
         let header_at = buf.len();
         buf.resize(header_at + 2 * COLUMN_HEADER_LEN, 0);
-        let virt_off = buf.len();
-        super::colblk::encode_uint_column(&[], virt_off, &mut buf);
+        // The virtualBlocks column has zero rows (this file is not rewritten), so it occupies no
+        // bytes: it shares the offsets column's start offset. Encoding a 0-row column as an empty
+        // page (rather than writing an encoding byte) is what Pebble's colblk expects.
         let off_off = buf.len();
         super::colblk::encode_uint_column(offsets, off_off, &mut buf);
         buf.push(0); // trailing padding
         buf[header_at] = COL_TYPE_UINT;
-        buf[header_at + 1..header_at + 5].copy_from_slice(&(virt_off as u32).to_le_bytes());
+        buf[header_at + 1..header_at + 5].copy_from_slice(&(off_off as u32).to_le_bytes());
         buf[header_at + COLUMN_HEADER_LEN] = COL_TYPE_UINT;
         buf[header_at + COLUMN_HEADER_LEN + 1..header_at + COLUMN_HEADER_LEN + 5]
             .copy_from_slice(&(off_off as u32).to_le_bytes());

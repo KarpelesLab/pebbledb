@@ -223,8 +223,10 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     Progress:
     - [x] **Native blob file writer.** `pebble_blob::PebbleBlobWriter` writes Pebble's native
       `.blob` format (value block + index block + 38-byte footer with masked-CRC32C checksum),
-      mirroring the reader. Verified by a round-trip through `PebbleBlobReader` (itself proven
-      byte-exact against real Pebble blob fixtures).
+      mirroring the reader. Verified both by a round-trip through `PebbleBlobReader` and by upstream
+      Pebble: a `pebble_blob_gen` example + a `verify-pebble-blob` interop step open the written file
+      with Pebble's own `blob.FileReader` and validate its layout. (Fixed: a 0-row colblk column —
+      the empty `virtualBlocks` column — must occupy no bytes and share the next column's offset.)
     - [ ] v6/v7 sstable write (footer + columnar metaindex KV block + blob-reference-index block),
       `NewFile5`/`NewBlobFile` MANIFEST write, the value-separation policy in flush/compaction, and
       raising the write format ceiling.

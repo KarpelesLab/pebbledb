@@ -12,6 +12,7 @@
 //	interop generate-separated    <dir>   FormatValueSeparation DB with native blob files
 //	interop verify                <dir>   open <dir> read-only and verify the known keys
 //	interop verify-columnar-sst   <file>  read a Rust-written columnar .sst and verify the keys
+//	interop verify-pebble-blob    <file>  read a Rust-written native .blob via Pebble's blob reader
 //
 // The keys are key0000..key0099 with values value0..value99.
 package main
@@ -25,6 +26,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/cockroachdb/pebble/v2/sstable/blob"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 const n = 100
@@ -63,6 +66,9 @@ func main() {
 	case "verify-columnar-sst":
 		// `dir` is actually a path to a single columnar .sst file written by the Rust engine.
 		verifyColumnarSST(dir)
+	case "verify-pebble-blob":
+		// `dir` is a path to a native .blob file written by the Rust PebbleBlobWriter.
+		verifyPebbleBlob(dir)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)
@@ -233,6 +239,26 @@ func verifyColumnarSST(path string) {
 	}
 	fmt.Printf("verified %d keys + %d range del + %d range key in columnar sstable %s\n",
 		count, rdCount, rkCount, path)
+}
+
+// verifyPebbleBlob opens a native blob file written by the Rust PebbleBlobWriter through Pebble's
+// own blob.FileReader and validates its structure via Layout (which reads the footer, index, and
+// every value block) — the Rust→Go native-blob byte-parity direction.
+func verifyPebbleBlob(path string) {
+	f, err := vfs.Default.Open(path)
+	must(err)
+	readable, err := sstable.NewSimpleReadable(f)
+	must(err)
+	r, err := blob.NewFileReader(context.Background(), readable, blob.FileReaderOptions{})
+	must(err)
+	defer r.Close()
+	layout, err := r.Layout()
+	must(err)
+	if !strings.Contains(layout, "values: 20") {
+		fmt.Fprintf(os.Stderr, "unexpected blob layout (no 20 values):\n%s\n", layout)
+		os.Exit(1)
+	}
+	fmt.Printf("verified native blob file %s (Pebble parsed it)\n", path)
 }
 
 func must(err error) {
