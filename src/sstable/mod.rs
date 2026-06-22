@@ -287,6 +287,9 @@ fn read_metaindex(file: &[u8], footer: &Footer) -> Result<MetaBlocks> {
     })
 }
 
+/// A columnar table's fully decoded `(internal_key, value)` rows, in sorted internal-key order.
+type ColumnarRows = Arc<[(Vec<u8>, Vec<u8>)]>;
+
 /// A reader over an in-memory sstable.
 pub struct Reader {
     file: Arc<[u8]>,
@@ -319,6 +322,11 @@ pub struct Reader {
     /// Set by the engine when it opens a reader; absent for standalone reads, where a
     /// blob-referenced value cannot be fetched.
     blob_resolver: Option<Arc<dyn BlobResolver>>,
+    /// For a **columnar** table (Pebble format v5+), the fully decoded `(internal_key, value)`
+    /// rows in sorted order. The columnar block layout differs entirely from the row layout, so
+    /// rather than thread it through the row block cursor the table is decoded once at open and
+    /// point lookups / iteration are served from this. `None` for row-format tables.
+    columnar_rows: Option<ColumnarRows>,
 }
 
 /// Resolves a blob-referenced value: given the sstable's file number and the
@@ -348,9 +356,30 @@ impl Reader {
         let file: Arc<[u8]> = file.into();
         let footer = parse_footer(&file)?;
         if footer.format.is_columnar() {
-            return Err(Error::Unsupported(
-                "sstable: columnar block format (Pebblev5+) not yet supported",
-            ));
+            // Decode the whole columnar table up front and serve reads from the decoded rows;
+            // the columnar block format shares nothing with the row block cursor.
+            let cr = columnar::ColumnarReader::open(Arc::clone(&file), cmp.clone())?;
+            let rows: Arc<[(Vec<u8>, Vec<u8>)]> = cr.iter_all()?.into();
+            return Ok(Reader {
+                file,
+                cmp,
+                footer,
+                index: Arc::from(&[][..]),
+                prefixed_values: false,
+                value_block_handles: Vec::new(),
+                blob_refs: Vec::new(),
+                props: Properties::default(),
+                filter: None,
+                // TODO: columnar keyspan blocks (range deletions / range keys) are not yet
+                // decoded; a columnar table with spans would surface none here.
+                range_dels: Vec::new(),
+                range_keys: Vec::new(),
+                two_level: false,
+                file_num,
+                blob_resolver: None,
+                block_cache,
+                columnar_rows: Some(rows),
+            });
         }
         let prefixed_values = footer.format.prefixes_values();
         let meta = read_metaindex(&file, &footer)?;
@@ -372,6 +401,7 @@ impl Reader {
             file_num,
             blob_resolver: None,
             block_cache,
+            columnar_rows: None,
         })
     }
 
@@ -613,6 +643,24 @@ impl Reader {
         user_key: &[u8],
         snapshot: SeqNum,
     ) -> Result<Option<(SeqNum, InternalKeyKind, Vec<u8>)>> {
+        if let Some(rows) = &self.columnar_rows {
+            // Columnar table: serve from the decoded rows (sorted by internal key — user key
+            // ascending, trailer descending, so versions of a key are newest-first).
+            let start = rows.partition_point(|(ik, _)| {
+                self.cmp.compare(encoded_user_key(ik), user_key) == std::cmp::Ordering::Less
+            });
+            for (ik, val) in &rows[start..] {
+                if self.cmp.compare(encoded_user_key(ik), user_key) != std::cmp::Ordering::Equal {
+                    break;
+                }
+                let trailer = crate::base::internal_key::encoded_trailer(ik);
+                let seq = trailer >> 8;
+                if seq <= snapshot {
+                    return Ok(Some((seq, trailer_kind(trailer), val.clone())));
+                }
+            }
+            return Ok(None);
+        }
         // The bloom filter can rule the key out without touching any data block.
         if let Some(filter) = &self.filter
             && let Some(bk) = self.bloom_key(user_key)
@@ -652,6 +700,22 @@ impl Reader {
         snapshot: SeqNum,
     ) -> Result<Vec<(SeqNum, InternalKeyKind, Vec<u8>)>> {
         let mut out = Vec::new();
+        if let Some(rows) = &self.columnar_rows {
+            let start = rows.partition_point(|(ik, _)| {
+                self.cmp.compare(encoded_user_key(ik), user_key) == std::cmp::Ordering::Less
+            });
+            for (ik, val) in &rows[start..] {
+                if self.cmp.compare(encoded_user_key(ik), user_key) != std::cmp::Ordering::Equal {
+                    break;
+                }
+                let trailer = crate::base::internal_key::encoded_trailer(ik);
+                let seq = trailer >> 8;
+                if seq <= snapshot {
+                    out.push((seq, trailer_kind(trailer), val.clone()));
+                }
+            }
+            return Ok(out);
+        }
         if let Some(filter) = &self.filter
             && let Some(bk) = self.bloom_key(user_key)
             && !filter::may_contain(filter, bk)
@@ -704,7 +768,12 @@ impl Reader {
     /// The iterator holds a shared reference to the reader, so it can outlive the
     /// borrow and be stored (e.g. in a merging iterator).
     pub fn iter(self: &Arc<Reader>) -> Result<TableIter> {
-        let handles = self.data_block_handles()?;
+        let columnar = self.columnar_cursor();
+        let handles = if columnar.is_some() {
+            Vec::new()
+        } else {
+            self.data_block_handles()?
+        };
         Ok(TableIter {
             reader: Arc::clone(self),
             handles,
@@ -713,6 +782,16 @@ impl Reader {
             data: None,
             cur_value: Vec::new(),
             cur_blob_ref: None,
+            columnar,
+        })
+    }
+
+    /// A fresh columnar cursor over this reader's decoded rows, or `None` for a row table.
+    fn columnar_cursor(&self) -> Option<ColumnarCursor> {
+        self.columnar_rows.as_ref().map(|rows| ColumnarCursor {
+            rows: Arc::clone(rows),
+            cmp: self.cmp.clone(),
+            pos: None,
         })
     }
 
@@ -723,6 +802,19 @@ impl Reader {
         self: &Arc<Reader>,
         filters: &[std::sync::Arc<dyn blockprop::BlockPropertyFilter>],
     ) -> Result<TableIter> {
+        if let Some(columnar) = self.columnar_cursor() {
+            // Columnar tables carry no per-block row properties to filter on; serve all rows.
+            return Ok(TableIter {
+                reader: Arc::clone(self),
+                handles: Vec::new(),
+                block_skip: Vec::new(),
+                block_idx: None,
+                data: None,
+                cur_value: Vec::new(),
+                cur_blob_ref: None,
+                columnar: Some(columnar),
+            });
+        }
         let raw = self.data_block_handles_raw()?;
         let mut handles = Vec::with_capacity(raw.len());
         let mut block_skip = Vec::with_capacity(raw.len());
@@ -749,6 +841,7 @@ impl Reader {
             data: None,
             cur_value: Vec::new(),
             cur_blob_ref: None,
+            columnar: None,
         })
     }
 }
@@ -774,6 +867,61 @@ pub struct TableIter {
     /// If the current entry's value is a blob reference, the `(blob_file_num, handle)` it
     /// points at — used by compaction to preserve the reference without rewriting the value.
     cur_blob_ref: Option<(u64, blob::BlobHandle)>,
+    /// For a columnar table, a cursor over the reader's decoded rows; when set, every
+    /// positioning method serves from it and the row-block machinery above is unused.
+    columnar: Option<ColumnarCursor>,
+}
+
+/// A cursor over a columnar table's decoded `(internal_key, value)` rows (sorted by internal
+/// key). Backs [`TableIter`] for columnar tables, where the row block cursor does not apply.
+#[derive(Clone)]
+struct ColumnarCursor {
+    rows: ColumnarRows,
+    cmp: Arc<dyn Comparer>,
+    pos: Option<usize>,
+}
+
+impl ColumnarCursor {
+    fn first(&mut self) {
+        self.pos = (!self.rows.is_empty()).then_some(0);
+    }
+    fn last(&mut self) {
+        self.pos = self.rows.len().checked_sub(1);
+    }
+    fn valid(&self) -> bool {
+        self.pos.is_some()
+    }
+    fn key(&self) -> &[u8] {
+        &self.rows[self.pos.expect("valid")].0
+    }
+    fn value(&self) -> &[u8] {
+        &self.rows[self.pos.expect("valid")].1
+    }
+    fn next(&mut self) {
+        if let Some(p) = self.pos {
+            self.pos = (p + 1 < self.rows.len()).then_some(p + 1);
+        }
+    }
+    fn prev(&mut self) {
+        self.pos = self.pos.and_then(|p| p.checked_sub(1));
+    }
+    /// First row whose internal key is `>= target` (internal-key order: user key ascending,
+    /// trailer descending).
+    fn seek_ge(&mut self, target: &[u8]) {
+        let i = self.rows.partition_point(|(ik, _)| {
+            crate::base::internal_key::compare_encoded(self.cmp.as_ref(), ik, target)
+                == std::cmp::Ordering::Less
+        });
+        self.pos = (i < self.rows.len()).then_some(i);
+    }
+    /// Last row whose internal key is `< target`.
+    fn seek_lt(&mut self, target: &[u8]) {
+        let i = self.rows.partition_point(|(ik, _)| {
+            crate::base::internal_key::compare_encoded(self.cmp.as_ref(), ik, target)
+                == std::cmp::Ordering::Less
+        });
+        self.pos = i.checked_sub(1);
+    }
 }
 
 impl TableIter {
@@ -825,6 +973,10 @@ impl TableIter {
 
     /// Advances to the first entry and returns whether one exists.
     pub fn first(&mut self) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.first();
+            return Ok(c.valid());
+        }
         for i in 0..self.handles.len() {
             if self.skipped(i) {
                 continue;
@@ -842,6 +994,10 @@ impl TableIter {
 
     /// Positions at the last entry and returns whether one exists.
     pub fn last(&mut self) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.last();
+            return Ok(c.valid());
+        }
         let mut i = self.handles.len();
         while i > 0 {
             i -= 1;
@@ -861,22 +1017,35 @@ impl TableIter {
 
     /// Whether the iterator is at a valid entry.
     pub fn valid(&self) -> bool {
+        if let Some(c) = &self.columnar {
+            return c.valid();
+        }
         self.data.as_ref().is_some_and(|d| d.valid())
     }
 
     /// The current entry's encoded internal key.
     pub fn key(&self) -> &[u8] {
+        if let Some(c) = &self.columnar {
+            return c.key();
+        }
         self.data.as_ref().expect("valid").key()
     }
 
     /// The current entry's resolved value.
     pub fn value(&self) -> &[u8] {
+        if let Some(c) = &self.columnar {
+            return c.value();
+        }
         &self.cur_value
     }
 
     /// Advances to the next entry. Returns whether the iterator remains valid.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.next();
+            return Ok(c.valid());
+        }
         match self.data.as_mut() {
             Some(d) => {
                 d.next();
@@ -908,6 +1077,10 @@ impl TableIter {
 
     /// Steps back to the previous entry. Returns whether the iterator remains valid.
     pub fn prev(&mut self) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.prev();
+            return Ok(c.valid());
+        }
         match self.data.as_mut() {
             Some(d) => {
                 d.prev();
@@ -939,6 +1112,10 @@ impl TableIter {
     /// Like [`seek_ge`](Self::seek_ge), but first consults the table's prefix bloom: if no key
     /// shares `prefix`, the iterator is positioned invalid without reading any data block.
     pub fn seek_prefix_ge(&mut self, target: &[u8], prefix: &[u8]) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.seek_ge(target);
+            return Ok(c.valid());
+        }
         if !self.reader.prefix_may_match(prefix) {
             self.clear();
             return Ok(false);
@@ -948,6 +1125,10 @@ impl TableIter {
 
     /// Positions at the first entry whose internal key is `>= target`.
     pub fn seek_ge(&mut self, target: &[u8]) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.seek_ge(target);
+            return Ok(c.valid());
+        }
         let handle = match self.reader.seek_data_handle(target)? {
             Some(h) => h,
             None => {
@@ -986,6 +1167,10 @@ impl TableIter {
 
     /// Positions at the last entry whose internal key is `< target`.
     pub fn seek_lt(&mut self, target: &[u8]) -> Result<bool> {
+        if let Some(c) = self.columnar.as_mut() {
+            c.seek_lt(target);
+            return Ok(c.valid());
+        }
         let idx = match self.reader.seek_data_handle(target)? {
             Some(h) => self.handles.iter().position(|x| *x == h).unwrap_or(0),
             // Target is past the whole table: the last entry is the answer.

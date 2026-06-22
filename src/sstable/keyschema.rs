@@ -71,6 +71,13 @@ pub trait KeySchema: Send + Sync {
     /// The data types of the key columns this schema writes, in column order.
     fn columns(&self) -> Vec<KeyColumn>;
 
+    /// The size in bytes of the schema's own custom header, written immediately after the data
+    /// block's fixed custom header and before the columnar block header. Zero for schemas (like
+    /// [`DefaultKeySchema`]) that need no per-block state.
+    fn header_size(&self) -> usize {
+        0
+    }
+
     /// Splits `key` into `(prefix, suffix)`, where `prefix` is the key without its version
     /// suffix and `suffix` is the trailing version bytes (possibly empty).
     fn split<'k>(&self, key: &'k [u8]) -> (&'k [u8], &'k [u8]);

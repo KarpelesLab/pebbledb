@@ -4357,3 +4357,46 @@ fn blob_refs_persist_across_reopen_skipping_rescan() {
     assert_eq!(db.get(b"k000").unwrap(), Some(big.clone()));
     assert_eq!(db.get(b"k079").unwrap(), Some(big.clone()));
 }
+
+/// Reads a real Pebble v2 (`FormatColumnarBlocks`) sstable — checked in as a fixture — through
+/// the engine's `Reader`, proving columnar byte-parity offline (no Go toolchain needed). The
+/// fixture was produced by Pebble v2.1.6 with keys key0000..key0099 => value0..value99.
+#[test]
+fn reads_pebble_v2_columnar_sstable_fixture() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::sstable::Reader;
+
+    let bytes = include_bytes!("fixtures/pebble_v2_columnar.sst").to_vec();
+    let reader = Arc::new(Reader::open(bytes, Arc::new(DefaultComparer)).expect("open columnar"));
+
+    // Point lookups resolve each key to its value at the latest sequence number.
+    for i in 0..100u32 {
+        let k = format!("key{i:04}");
+        let got = reader
+            .get(k.as_bytes(), u64::MAX)
+            .expect("lookup")
+            .map(|(_, v)| v);
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("value{i}").as_bytes()),
+            "columnar get for {k}"
+        );
+    }
+
+    // Forward iteration yields all 100 keys in order.
+    let mut it = reader.iter().expect("iter");
+    let mut n = 0u32;
+    it.first().unwrap();
+    while it.valid() {
+        let want_k = format!("key{n:04}");
+        assert_eq!(
+            pebbledb::base::internal_key::encoded_user_key(it.key()),
+            want_k.as_bytes(),
+            "columnar scan key #{n}"
+        );
+        assert_eq!(it.value(), format!("value{n}").as_bytes());
+        n += 1;
+        it.next().unwrap();
+    }
+    assert_eq!(n, 100, "columnar scan should yield 100 keys");
+}

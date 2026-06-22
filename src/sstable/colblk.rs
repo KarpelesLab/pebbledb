@@ -118,14 +118,27 @@ impl BlockHeader {
     /// Parses the header of a columnar block. Validates that every column's data offset
     /// lies within the block.
     pub fn parse(block: &[u8]) -> Result<BlockHeader> {
-        if block.len() < BLOCK_HEADER_BASE_LEN {
+        BlockHeader::parse_at(block, 0)
+    }
+
+    /// Parses the columnar block header that begins at byte `base` (after any block-specific
+    /// custom header). Stored column page-offsets are absolute within `block`, so they are used
+    /// as-is. Pebble's data block prefixes the columnar header with a 4-byte custom header (plus
+    /// the key schema's header), so it is parsed with `base > 0`.
+    pub fn parse_at(block: &[u8], base: usize) -> Result<BlockHeader> {
+        if block.len() < base + BLOCK_HEADER_BASE_LEN {
             return Err(Error::corruption("colblk: block smaller than header"));
         }
-        let version = block[0];
-        let num_columns = u16::from_le_bytes([block[1], block[2]]) as usize;
-        let rows = u32::from_le_bytes([block[3], block[4], block[5], block[6]]);
+        let version = block[base];
+        let num_columns = u16::from_le_bytes([block[base + 1], block[base + 2]]) as usize;
+        let rows = u32::from_le_bytes([
+            block[base + 3],
+            block[base + 4],
+            block[base + 5],
+            block[base + 6],
+        ]);
 
-        let headers_end = BLOCK_HEADER_BASE_LEN + num_columns * COLUMN_HEADER_LEN;
+        let headers_end = base + BLOCK_HEADER_BASE_LEN + num_columns * COLUMN_HEADER_LEN;
         if block.len() < headers_end + 1 {
             // +1 for the trailing padding byte.
             return Err(Error::corruption(
@@ -135,7 +148,7 @@ impl BlockHeader {
 
         let mut columns = Vec::with_capacity(num_columns);
         for i in 0..num_columns {
-            let off = BLOCK_HEADER_BASE_LEN + i * COLUMN_HEADER_LEN;
+            let off = base + BLOCK_HEADER_BASE_LEN + i * COLUMN_HEADER_LEN;
             let data_type = DataType::from_u8(block[off])?;
             let page_offset = u32::from_le_bytes([
                 block[off + 1],
@@ -689,35 +702,56 @@ impl<'s> SchemaDataBlockBuilder<'s> {
         self.trailers.len()
     }
 
-    /// Serializes the block: a header, the schema's key columns, the trailer and value
-    /// columns, and the trailing padding byte.
+    /// Serializes the block in Pebble v2's columnar data-block layout: a 4-byte custom header
+    /// (the maximum key length) followed by the columnar block header, the schema's key columns,
+    /// then the five fixed columns — trailer, prefix-changed, value, is-value-external,
+    /// is-obsolete — and a trailing padding byte.
     pub fn finish(&self) -> Vec<u8> {
         let rows = self.trailers.len();
         let key_cols = self.schema.columns();
-        let num_columns = key_cols.len() + 2; // + trailer + value
+        let num_columns = key_cols.len() + DATA_BLOCK_TRAILING_COLUMNS;
+
+        // Per-row key prefix (via the schema split) drives the prefix-changed bitmap.
+        let prefixes: Vec<&[u8]> = self
+            .user_keys
+            .iter()
+            .map(|k| self.schema.split(k).0)
+            .collect();
+        let prefix_changed: Vec<bool> = (0..rows)
+            .map(|i| i > 0 && prefixes[i] != prefixes[i - 1])
+            .collect();
+        let max_key_len = self.user_keys.iter().map(|k| k.len()).max().unwrap_or(0);
 
         let mut buf = Vec::new();
+        // 4-byte custom header (maximum key length) + the schema's own (zero-length) header.
+        buf.extend_from_slice(&(max_key_len as u32).to_le_bytes());
+        buf.resize(DATA_BLOCK_CUSTOM_HEADER_LEN + self.schema.header_size(), 0);
         buf.push(DATA_BLOCK_VERSION);
         buf.extend_from_slice(&(num_columns as u16).to_le_bytes());
         buf.extend_from_slice(&(rows as u32).to_le_bytes());
         let headers_at = buf.len();
         buf.resize(headers_at + num_columns * COLUMN_HEADER_LEN, 0);
 
-        // Key columns, via the schema.
+        // Key columns, via the schema; then the five fixed columns.
         let key_refs: Vec<&[u8]> = self.user_keys.iter().map(|k| k.as_slice()).collect();
         let key_col_offsets = self.schema.encode_keys(&key_refs, &mut buf);
         debug_assert_eq!(key_col_offsets.len(), key_cols.len());
 
-        // Trailer and value columns.
         let trailer_off = buf.len();
         encode_uint_column(&self.trailers, trailer_off, &mut buf);
+        let prefix_changed_off = buf.len();
+        encode_bitmap(&prefix_changed, prefix_changed_off, &mut buf);
         let value_off = buf.len();
         let val_refs: Vec<&[u8]> = self.values.iter().map(|v| v.as_slice()).collect();
         encode_raw_bytes(&val_refs, value_off, &mut buf);
+        let is_value_external_off = buf.len();
+        encode_bitmap(&vec![false; rows], is_value_external_off, &mut buf);
+        let is_obsolete_off = buf.len();
+        encode_bitmap(&vec![false; rows], is_obsolete_off, &mut buf);
 
         buf.push(0); // trailing padding byte
 
-        // Backfill the column headers: schema key columns, then trailer, then value.
+        // Backfill the column headers (offsets are absolute within the block).
         let mut write_header = |i: usize, data_type: DataType, off: usize| {
             let h = headers_at + i * COLUMN_HEADER_LEN;
             buf[h] = match data_type {
@@ -732,8 +766,12 @@ impl<'s> SchemaDataBlockBuilder<'s> {
         for (i, (col, &off)) in key_cols.iter().zip(key_col_offsets.iter()).enumerate() {
             write_header(i, col.data_type, off);
         }
-        write_header(key_cols.len(), DataType::Uint, trailer_off);
-        write_header(key_cols.len() + 1, DataType::Bytes, value_off);
+        let k = key_cols.len();
+        write_header(k + DATA_COL_TRAILER, DataType::Uint, trailer_off);
+        write_header(k + 1, DataType::Bool, prefix_changed_off);
+        write_header(k + DATA_COL_VALUE, DataType::Bytes, value_off);
+        write_header(k + 3, DataType::Bool, is_value_external_off);
+        write_header(k + 4, DataType::Bool, is_obsolete_off);
         buf
     }
 }
@@ -747,12 +785,18 @@ pub struct SchemaDataBlockReader<'a, 's> {
 
 impl<'a, 's> SchemaDataBlockReader<'a, 's> {
     /// Parses the block header and validates the column count against the schema.
+    ///
+    /// Matches Pebble v2's columnar data block: a 4-byte custom header (the maximum key length,
+    /// which this reader does not need) plus the key schema's own header precede the columnar
+    /// block header, and after the schema's key columns come five fixed columns — trailer,
+    /// prefix-changed, value, is-value-external, is-obsolete.
     pub fn new(
         block: &'a [u8],
         schema: &'s dyn KeySchema,
     ) -> Result<SchemaDataBlockReader<'a, 's>> {
-        let header = BlockHeader::parse(block)?;
-        let expected = schema.columns().len() + 2;
+        let base = DATA_BLOCK_CUSTOM_HEADER_LEN + schema.header_size();
+        let header = BlockHeader::parse_at(block, base)?;
+        let expected = schema.columns().len() + DATA_BLOCK_TRAILING_COLUMNS;
         if header.columns.len() != expected {
             return Err(Error::corruption(
                 "colblk: unexpected schema data-block column count",
@@ -778,8 +822,8 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
             .iter()
             .map(|c| c.page_offset as usize)
             .collect();
-        let trailer_off = self.header.columns[num_key_cols].page_offset as usize;
-        let value_off = self.header.columns[num_key_cols + 1].page_offset as usize;
+        let trailer_off = self.header.columns[num_key_cols + DATA_COL_TRAILER].page_offset as usize;
+        let value_off = self.header.columns[num_key_cols + DATA_COL_VALUE].page_offset as usize;
 
         let keys = self.schema.decode_keys(self.block, &key_offsets, rows)?;
         let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
@@ -790,6 +834,15 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
             .collect())
     }
 }
+
+/// Pebble's columnar data block prefixes the columnar header with a 4-byte custom header
+/// holding the block's maximum key length.
+const DATA_BLOCK_CUSTOM_HEADER_LEN: usize = 4;
+/// After a key schema's columns, a Pebble data block has five fixed columns.
+const DATA_BLOCK_TRAILING_COLUMNS: usize = 5;
+/// Indices of the fixed columns relative to the end of the key-schema columns.
+const DATA_COL_TRAILER: usize = 0;
+const DATA_COL_VALUE: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Columnar index block
@@ -865,7 +918,10 @@ impl IndexBlockBuilder {
 /// Reads a columnar index block, returning its entries.
 pub fn decode_index_block(block: &[u8]) -> Result<Vec<IndexEntry>> {
     let header = BlockHeader::parse(block)?;
-    if header.columns.len() != INDEX_BLOCK_COLUMNS {
+    // Pebble v2's index block carries a fourth, block-properties column (separator, offsets,
+    // lengths, block-properties); we read the first three and ignore any trailing columns, so
+    // both our own three-column writer and a real Pebble index block parse.
+    if header.columns.len() < INDEX_BLOCK_COLUMNS {
         return Err(Error::corruption(
             "colblk: unexpected index-block column count",
         ));

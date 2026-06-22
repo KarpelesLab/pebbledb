@@ -34,11 +34,16 @@ impl FormatMajorVersion {
     /// format major version upstream Pebble v2 still supports, so it is the most compatible
     /// format for cross-engine interop with current Pebble.
     pub const FLUSHABLE_INGEST: FormatMajorVersion = FormatMajorVersion(13);
-    /// The newest format this implementation understands.
-    pub const NEWEST: FormatMajorVersion = FormatMajorVersion(13);
+    /// Columnar sstable blocks (Pebble v2's `FormatColumnarBlocks`). This engine can **read**
+    /// columnar tables; it still writes the row format, which a columnar-format database may also
+    /// contain.
+    pub const COLUMNAR_BLOCKS: FormatMajorVersion = FormatMajorVersion(19);
+    /// The newest format this implementation understands (can open / read).
+    pub const NEWEST: FormatMajorVersion = FormatMajorVersion::COLUMNAR_BLOCKS;
 
-    /// The default format for a freshly created database.
-    pub const DEFAULT: FormatMajorVersion = FormatMajorVersion::NEWEST;
+    /// The default format for a freshly created database: the row layout, which is the most
+    /// broadly compatible format current Pebble still reads and writes.
+    pub const DEFAULT: FormatMajorVersion = FormatMajorVersion::FLUSHABLE_INGEST;
 
     /// The raw integer version.
     pub fn as_u32(self) -> u32 {
