@@ -127,6 +127,13 @@ pub struct Options {
     /// (e.g. a stalled or failing disk). On failure the current batch is re-logged here and
     /// subsequent WALs are created here; recovery scans every configured WAL directory.
     pub wal_failover_dir: Option<PathBuf>,
+    /// Proactively fail the WAL over to the next [`wal_failover_dir`](Options::wal_failover_dir)
+    /// when a WAL write (append + sync) *succeeds but takes longer than this* — i.e. the primary
+    /// disk is slow, not yet failing (Pebble's latency-triggered WAL failover). `None` (default)
+    /// disables it; failover then happens only on an outright write error. The switch is
+    /// forward-only (toward the last configured directory) and counted in
+    /// [`Metrics::wal_failover_count`].
+    pub wal_failover_latency_threshold: Option<std::time::Duration>,
     /// Number of obsolete WAL files to keep for **recycling** rather than deleting (default
     /// `0`, disabled). When non-zero and a single WAL directory is configured, a flushed WAL's
     /// file is retained (up to this many) and reused in place for the next WAL — its
@@ -313,6 +320,7 @@ impl Default for Options {
             format_major_version: FormatMajorVersion::DEFAULT,
             wal_dir: None,
             wal_failover_dir: None,
+            wal_failover_latency_threshold: None,
             logger: None,
             cleaner: Arc::new(DeleteCleaner),
             mem_table_stop_writes_threshold: 4,
@@ -384,6 +392,9 @@ struct State {
     flush_count: u64,
     /// Number of compactions performed this session.
     compaction_count: u64,
+    /// Number of WAL failovers this session — switches of the active WAL to the next directory,
+    /// triggered either by a failed primary write or (when configured) by a slow one.
+    wal_failover_count: u64,
     /// Total bytes written by flushes this session (the denominator of write amplification).
     flush_bytes: u64,
     /// Total bytes written by compactions this session.
@@ -530,6 +541,9 @@ pub struct DbInner {
     cmp: Arc<dyn Comparer>,
     mem_table_size: usize,
     wal_sync: bool,
+    /// Latency above which a slow-but-successful WAL write proactively fails over to the next
+    /// WAL directory (see [`Options::wal_failover_latency_threshold`]). `None` disables it.
+    wal_failover_latency_threshold: Option<std::time::Duration>,
     /// Number of obsolete WAL files to retain for recycling (see [`Options::wal_recycle_limit`]).
     wal_recycle_limit: usize,
     state: Mutex<State>,
@@ -1104,6 +1118,7 @@ impl DbInner {
                 shutdown: false,
                 flush_count: 0,
                 compaction_count: 0,
+                wal_failover_count: 0,
                 flush_bytes: 0,
                 compaction_bytes: 0,
                 read_miss: std::collections::HashMap::new(),
@@ -1126,6 +1141,7 @@ impl DbInner {
                 blob_store,
                 mem_table_size: opts.mem_table_size,
                 wal_sync: opts.wal_sync,
+                wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
                 wal_recycle_limit: opts.wal_recycle_limit,
                 state: Mutex::new(state),
                 flush_lock: Mutex::new(()),
@@ -1269,6 +1285,7 @@ impl DbInner {
             shutdown: false,
             flush_count: 0,
             compaction_count: 0,
+            wal_failover_count: 0,
             flush_bytes: 0,
             compaction_bytes: 0,
             read_miss: std::collections::HashMap::new(),
@@ -1293,6 +1310,7 @@ impl DbInner {
             blob_store,
             mem_table_size: opts.mem_table_size,
             wal_sync: opts.wal_sync,
+            wal_failover_latency_threshold: opts.wal_failover_latency_threshold,
             wal_recycle_limit: opts.wal_recycle_limit,
             state: Mutex::new(state),
             flush_lock: Mutex::new(()),
@@ -1827,6 +1845,9 @@ impl DbInner {
     /// write (or its sync) fails — e.g. a stalled or failing disk. The batch is re-logged
     /// to the new WAL so it is durable before the write returns.
     fn append_to_wal(&self, state: &mut State, batch: &Batch) -> Result<()> {
+        // Time the write only when latency-triggered failover is armed (avoids a clock read on
+        // the hot path otherwise).
+        let timer = self.wal_failover_latency_threshold.map(|_| Instant::now());
         {
             let wal = state.wal.as_mut().expect("wal present");
             let res = wal.write_record(batch.as_bytes()).and_then(|_| {
@@ -1837,6 +1858,15 @@ impl DbInner {
                 }
             });
             if res.is_ok() {
+                // The write succeeded. If it was slow and a further failover directory is
+                // available, proactively switch future writes there (this batch is already
+                // durable in the current WAL, so it is not re-logged).
+                if let (Some(t), Some(threshold)) = (timer, self.wal_failover_latency_threshold)
+                    && t.elapsed() >= threshold
+                    && state.wal_dir_idx + 1 < self.wal_dirs.len()
+                {
+                    self.failover_wal(state, state.wal_dir_idx + 1)?;
+                }
                 return Ok(());
             }
             // Primary write failed: fall through to failover (if a directory is available).
@@ -1845,9 +1875,8 @@ impl DbInner {
             }
         }
         // Rotate to a fresh WAL in the next directory and re-log the batch there so it is
-        // durable. The failed WAL keeps its number in `imm_wals`-style cleanup via the
-        // normal flush path is not applicable here, so it is left for the next open's
-        // recovery scan / obsolete-file handling.
+        // durable. The failed WAL is left for the next open's recovery scan / obsolete-file
+        // handling (recovery replays every WAL directory).
         let next_dir = state.wal_dir_idx + 1;
         let new_wal = state.vs.allocate_file_number();
         let (mut writer, dir_idx) =
@@ -1864,6 +1893,24 @@ impl DbInner {
         state.wal = Some(writer);
         state.wal_number = new_wal;
         state.wal_dir_idx = dir_idx;
+        state.wal_failover_count += 1;
+        Ok(())
+    }
+
+    /// Switches the active WAL to a fresh log in the directory at or after `start_dir` (forward
+    /// only), leaving the current WAL in place. Used for latency-triggered failover, where the
+    /// triggering batch is already durable in the current WAL; the active memtable simply spans
+    /// both logs and recovery replays each. Counts the switch in `wal_failover_count`.
+    fn failover_wal(&self, state: &mut State, start_dir: usize) -> Result<()> {
+        let new_wal = state.vs.allocate_file_number();
+        let (writer, dir_idx) = create_wal(self.fs.as_ref(), &self.wal_dirs, start_dir, new_wal)?;
+        if let Some(l) = &self.listener {
+            l.on_wal_created(new_wal);
+        }
+        state.wal = Some(writer);
+        state.wal_number = new_wal;
+        state.wal_dir_idx = dir_idx;
+        state.wal_failover_count += 1;
         Ok(())
     }
 
@@ -2682,6 +2729,7 @@ impl DbInner {
             last_sequence: state.vs.last_sequence,
             flush_count: state.flush_count,
             compaction_count: state.compaction_count,
+            wal_failover_count: state.wal_failover_count,
             block_cache_hits,
             block_cache_misses,
             total_sstables,
@@ -3138,6 +3186,10 @@ pub struct Metrics {
     pub flush_count: u64,
     /// Number of compactions performed this session.
     pub compaction_count: u64,
+    /// Number of WAL failovers this session — switches of the active WAL to the next directory,
+    /// on a failed primary write or (when [`Options::wal_failover_latency_threshold`] is set) a
+    /// slow one.
+    pub wal_failover_count: u64,
     /// Number of block-cache hits so far (0 if caching is disabled).
     pub block_cache_hits: u64,
     /// Number of block-cache misses so far (0 if caching is disabled).

@@ -4121,3 +4121,142 @@ fn span_hint_persists_across_reopen() {
          the run); the persisted span hint should let it skip the rest without opening them"
     );
 }
+
+/// A slow-but-successful WAL write proactively fails the WAL over to the secondary directory
+/// when `wal_failover_latency_threshold` is set, and the data remains correct and recoverable.
+#[test]
+fn slow_wal_write_triggers_latency_failover() {
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+
+    // A writable that sleeps on its durability barrier, simulating a slow disk.
+    struct SlowWritable {
+        inner: Box<dyn WritableFile>,
+        delay: Duration,
+    }
+    impl Write for SlowWritable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            std::thread::sleep(self.delay);
+            self.inner.flush()
+        }
+    }
+    impl WritableFile for SlowWritable {
+        fn sync_all(&mut self) -> io::Result<()> {
+            std::thread::sleep(self.delay);
+            self.inner.sync_all()
+        }
+    }
+
+    // Makes `.log` writes under `slow_dir` slow; everything else delegates unchanged.
+    struct SlowFs {
+        inner: Arc<dyn Fs>,
+        slow_dir: PathBuf,
+        delay: Duration,
+    }
+    impl SlowFs {
+        fn wrap(&self, path: &Path, w: Box<dyn WritableFile>) -> Box<dyn WritableFile> {
+            if path.extension().is_some_and(|e| e == "log") && path.starts_with(&self.slow_dir) {
+                Box::new(SlowWritable {
+                    inner: w,
+                    delay: self.delay,
+                })
+            } else {
+                w
+            }
+        }
+    }
+    impl Fs for SlowFs {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            let w = self.inner.create(path)?;
+            Ok(self.wrap(path, w))
+        }
+        fn reuse(&self, path: &Path) -> io::Result<Box<dyn WritableFile>> {
+            let w = self.inner.reuse(path)?;
+            Ok(self.wrap(path, w))
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.inner.read(path)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn size(&self, path: &Path) -> io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn lock(&self, path: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(path)
+        }
+    }
+
+    let primary = PathBuf::from("/lat-primary");
+    let secondary = PathBuf::from("/lat-secondary");
+    let fs: Arc<dyn Fs> = Arc::new(SlowFs {
+        inner: Arc::new(MemFs::new()),
+        slow_dir: primary.clone(),
+        delay: Duration::from_millis(30),
+    });
+
+    let db = Db::open(
+        &primary,
+        Options {
+            fs: Arc::clone(&fs),
+            wal_failover_dir: Some(secondary.clone()),
+            wal_failover_latency_threshold: Some(Duration::from_millis(5)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The first write hits the slow primary WAL (30ms > 5ms), tripping a latency failover; later
+    // writes land on the fast secondary.
+    db.set(b"k1", b"v1").unwrap();
+    db.set(b"k2", b"v2").unwrap();
+    db.set(b"k3", b"v3").unwrap();
+
+    assert!(
+        db.metrics().wal_failover_count >= 1,
+        "a slow WAL write should trigger a latency failover, got {}",
+        db.metrics().wal_failover_count
+    );
+    assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+
+    // The data survives a reopen — recovery replays both WAL directories.
+    drop(db);
+    let db = Db::open(
+        &primary,
+        Options {
+            fs: Arc::clone(&fs),
+            wal_failover_dir: Some(secondary.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (k, v) in [(&b"k1"[..], &b"v1"[..]), (b"k2", b"v2"), (b"k3", b"v3")] {
+        assert_eq!(
+            db.get(k).unwrap().as_deref(),
+            Some(v),
+            "key {k:?} after reopen"
+        );
+    }
+}

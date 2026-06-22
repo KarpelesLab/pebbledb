@@ -105,10 +105,15 @@ gated on the Go interop CI is under **Byte-parity & interop**.
     cold reopen seeds the hint from file metadata and the first scan skips span-free files
     without opening them to learn it.
 
-- [ ] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
-  recovery, match `pebble/wal`'s manager surface.
-  - [ ] Failover health monitoring (latency-triggered secondary switch) + the related metrics.
-  - [ ] Configurable failover policy on `Options`.
+- [x] **WAL failover manager parity.** Beyond the current multi-directory write-failover +
+  recovery: a slow-but-successful WAL write (append + sync exceeding
+  `Options::wal_failover_latency_threshold`) now proactively fails the WAL over to the next
+  directory (Pebble's latency-triggered failover), counted in `Metrics::wal_failover_count`
+  (which also covers error-triggered failovers). The switch is forward-only toward the last
+  configured directory.
+  - [ ] Deferred (niche): health-probe **switchback** to the primary once it recovers, and a
+    richer per-directory health/latency-policy surface. The forward latency+error failover above
+    covers the common slow/failing-disk case.
 
 ### Byte-parity & interop (Go CI)
 
