@@ -120,27 +120,34 @@ gated on the Go interop CI is under **Byte-parity & interop**.
 These are correctness-vs-upstream checks; the formats are implemented to spec with in-crate
 round-trip tests, but exact byte-parity is proven only by the Go interop workflow.
 
-> **Blocked on an upstream Pebble release.** The columnar block format
-> (`FormatColumnarBlocks`), separate blob files, and the current objstorage catalog format
-> exist only on Pebble's `master`; the newest *tagged* release is `v1.1.5`, which predates all
-> three (`go list -m -versions github.com/cockroachdb/pebble` stops at `v1.1.5`). The interop
-> workflow pins a tagged release for reproducibility, so these round-trips cannot be added to
-> CI until Pebble tags a release that includes them. The in-crate encoders/decoders are
-> implemented and round-trip-tested; only the cross-engine byte-parity check is gated.
+> **In progress (Pebble v2).** The interop workflow now pins **Pebble v2** (`pebble/v2`,
+> v2.1.6), which is the tagged line that ships `FormatColumnarBlocks` and separate blob files —
+> so these are no longer externally blocked. The row format round-trips both ways against v2
+> (this required writing the `marker.format-version` file Pebble treats as authoritative). The
+> columnar and blob round-trips are the remaining work; the reference source is vendored locally
+> for byte comparison.
 
 - [ ] **Columnar round-trip in interop.** Extend the workflow beyond the row format.
+  - [ ] **Read parity:** our `colblk` reader cannot yet parse a Pebble v2.1.6 columnar sstable.
+    The shared block *header* matches; per-block *schema* differs — e.g. Pebble's index block has
+    four columns (separator, offsets, lengths, **block-properties**); the data block uses
+    `DefaultKeySchema` (`PrefixBytes` prefix column + suffix + trailer + value). Reconcile each
+    block type against the vendored v2.1.6 source until `ColumnarReader` reads a real file.
+  - [ ] **Engine integration:** `sstable::Reader::open` currently *rejects* columnar tables
+    (`is_columnar()` → error). Dispatch the read path (lookup / iter / spans) to the columnar
+    reader so the engine can open a columnar DB.
   - [ ] Match `colblk.DefaultKeySchema(comparer, 16)`'s exact `KeySchema` name string.
-  - [ ] Verify/finish the `PrefixBytes` delta-offset sub-encoding (see `sstable::colblk`).
-  - [ ] Extend `.github/workflows/interop.yml` to round-trip a columnar
-    (`FormatColumnarBlocks`+) table both ways.
-- [ ] **Blob file format byte-parity.** Diff `sstable::blob` output against a Pebble-written
-  blob file in the interop workflow; reconcile magic/footer/handle encoding.
+  - [ ] Extend `.github/workflows/interop.yml` to round-trip a columnar table both ways
+    (`interop-tool generate-columnar` already writes one).
+- [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
+  `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
+  encoding. (No longer blocked — v2 is tagged.)
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
   open-rescan remains as a fallback for legacy / upstream-Pebble records. (Byte-parity with
-  Pebble's own richer `NewFile5` blob-reference encoding — value sizes, reference depth — stays
-  under the blocked columnar/blob work above.)
+  Pebble's own richer `NewFile5` blob-reference encoding — value sizes, reference depth — is part
+  of the blob byte-parity work above.)
 - [ ] **objstorage catalog byte-format.** Match Pebble's shared-object catalog on-disk format
   so a disaggregated store round-trips through the interop workflow.
 - [ ] **Port Pebble's `testdata` corpus.** Vendor a subset of upstream data-driven fixtures
