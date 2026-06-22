@@ -355,8 +355,9 @@ pub fn decode_raw_bytes(b: &[u8], off: usize, count: usize) -> Result<(Vec<&[u8]
     Ok((out, end))
 }
 
-const BITMAP_ZERO: u8 = 0;
-const BITMAP_DEFAULT: u8 = 1;
+// Match Pebble's `bitmapEncoding` iota: defaultBitmapEncoding = 0, zeroBitmapEncoding = 1.
+const BITMAP_DEFAULT: u8 = 0;
+const BITMAP_ZERO: u8 = 1;
 
 /// Encodes a bool column as a bitmap at `offset` within `buf`. Returns the offset past it.
 pub fn encode_bitmap(bits: &[bool], offset: usize, buf: &mut Vec<u8>) -> usize {
@@ -824,11 +825,19 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
             .collect();
         let trailer_off = self.header.columns[num_key_cols + DATA_COL_TRAILER].page_offset as usize;
         let value_off = self.header.columns[num_key_cols + DATA_COL_VALUE].page_offset as usize;
+        let is_external_off =
+            self.header.columns[num_key_cols + DATA_COL_VALUE_EXTERNAL].page_offset as usize;
 
-        // NOTE: out-of-line (value-block) columnar values — flagged by the is-value-external
-        // column — are not decoded yet; such a value column holds a handle rather than the value.
-        // (Our bool-column decoder does not yet match Pebble's compact all-equal bitmap form, so
-        // that column is not consulted here.)
+        // Out-of-line (value-block) columnar values — flagged by the is-value-external column —
+        // are not decoded yet; such a value column holds a handle rather than the value. Reject
+        // them rather than return a handle as if it were the value.
+        let (is_external, _) = decode_bitmap(self.block, is_external_off, rows)?;
+        if is_external.iter().any(|&x| x) {
+            return Err(Error::Unsupported(
+                "colblk: out-of-line (value-block) columnar values are not yet supported",
+            ));
+        }
+
         let keys = self.schema.decode_keys(self.block, &key_offsets, rows)?;
         let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
         let (values, _) = decode_raw_bytes(self.block, value_off, rows)?;
@@ -847,6 +856,7 @@ const DATA_BLOCK_TRAILING_COLUMNS: usize = 5;
 /// Indices of the fixed columns relative to the end of the key-schema columns.
 const DATA_COL_TRAILER: usize = 0;
 const DATA_COL_VALUE: usize = 2;
+const DATA_COL_VALUE_EXTERNAL: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Columnar index block
