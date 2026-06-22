@@ -28,6 +28,7 @@ use crate::base::range_del::RangeTombstone;
 use crate::base::range_key::RangeKeyEntry;
 use crate::manifest::{FileMetadata, NUM_LEVELS, NewFileEntry, Version, VersionEdit};
 use crate::sstable::Writer;
+use crate::sstable::columnar::ColumnarWriter;
 use crate::vfs::{Fs, WritableFile};
 
 use super::merging_iter::{BoundedIter, InternalIter, MergingIter};
@@ -740,6 +741,11 @@ impl DbInner {
         // all compacted data, so it lands in the top stripe — whose newest version per key is
         // always kept — and is therefore unaffected by this compaction.
 
+        // Columnar output stores values inline, so blob references are resolved to bytes rather
+        // than preserved (the cross-sstable blob-sharing optimization applies to row output only).
+        let columnar_output =
+            self.format_major_version() >= crate::FormatMajorVersion::COLUMNAR_BLOCKS;
+
         let mut outputs: Vec<FileMetadata> = Vec::new();
         let mut builder: Option<OutputBuilder> = None;
         let mut prev_user: Option<Vec<u8>> = None;
@@ -754,7 +760,10 @@ impl DbInner {
             // A blob-referenced value can be carried over to the output without rewriting it
             // (cross-sstable sharing); otherwise take the resolved value bytes.
             let blob_ref = merge.blob_ref();
-            let value = if blob_ref.is_none() {
+            // For columnar output (which has no blob files) always materialize the resolved value
+            // so it can be stored inline; for row output a preserved blob reference avoids
+            // rewriting the value.
+            let value = if blob_ref.is_none() || columnar_output {
                 merge.value().to_vec()
             } else {
                 Vec::new()
@@ -837,8 +846,10 @@ impl DbInner {
             }
             let b = builder.as_mut().unwrap();
             match blob_ref {
-                Some((blob_num, handle)) => b.add_preserved_blob(&ikey, blob_num, handle)?,
-                None => b.add(&ikey, &value)?,
+                Some((blob_num, handle)) if !columnar_output => {
+                    b.add_preserved_blob(&ikey, blob_num, handle)?
+                }
+                _ => b.add(&ikey, &value)?,
             }
         }
         if let Some(b) = builder.take() {
@@ -1026,12 +1037,36 @@ impl DbInner {
     }
 }
 
+/// The sstable writer backing a compaction output: a row writer, or — at a columnar format
+/// major version — a columnar writer. The columnar variant stores values inline (no value-block
+/// / blob separation) and buffers the whole table in memory, written out at finish.
+enum CompactionWriter {
+    Row(Box<Writer<Box<dyn WritableFile>>>),
+    Columnar(Box<ColumnarWriter>),
+}
+
+impl CompactionWriter {
+    fn add(&mut self, ikey: &[u8], value: &[u8]) -> Result<()> {
+        match self {
+            CompactionWriter::Row(w) => w.add(ikey, value),
+            CompactionWriter::Columnar(w) => w.add(ikey, value),
+        }
+    }
+
+    fn estimated_size(&self) -> u64 {
+        match self {
+            CompactionWriter::Row(w) => w.estimated_size(),
+            CompactionWriter::Columnar(w) => w.estimated_size(),
+        }
+    }
+}
+
 /// Accumulates entries into one output sstable during compaction, tracking the file's
 /// key-range and sequence-number bounds across both point keys and range tombstones.
 struct OutputBuilder {
     file_num: u64,
     path: std::path::PathBuf,
-    writer: Writer<Box<dyn WritableFile>>,
+    writer: CompactionWriter,
     cmp_dyn: Arc<dyn crate::base::comparer::Comparer>,
     fs: Arc<dyn Fs>,
     smallest: Option<Vec<u8>>,
@@ -1043,22 +1078,34 @@ struct OutputBuilder {
 impl OutputBuilder {
     fn new(db: &DbInner, file_num: u64) -> Result<OutputBuilder> {
         let path = db.dir.join(filenames::table(file_num));
-        let mut writer = Writer::new(
-            db.fs.create(&path)?,
-            db.cmp.clone(),
-            // Blob-file rewrite: compaction reads each input value (resolving any blob
-            // reference) and, when blob separation is enabled, re-stores large values in this
-            // output's own blob file — so large values stay out of the sstable across
-            // compactions. Each input's blob file becomes obsolete with its sstable.
-            super::engine_writer_options(
-                db.value_block_threshold,
-                db.blob_value_threshold,
-                file_num,
-            ),
-        );
-        for factory in &db.block_property_collectors {
-            writer.add_block_property_collector(factory());
-        }
+        let writer = if db.format_major_version() >= crate::FormatMajorVersion::COLUMNAR_BLOCKS {
+            // Columnar output: values inline, whole table buffered then written at finish.
+            CompactionWriter::Columnar(Box::new(ColumnarWriter::new(
+                db.cmp.clone(),
+                crate::sstable::WriterOptions {
+                    table_format: crate::sstable::TableFormat::Pebble(5),
+                    ..Default::default()
+                },
+            )))
+        } else {
+            let mut writer = Writer::new(
+                db.fs.create(&path)?,
+                db.cmp.clone(),
+                // Blob-file rewrite: compaction reads each input value (resolving any blob
+                // reference) and, when blob separation is enabled, re-stores large values in this
+                // output's own blob file — so large values stay out of the sstable across
+                // compactions. Each input's blob file becomes obsolete with its sstable.
+                super::engine_writer_options(
+                    db.value_block_threshold,
+                    db.blob_value_threshold,
+                    file_num,
+                ),
+            );
+            for factory in &db.block_property_collectors {
+                writer.add_block_property_collector(factory());
+            }
+            CompactionWriter::Row(Box::new(writer))
+        };
         Ok(OutputBuilder {
             file_num,
             path,
@@ -1108,7 +1155,16 @@ impl OutputBuilder {
         blob_num: u64,
         handle: crate::sstable::blob::BlobHandle,
     ) -> Result<()> {
-        self.writer.add_preserved_blob(ikey, blob_num, handle)?;
+        match &mut self.writer {
+            CompactionWriter::Row(w) => w.add_preserved_blob(ikey, blob_num, handle)?,
+            // Columnar output stores values inline, so run_compaction resolves blob-referenced
+            // values to bytes and uses `add` instead — this path is never taken.
+            CompactionWriter::Columnar(_) => {
+                return Err(crate::Error::InvalidState(
+                    "columnar compaction output cannot preserve blob references".into(),
+                ));
+            }
+        }
         self.extend_bounds(ikey, encoded_trailer(ikey) >> 8);
         Ok(())
     }
@@ -1138,18 +1194,31 @@ impl OutputBuilder {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<FileMetadata> {
-        let blob_bytes = self.writer.take_blob_file()?;
-        let blob_refs = self.writer.blob_refs().to_vec();
-        let mut file = self.writer.finish()?;
-        file.sync_all()?;
-        // Write this output's sibling blob file, if blob rewrite separated any new values.
-        if let Some(b) = &blob_bytes {
-            let blob_path = self.path.with_file_name(filenames::blob(self.file_num));
-            let mut bf = self.fs.create(&blob_path)?;
-            bf.write_all(b)?;
-            bf.sync_all()?;
-        }
+    fn finish(self) -> Result<FileMetadata> {
+        let blob_refs = match self.writer {
+            CompactionWriter::Row(mut w) => {
+                let blob_bytes = w.take_blob_file()?;
+                let blob_refs = w.blob_refs().to_vec();
+                let mut file = w.finish()?;
+                file.sync_all()?;
+                // Write this output's sibling blob file, if blob rewrite separated any new values.
+                if let Some(b) = &blob_bytes {
+                    let blob_path = self.path.with_file_name(filenames::blob(self.file_num));
+                    let mut bf = self.fs.create(&blob_path)?;
+                    bf.write_all(b)?;
+                    bf.sync_all()?;
+                }
+                blob_refs
+            }
+            CompactionWriter::Columnar(w) => {
+                // Columnar output buffers the whole table; write it out now. No blob files.
+                let bytes = w.finish()?;
+                let mut file = self.fs.create(&self.path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                Vec::new()
+            }
+        };
         let size = self.fs.size(&self.path)?;
         Ok(FileMetadata {
             file_num: self.file_num,

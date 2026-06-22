@@ -170,10 +170,14 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     end-to-end test (flushed file is columnar; reads round-trip with the range deletion applied)
     and a Rust→Go interop step where the engine writes a columnar database that Pebble v2 opens
     and reads.
-  - [ ] **Columnar compaction output.** Compaction still writes row sstables, so a columnar
-    database becomes mixed-format after compaction (valid — both formats read fine in either
-    engine). Emitting columnar from compaction (and optional value-block separation) is the last
-    columnar step.
+  - [x] **Columnar compaction output.** Compaction also emits columnar sstables at a columnar
+    format major version (via a `CompactionWriter` enum wrapping the row or columnar writer), so a
+    columnar database stays columnar end-to-end. Blob-referenced values are resolved to bytes and
+    stored inline rather than preserved (the cross-sstable blob-sharing optimization is row-only).
+    Verified by an end-to-end test (forced flushes + full compaction; every surviving sstable is
+    columnar and overwritten values are correct) and a Rust→Go interop step where the engine
+    writes, compacts, and Pebble v2 reads the columnar database. Optional value-block separation in
+    columnar output remains a space optimization, not required for parity.
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
   `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
   encoding. (No longer blocked — v2 is tagged.)

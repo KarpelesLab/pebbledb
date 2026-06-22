@@ -4565,3 +4565,59 @@ fn engine_flushes_columnar_sstables_at_columnar_format() {
         }
     }
 }
+
+/// At a columnar format major version, compaction output is also columnar, so a database stays
+/// columnar end-to-end. This forces several flushes then a full compaction and asserts every
+/// surviving sstable is columnar and the (overwritten) values are correct.
+#[test]
+fn engine_compacts_to_columnar_sstables() {
+    use pebbledb::FormatMajorVersion;
+    use pebbledb::sstable::Reader;
+
+    let dir = temp_dir("columnar-compact");
+    let opts = Options {
+        format_major_version: FormatMajorVersion::COLUMNAR_BLOCKS,
+        mem_table_size: 16 * 1024, // small, to force multiple flushes
+        ..Default::default()
+    };
+
+    let db = Db::open(&dir, opts).unwrap();
+    // Two passes over the same keys: the second overwrites, so compaction must drop older
+    // versions — exercising the merge/value path of the columnar compaction output.
+    for pass in 0..2 {
+        for i in 0..400u32 {
+            db.set(
+                format!("key{i:05}").as_bytes(),
+                format!("v{i}-pass{pass}").as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // Every sstable on disk must be columnar (flush and compaction both emit columnar).
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sst") {
+            let bytes = std::fs::read(&path).unwrap();
+            let r = Reader::open(bytes, Arc::new(pebbledb::DefaultComparer)).unwrap();
+            assert!(
+                r.format().is_columnar(),
+                "compacted sstable {path:?} should be columnar"
+            );
+            count += 1;
+        }
+    }
+    assert!(count > 0, "expected sstables after compaction");
+
+    // Values reflect the second pass.
+    for i in 0..400u32 {
+        let k = format!("key{i:05}");
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(format!("v{i}-pass1").as_bytes())
+        );
+    }
+}

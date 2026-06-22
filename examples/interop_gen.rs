@@ -40,5 +40,10 @@ fn main() {
         db.set(k.as_bytes(), v.as_bytes()).expect("set");
     }
     db.flush().expect("flush");
+    if columnar {
+        // Force a compaction so the columnar interop also covers compaction output (not just
+        // freshly-flushed L0 tables).
+        db.compact_range(None, None).expect("compact");
+    }
     println!("wrote 100 keys to {dir}");
 }

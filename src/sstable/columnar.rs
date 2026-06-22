@@ -101,6 +101,12 @@ impl ColumnarWriter {
         }
     }
 
+    /// An estimate of the bytes written so far: flushed blocks plus the pending data block. Used
+    /// by compaction to decide output-file boundaries (approximate, like the row writer's).
+    pub fn estimated_size(&self) -> u64 {
+        (self.buf.len() + self.approx_block_bytes) as u64
+    }
+
     /// Adds an entry. `internal_key` is the encoded internal key (user key + trailer). Point
     /// keys must be added in ascending internal-key order; range deletions and range keys form
     /// their own sorted streams (routed to keyspan blocks), exactly like the row writer's `add`.
