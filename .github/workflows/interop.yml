@@ -85,3 +85,10 @@ jobs:
 
       - name: Go reads the Rust-written database
         run: ./target/interop-tool verify "$RUNNER_TEMP/from-rust"
+
+      # Reverse columnar: the Rust writer emits a columnar sstable, Go Pebble reads it back.
+      - name: Rust generates a columnar sstable
+        run: cargo run --example columnar_sst_gen -- "$RUNNER_TEMP/from-rust-columnar.sst"
+
+      - name: Go reads the Rust-written columnar sstable
+        run: ./target/interop-tool verify-columnar-sst "$RUNNER_TEMP/from-rust-columnar.sst"

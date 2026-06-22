@@ -10,6 +10,7 @@
 //	interop generate-columnar-spans <dir> columnar keys + a range deletion and a range key
 //	interop generate-columnar-valueblock <dir> columnar table with an out-of-line value block
 //	interop verify                <dir>   open <dir> read-only and verify the known keys
+//	interop verify-columnar-sst   <file>  read a Rust-written columnar .sst and verify the keys
 //
 // The keys are key0000..key0099 with values value0..value99.
 package main
@@ -21,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 const n = 100
@@ -52,6 +54,9 @@ func main() {
 		generateColumnarValueBlock(dir)
 	case "verify":
 		verify(dir)
+	case "verify-columnar-sst":
+		// `dir` is actually a path to a single columnar .sst file written by the Rust engine.
+		verifyColumnarSST(dir)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)
@@ -128,6 +133,37 @@ func verify(dir string) {
 		closer.Close()
 	}
 	fmt.Printf("verified %d keys in %s\n", n, dir)
+}
+
+// verifyColumnarSST opens a single columnar sstable written by the Rust engine and verifies the
+// known keys read back through Pebble's own sstable reader — the Rust→Go columnar byte-parity
+// direction. The file holds key0000..key0099 => value0..value99.
+func verifyColumnarSST(path string) {
+	data, err := os.ReadFile(path)
+	must(err)
+	r, err := sstable.NewMemReader(data, sstable.ReaderOptions{})
+	must(err)
+	defer r.Close()
+	it, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	must(err)
+	count := 0
+	for kv := it.First(); kv != nil; kv = it.Next() {
+		v, _, err := kv.Value(nil)
+		must(err)
+		wantK := fmt.Sprintf("key%04d", count)
+		wantV := fmt.Sprintf("value%d", count)
+		if string(kv.K.UserKey) != wantK || string(v) != wantV {
+			fmt.Fprintf(os.Stderr, "mismatch at %d: key=%q value=%q\n", count, kv.K.UserKey, v)
+			os.Exit(1)
+		}
+		count++
+	}
+	must(it.Error())
+	if count != n {
+		fmt.Fprintf(os.Stderr, "expected %d keys, got %d\n", n, count)
+		os.Exit(1)
+	}
+	fmt.Printf("verified %d keys in columnar sstable %s\n", count, path)
 }
 
 func must(err error) {

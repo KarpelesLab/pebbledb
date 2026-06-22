@@ -882,6 +882,9 @@ const DATA_COL_VALUE_EXTERNAL: usize = 3;
 // ---------------------------------------------------------------------------
 
 const INDEX_BLOCK_COLUMNS: usize = 3;
+/// Pebble's index block has a fourth block-properties column; we write all four (its reader
+/// requires them) but read only the first three.
+const INDEX_BLOCK_WRITE_COLUMNS: usize = 4;
 const IDX_COL_SEPARATOR: usize = 0;
 const IDX_COL_OFFSET: usize = 1;
 const IDX_COL_LENGTH: usize = 2;
@@ -915,10 +918,13 @@ impl IndexBlockBuilder {
         let rows = self.offsets.len();
         let mut buf = Vec::new();
         buf.push(DATA_BLOCK_VERSION);
-        buf.extend_from_slice(&(INDEX_BLOCK_COLUMNS as u16).to_le_bytes());
+        buf.extend_from_slice(&(INDEX_BLOCK_WRITE_COLUMNS as u16).to_le_bytes());
         buf.extend_from_slice(&(rows as u32).to_le_bytes());
         let headers_at = buf.len();
-        buf.resize(headers_at + INDEX_BLOCK_COLUMNS * COLUMN_HEADER_LEN, 0);
+        buf.resize(
+            headers_at + INDEX_BLOCK_WRITE_COLUMNS * COLUMN_HEADER_LEN,
+            0,
+        );
 
         let sep_refs: Vec<&[u8]> = self.separators.iter().map(|s| s.as_slice()).collect();
         let sep_off = buf.len();
@@ -927,12 +933,19 @@ impl IndexBlockBuilder {
         encode_uint_column(&self.offsets, off_off, &mut buf);
         let len_off = buf.len();
         encode_uint_column(&self.lengths, len_off, &mut buf);
+        // Pebble's index block carries a fourth block-properties column (raw bytes, one empty
+        // entry per data block when no block-property collectors are configured). Pebble's index
+        // reader requires it, so emit it even though our own reader ignores it.
+        let empty: Vec<&[u8]> = vec![&[][..]; rows];
+        let props_off = buf.len();
+        encode_raw_bytes(&empty, props_off, &mut buf);
         buf.push(0); // trailing padding
 
         for (i, (ty, off)) in [
-            (3u8, sep_off), // Bytes
-            (2u8, off_off), // Uint
-            (2u8, len_off), // Uint
+            (3u8, sep_off),   // Bytes: separator
+            (2u8, off_off),   // Uint: block offset
+            (2u8, len_off),   // Uint: block length
+            (3u8, props_off), // Bytes: block properties (empty)
         ]
         .iter()
         .enumerate()

@@ -48,8 +48,10 @@ use super::{TableFormat, parse_footer};
 /// Target uncompressed size of a columnar data block before it is flushed.
 const TARGET_DATA_BLOCK_SIZE: usize = 32 * 1024;
 
-/// User-property key under which the columnar key-schema name is recorded.
-const KEY_SCHEMA_PROPERTY: &str = "pebbledb.key_schema";
+/// Property key under which the columnar key-schema name is recorded. Pebble reads its
+/// `Properties.KeySchemaName` from this exact tag to select the matching key decomposition,
+/// so emitting it lets Pebble v2 read tables this writer produces.
+const KEY_SCHEMA_PROPERTY: &str = "pebble.colblk.schema";
 
 /// Writes a columnar sstable to an in-memory buffer.
 pub struct ColumnarWriter {
