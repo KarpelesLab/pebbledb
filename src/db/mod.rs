@@ -479,6 +479,11 @@ impl NativeBlobStore {
         self.cache.lock().unwrap().insert(file_num, Arc::clone(&r));
         Ok(r)
     }
+
+    /// Drops the cached reader for a (now-deleted) native blob file.
+    fn evict(&self, file_num: u64) {
+        self.cache.lock().unwrap().remove(&file_num);
+    }
 }
 
 impl crate::sstable::pebble_blob::NativeBlobResolver for NativeBlobStore {
@@ -780,11 +785,23 @@ impl DbInner {
             // candidates for deletion. A virtual sstable contributes its backing file.
             let mut candidate_tables: Vec<u64> = Vec::new();
             let mut candidate_blobs: Vec<u64> = Vec::new();
+            // A native (Pebble) blob file is named `<num>.blob` like a sibling blob; a file's
+            // `pebble_blob_refs` carry blob-file *reference IDs* mapped to numbers through the
+            // version's blob-file registry. Snapshot the registry so the retain closure (which
+            // borrows `state.obsolete`) can resolve without re-borrowing `state`.
+            let blob_registry = state.vs.blob_files.clone();
+            let native_nums = |f: &FileMetadata| -> Vec<u64> {
+                f.pebble_blob_refs
+                    .iter()
+                    .filter_map(|(id, _)| blob_registry.get(id).copied())
+                    .collect::<Vec<_>>()
+            };
             state.obsolete.retain(|(num, arc)| {
                 if Arc::strong_count(arc) == 1 {
                     ready.push(*num);
                     candidate_tables.push(arc.physical_num());
                     candidate_blobs.extend(arc.blob_refs.iter().copied());
+                    candidate_blobs.extend(native_nums(arc));
                     false
                 } else {
                     true
@@ -801,11 +818,13 @@ impl DbInner {
                 for f in level {
                     live_tables.insert(f.physical_num());
                     live_blobs.extend(f.blob_refs.iter().copied());
+                    live_blobs.extend(native_nums(f));
                 }
             }
             for (_, arc) in &state.obsolete {
                 live_tables.insert(arc.physical_num());
                 live_blobs.extend(arc.blob_refs.iter().copied());
+                live_blobs.extend(native_nums(arc));
             }
             (
                 ready,
@@ -821,11 +840,14 @@ impl DbInner {
                 l.on_table_deleted(*file_num);
             }
         }
-        // Drop span hints for the removed logical files so the map stays bounded.
+        // Drop span hints and native-blob references for the removed logical files so the maps
+        // stay bounded.
         if !ready.is_empty() {
             let mut hints = self.span_hint.lock().unwrap();
+            let mut nbr = self.native_blob_refs.lock().unwrap();
             for file_num in &ready {
                 hints.remove(file_num);
+                nbr.remove(file_num);
             }
         }
         // Delete physical sstables no live or in-flight file still references (a backing file
@@ -844,7 +866,9 @@ impl DbInner {
                 }
             }
         }
-        // Delete blob files the removed sstables referenced that no live file still needs.
+        // Delete blob files the removed sstables referenced that no live file still needs. A
+        // candidate is either a sibling blob or a native (Pebble) blob — both are named
+        // `<num>.blob`; evicting both caches is harmless when only one applies.
         for blob in candidate_blobs {
             if !live_blobs.contains(&blob) {
                 let name = filenames::blob(blob);
@@ -852,9 +876,11 @@ impl DbInner {
                     && remote.exists(&name)
                 {
                     self.blob_store.evict(blob);
+                    self.native_blob_store.evict(blob);
                     let _ = remote.delete(&name);
                 } else if self.fs.exists(&self.dir.join(&name)) {
                     self.blob_store.evict(blob);
+                    self.native_blob_store.evict(blob);
                     self.clean_file(&self.dir.join(&name));
                 }
             }

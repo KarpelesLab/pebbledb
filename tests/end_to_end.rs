@@ -4738,11 +4738,42 @@ fn compaction_keeps_values_separated() {
         );
     }
 
+    // A second write + compaction cycle. Its `collect_obsolete` pass frees the first cycle's now-
+    // unreferenced inputs, so their native blob files must be deleted along with the sstables — not
+    // left orphaned on disk. Each value-separated sstable owns exactly one blob (1:1), so after
+    // collection the number of blob files must equal the number of v7 sstables on disk; an orphaned
+    // blob (the pre-GC bug) would make blobs outnumber sstables.
+    for k in 120..150u32 {
+        db.set(format!("key{k:05}").as_bytes(), big(k).as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+
+    let count_ext = |ext: &str| {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some(ext)
+            })
+            .count()
+    };
+    assert_eq!(
+        count_ext("blob"),
+        count_ext("sst"),
+        "obsolete native blob files must be GC'd with their sstables (no orphans)"
+    );
+
     // Reopen and read every value back — resolution comes from the compacted file's
     // MANIFEST-persisted blob references, proving the compaction wrote them correctly.
     drop(db);
     let db = Db::open(&dir, opts).unwrap();
-    for k in 0..120u32 {
+    for k in 0..150u32 {
         assert_eq!(
             db.get(format!("key{k:05}").as_bytes()).unwrap().as_deref(),
             Some(big(k).as_bytes()),
