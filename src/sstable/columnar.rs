@@ -38,8 +38,10 @@ use super::block::{BlockHandle, BlockIter, ChecksumType, CompressionType, read_b
 use super::colblk;
 use super::keyschema::{DefaultKeySchema, KeySchema};
 use super::properties::{
-    META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME, Properties,
+    META_PROPERTIES_NAME, META_RANGE_DEL_NAME, META_RANGE_KEY_NAME, META_VALUE_INDEX_NAME,
+    Properties,
 };
+use super::valblk;
 use super::writer::{BlockBuilder, WriterOptions, encode_footer, write_block};
 use super::{TableFormat, parse_footer};
 
@@ -198,6 +200,10 @@ pub struct ColumnarReader {
     checksum: ChecksumType,
     /// The metaindex block handle, used to locate the keyspan (range-del / range-key) blocks.
     metaindex: BlockHandle,
+    /// Handles of the table's value blocks (from the `pebble.value_index` metaindex entry),
+    /// used to resolve out-of-line (is-value-external) columnar values. Empty if the table
+    /// has no value blocks.
+    value_block_handles: Vec<BlockHandle>,
     /// Index entries: each data block's last user key and its handle.
     index: Vec<(Vec<u8>, BlockHandle)>,
 }
@@ -225,14 +231,60 @@ impl ColumnarReader {
             })
             .collect();
         let schema = DefaultKeySchema::with_default_bundle_size(cmp.clone());
+
+        // Read the value-block index (if any) from the metaindex so out-of-line columnar values
+        // can be resolved. Absent for tables that store every value inline.
+        let mut value_block_handles = Vec::new();
+        let metaindex_block = read_block(&file, footer.metaindex, footer.checksum)?;
+        let mut mit = BlockIter::new(metaindex_block)?;
+        mit.first();
+        while mit.valid() {
+            if mit.key() == META_VALUE_INDEX_NAME.as_bytes() {
+                let ih = valblk::decode_index_handle(mit.value())?;
+                let index_block = read_block(&file, ih.handle, footer.checksum)?;
+                value_block_handles = valblk::decode_index(&index_block, &ih)?;
+                break;
+            }
+            mit.next();
+        }
+
         Ok(ColumnarReader {
             file,
             cmp,
             schema,
             checksum: footer.checksum,
             metaindex: footer.metaindex,
+            value_block_handles,
             index,
         })
+    }
+
+    /// Resolves a columnar value column entry. When `is_external` is false the entry is the
+    /// inline value, returned as-is. When true it is an out-of-line reference — a value-prefix
+    /// byte followed by an encoded value-block handle — resolved against the table's value
+    /// blocks (read + decompressed via the standard block framing).
+    fn resolve_value(&self, raw: &[u8], is_external: bool) -> Result<Vec<u8>> {
+        if !is_external {
+            return Ok(raw.to_vec());
+        }
+        if raw.is_empty() {
+            return Err(Error::corruption(
+                "columnar: empty external value reference",
+            ));
+        }
+        // raw[0] is the value-prefix byte; the handle follows.
+        let h = valblk::decode_handle(&raw[1..])?;
+        let block_handle = *self
+            .value_block_handles
+            .get(h.block_num as usize)
+            .ok_or_else(|| Error::corruption("columnar: value block number out of range"))?;
+        let block = read_block(&self.file, block_handle, self.checksum)?;
+        let start = h.offset_in_block as usize;
+        let end = start + h.value_len as usize;
+        if end > block.len() {
+            return Err(Error::corruption("columnar: value handle out of range"));
+        }
+        Ok(block[start..end].to_vec())
     }
 
     /// Reads the metaindex and decodes the columnar keyspan blocks (range deletions and range
@@ -309,10 +361,16 @@ impl ColumnarReader {
         Ok((range_dels, range_keys))
     }
 
-    /// Reads and decodes the columnar data block at `handle` into its rows.
+    /// Reads and decodes the columnar data block at `handle` into its rows, resolving any
+    /// out-of-line (value-block) values to their bytes.
     fn read_data_block(&self, handle: BlockHandle) -> Result<Vec<colblk::DataBlockRow>> {
         let block = read_block(&self.file, handle, self.checksum)?;
-        colblk::SchemaDataBlockReader::new(&block, &self.schema)?.decode_all()
+        let rows = colblk::SchemaDataBlockReader::new(&block, &self.schema)?.decode_all()?;
+        rows.into_iter()
+            .map(|(key, trailer, value, is_external)| {
+                Ok((key, trailer, self.resolve_value(&value, is_external)?))
+            })
+            .collect()
     }
 
     /// Returns every `(internal_key, value)` pair in the table, in order.

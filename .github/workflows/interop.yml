@@ -70,6 +70,15 @@ jobs:
           PEBBLEDB_INTEROP_SPANS_DIR: ${{ runner.temp }}/from-go-columnar-spans
         run: cargo test --test interop -- --nocapture
 
+      # Columnar value block: Go writes a columnar DB with an out-of-line (value-block) value.
+      - name: Go generates a columnar Pebble database with a value block
+        run: ./target/interop-tool generate-columnar-valueblock "$RUNNER_TEMP/from-go-columnar-vb"
+
+      - name: Rust reads the Go-written columnar value-block database
+        env:
+          PEBBLEDB_INTEROP_VALUEBLOCK_DIR: ${{ runner.temp }}/from-go-columnar-vb
+        run: cargo test --test interop -- --nocapture
+
       # Reverse: the Rust engine writes a DB, Go Pebble reads it back.
       - name: Rust generates a pebbledb database
         run: cargo run --example interop_gen -- "$RUNNER_TEMP/from-rust"

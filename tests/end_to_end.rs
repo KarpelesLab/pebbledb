@@ -4460,3 +4460,49 @@ fn reads_pebble_v2_columnar_keyspans_fixture() {
     assert_eq!(svs[0].suffix, b"@1");
     assert_eq!(svs[0].value, b"rkval");
 }
+
+/// Reads a real Pebble v2 columnar sstable that stores an **out-of-line value** in a value
+/// block (is-value-external). The fixture has key00002 written twice with a snapshot pinning
+/// the older version, so the older SET's value is separated into a value block; reading it back
+/// exercises the columnar value-block resolution path. Values: key00002 newest =
+/// "NEWVALUE-" + 20×'n' (inline), older = "OLDVALUE-" + 20×'o' (out-of-line).
+#[test]
+fn reads_pebble_v2_columnar_value_block_fixture() {
+    use pebbledb::DefaultComparer;
+    use pebbledb::base::internal_key::encoded_user_key;
+    use pebbledb::sstable::Reader;
+
+    let bytes = include_bytes!("fixtures/pebble_v2_columnar_valueblock.sst").to_vec();
+    let reader = Arc::new(Reader::open(bytes, Arc::new(DefaultComparer)).expect("open columnar"));
+
+    let new_value = format!("NEWVALUE-{}", "n".repeat(20));
+    let old_value = format!("OLDVALUE-{}", "o".repeat(20));
+
+    // The newest version of key00002 resolves to the inline NEWVALUE.
+    let got = reader
+        .get(b"key00002", u64::MAX)
+        .expect("lookup")
+        .map(|(_, v)| v);
+    assert_eq!(got.as_deref(), Some(new_value.as_bytes()));
+
+    // A full internal-key scan surfaces BOTH versions of key00002, and the older one — stored
+    // out-of-line in a value block — resolves to OLDVALUE.
+    let mut it = reader.iter().expect("iter");
+    let mut key2_values = Vec::new();
+    it.first().unwrap();
+    while it.valid() {
+        if encoded_user_key(it.key()) == b"key00002" {
+            key2_values.push(it.value().to_vec());
+        }
+        it.next().unwrap();
+    }
+    assert_eq!(key2_values.len(), 2, "two versions of key00002");
+    assert!(
+        key2_values.iter().any(|v| v == new_value.as_bytes()),
+        "newest (inline) value present"
+    );
+    assert!(
+        key2_values.iter().any(|v| v == old_value.as_bytes()),
+        "older (out-of-line value-block) value resolved"
+    );
+}

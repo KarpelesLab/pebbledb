@@ -8,6 +8,7 @@
 //	interop generate              <dir>   write known keys in the row (block) sstable format
 //	interop generate-columnar     <dir>   write known keys in the columnar sstable format
 //	interop generate-columnar-spans <dir> columnar keys + a range deletion and a range key
+//	interop generate-columnar-valueblock <dir> columnar table with an out-of-line value block
 //	interop verify                <dir>   open <dir> read-only and verify the known keys
 //
 // The keys are key0000..key0099 with values value0..value99.
@@ -17,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -44,6 +46,10 @@ func main() {
 		// A columnar table that also carries keyspans: a range deletion and a range key,
 		// exercising the columnar (boundary-based) keyspan block format.
 		generateColumnarSpans(dir)
+	case "generate-columnar-valueblock":
+		// A columnar table with an out-of-line value: a key written twice with a snapshot
+		// pinning the older version, so the older SET's value is stored in a value block.
+		generateColumnarValueBlock(dir)
 	case "verify":
 		verify(dir)
 	default:
@@ -81,6 +87,28 @@ func generateColumnarSpans(dir string) {
 	must(db.Flush())
 	must(db.Close())
 	fmt.Printf("generated columnar keys + spans in %s\n", dir)
+}
+
+// generateColumnarValueBlock writes a columnar database with an out-of-line value. key00002 is
+// written, a snapshot is taken (pinning that version), then key00002 is overwritten; both
+// versions survive the flush and share an identical user key, so Pebble stores the older SET's
+// value in a value block (is-value-external). Matches
+// tests/fixtures/pebble_v2_columnar_valueblock.sst.
+func generateColumnarValueBlock(dir string) {
+	db, err := pebble.Open(dir, &pebble.Options{
+		FormatMajorVersion: pebble.FormatColumnarBlocks,
+	})
+	must(err)
+	must(db.Set([]byte("key00002"), []byte("OLDVALUE-"+strings.Repeat("o", 20)), pebble.Sync))
+	snap := db.NewSnapshot()
+	must(db.Set([]byte("key00000"), []byte("v0"), pebble.Sync))
+	must(db.Set([]byte("key00001"), []byte("v1"), pebble.Sync))
+	must(db.Set([]byte("key00002"), []byte("NEWVALUE-"+strings.Repeat("n", 20)), pebble.Sync))
+	must(db.Set([]byte("key00003"), []byte("v3"), pebble.Sync))
+	must(db.Flush())
+	must(snap.Close())
+	must(db.Close())
+	fmt.Printf("generated columnar value-block table in %s\n", dir)
 }
 
 func verify(dir string) {

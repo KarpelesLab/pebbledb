@@ -145,8 +145,16 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     are detected and rejected (read support pending below). Verified by a checked-in Pebble
     columnar-spans fixture, the `generate-columnar-spans` interop CI step (Go writes → Rust reads),
     and a byte-identical regeneration of the fixture from the Go tool.
-  - [ ] **Out-of-line columnar values:** decode out-of-line (value-block) columnar values — flagged
-    by the is-value-external column — so a columnar table that separates large values reads fully.
+  - [x] **Out-of-line columnar values.** Out-of-line (value-block) columnar values — flagged by
+    the is-value-external column — are now resolved: `SchemaDataBlockReader::decode_all` surfaces
+    the external reference, and `ColumnarReader` reads the value-block index from the metaindex
+    (`pebble.value_index`) and resolves each reference (value-prefix byte + value-block handle)
+    against the value blocks. This also fixed PrefixBytes reconstruction of **exact-duplicate
+    keys** (multiple versions of one user key, the case that produces value blocks under the
+    default schema): an empty suffix slice now reuses the nearest non-empty suffix in the bundle
+    instead of decoding to a truncated key. Verified by a checked-in Pebble value-block fixture
+    (key written twice under a snapshot → older value separated) + a `generate-columnar-valueblock`
+    interop CI step, regenerating the fixture byte-for-byte.
   - [ ] **Columnar write path:** the engine still flushes/compacts to the row format; emitting
     columnar tables (and a Rust→Go columnar interop direction) is a separate step.
 - [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff

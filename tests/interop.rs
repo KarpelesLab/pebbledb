@@ -57,3 +57,30 @@ fn reads_columnar_spans_database_written_by_go_pebble() {
         }
     }
 }
+
+/// Reads a Go-written **columnar** database that stores an out-of-line value in a value block.
+/// Gated on `PEBBLEDB_INTEROP_VALUEBLOCK_DIR`. key00002 was overwritten under a snapshot, so its
+/// older version's value is separated into a value block; the latest read must still resolve to
+/// the newest inline value. (The offline fixture test additionally checks the older out-of-line
+/// value resolves.)
+#[test]
+fn reads_columnar_value_block_database_written_by_go_pebble() {
+    let Ok(dir) = std::env::var("PEBBLEDB_INTEROP_VALUEBLOCK_DIR") else {
+        eprintln!("PEBBLEDB_INTEROP_VALUEBLOCK_DIR unset; skipping Go columnar value-block test");
+        return;
+    };
+
+    let db = Db::open_read_only(&dir, Options::default()).expect("open Go-written value-block DB");
+    let new_value = format!("NEWVALUE-{}", "n".repeat(20));
+    assert_eq!(
+        db.get(b"key00002").unwrap().as_deref(),
+        Some(new_value.as_bytes()),
+        "latest key00002 resolves to the newest inline value"
+    );
+    for (k, want) in [("key00000", "v0"), ("key00001", "v1"), ("key00003", "v3")] {
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(want.as_bytes())
+        );
+    }
+}

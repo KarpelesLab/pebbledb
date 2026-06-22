@@ -512,7 +512,15 @@ pub fn decode_prefix_bytes(b: &[u8], mut off: usize, n: usize) -> Result<(Vec<Ve
     for i in 0..n {
         let bundle = i / bundle_size;
         let prefix_slice = 1 + bundle * (1 + bundle_size);
-        let suffix_slice = prefix_slice + 1 + (i - bundle * bundle_size);
+        let first_suffix_slice = prefix_slice + 1;
+        let mut suffix_slice = first_suffix_slice + (i - bundle * bundle_size);
+        // An empty suffix slice (its start offset equals its end offset) on a non-first row of
+        // the bundle marks an exact-duplicate key (e.g. multiple versions of the same MVCC key
+        // with the suffix held in a separate column). Step backward within the bundle to the
+        // nearest non-empty suffix and reuse it, matching Pebble's PrefixBytes reconstruction.
+        while suffix_slice > first_suffix_slice && slice(suffix_slice)?.is_empty() {
+            suffix_slice -= 1;
+        }
         let mut key = Vec::with_capacity(block_prefix.len());
         key.extend_from_slice(block_prefix);
         key.extend_from_slice(slice(prefix_slice)?);
@@ -613,6 +621,11 @@ impl DataBlockBuilder {
 
 /// A decoded data-block row: `(user_key, internal-key trailer, value)`.
 pub type DataBlockRow = (Vec<u8>, u64, Vec<u8>);
+
+/// A decoded schema-data-block row: `(user_key, trailer, value-or-handle, is_value_external)`.
+/// When the last element is true, the third is an out-of-line value reference rather than the
+/// value (see [`SchemaDataBlockReader::decode_all`]).
+pub type SchemaDataBlockRow = (Vec<u8>, u64, Vec<u8>, bool);
 
 /// A reader over a columnar data block produced by [`DataBlockBuilder`], reconstructing the
 /// `(user_key, trailer, value)` rows.
@@ -816,7 +829,12 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
     }
 
     /// Decodes all rows as `(user_key, trailer, value)`.
-    pub fn decode_all(&self) -> Result<Vec<DataBlockRow>> {
+    /// Decodes every row as `(user_key, trailer, value, is_value_external)`. When
+    /// `is_value_external` is true, `value` is not the value itself but the raw out-of-line
+    /// value reference from the value column (a [`block`](crate::sstable::block) value-prefix
+    /// byte followed by an encoded value-block handle); the caller must resolve it against the
+    /// table's value blocks. When false, `value` is the inline value.
+    pub fn decode_all(&self) -> Result<Vec<SchemaDataBlockRow>> {
         let rows = self.rows();
         let num_key_cols = self.schema.columns().len();
         let key_offsets: Vec<usize> = self.header.columns[..num_key_cols]
@@ -828,22 +846,20 @@ impl<'a, 's> SchemaDataBlockReader<'a, 's> {
         let is_external_off =
             self.header.columns[num_key_cols + DATA_COL_VALUE_EXTERNAL].page_offset as usize;
 
-        // Out-of-line (value-block) columnar values — flagged by the is-value-external column —
-        // are not decoded yet; such a value column holds a handle rather than the value. Reject
-        // them rather than return a handle as if it were the value.
         let (is_external, _) = decode_bitmap(self.block, is_external_off, rows)?;
-        if is_external.iter().any(|&x| x) {
-            return Err(Error::Unsupported(
-                "colblk: out-of-line (value-block) columnar values are not yet supported",
-            ));
-        }
-
         let keys = self.schema.decode_keys(self.block, &key_offsets, rows)?;
         let (trailers, _) = decode_uint_column(self.block, trailer_off, rows)?;
         let (values, _) = decode_raw_bytes(self.block, value_off, rows)?;
 
         Ok((0..rows)
-            .map(|i| (keys[i].clone(), trailers[i], values[i].to_vec()))
+            .map(|i| {
+                (
+                    keys[i].clone(),
+                    trailers[i],
+                    values[i].to_vec(),
+                    is_external[i],
+                )
+            })
             .collect())
     }
 }
