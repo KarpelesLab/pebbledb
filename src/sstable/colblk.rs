@@ -690,7 +690,11 @@ pub struct SchemaDataBlockBuilder<'s> {
     schema: &'s dyn KeySchema,
     user_keys: Vec<Vec<u8>>,
     trailers: Vec<u64>,
+    /// For each row, the value column's bytes: the inline value, or — when the corresponding
+    /// `is_external` entry is true — the encoded out-of-line reference (value-prefix byte + handle).
     values: Vec<Vec<u8>>,
+    /// Per-row is-value-external bitmap (true = the value column holds an out-of-line reference).
+    is_external: Vec<bool>,
 }
 
 impl<'s> SchemaDataBlockBuilder<'s> {
@@ -701,14 +705,26 @@ impl<'s> SchemaDataBlockBuilder<'s> {
             user_keys: Vec::new(),
             trailers: Vec::new(),
             values: Vec::new(),
+            is_external: Vec::new(),
         }
     }
 
-    /// Appends one row: the user key, the internal-key trailer, and the value.
+    /// Appends one row with an inline value.
     pub fn add(&mut self, user_key: &[u8], trailer: u64, value: &[u8]) {
         self.user_keys.push(user_key.to_vec());
         self.trailers.push(trailer);
         self.values.push(value.to_vec());
+        self.is_external.push(false);
+    }
+
+    /// Appends one row whose value is stored out-of-line: `reference` is the encoded value-column
+    /// entry (a value-prefix byte followed by the handle) that a reader resolves against a blob
+    /// file or value block. The is-value-external bit is set for this row.
+    pub fn add_external(&mut self, user_key: &[u8], trailer: u64, reference: &[u8]) {
+        self.user_keys.push(user_key.to_vec());
+        self.trailers.push(trailer);
+        self.values.push(reference.to_vec());
+        self.is_external.push(true);
     }
 
     /// Number of rows added so far.
@@ -759,7 +775,7 @@ impl<'s> SchemaDataBlockBuilder<'s> {
         let val_refs: Vec<&[u8]> = self.values.iter().map(|v| v.as_slice()).collect();
         encode_raw_bytes(&val_refs, value_off, &mut buf);
         let is_value_external_off = buf.len();
-        encode_bitmap(&vec![false; rows], is_value_external_off, &mut buf);
+        encode_bitmap(&self.is_external, is_value_external_off, &mut buf);
         let is_obsolete_off = buf.len();
         encode_bitmap(&vec![false; rows], is_obsolete_off, &mut buf);
 
@@ -1370,6 +1386,50 @@ mod data_block_tests {
         let r = DataBlockReader::new(&block).unwrap();
         assert_eq!(r.rows(), 0);
         assert!(r.decode_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_data_block_external_values_roundtrip() {
+        use crate::base::comparer::DefaultComparer;
+        use crate::sstable::keyschema::DefaultKeySchema;
+        use std::sync::Arc;
+
+        let schema = DefaultKeySchema::with_default_bundle_size(Arc::new(DefaultComparer));
+        let mut b = SchemaDataBlockBuilder::new(&schema);
+        b.add(b"key00000", 0x0100, b"inline-value");
+        // An out-of-line reference: 0x40 prefix + inline blob handle bytes.
+        b.add_external(b"key00001", 0x0200, &[0x40, 0x00, 0x3c, 0x00, 0x01]);
+        b.add(b"key00002", 0x0300, b"another");
+        let block = b.finish();
+
+        let rows = SchemaDataBlockReader::new(&block, &schema)
+            .unwrap()
+            .decode_all()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // (user_key, trailer, value-or-reference, is_external)
+        assert_eq!(
+            rows[0],
+            (
+                b"key00000".to_vec(),
+                0x0100,
+                b"inline-value".to_vec(),
+                false
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                b"key00001".to_vec(),
+                0x0200,
+                vec![0x40, 0x00, 0x3c, 0x00, 0x01],
+                true
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (b"key00002".to_vec(), 0x0300, b"another".to_vec(), false)
+        );
     }
 }
 
