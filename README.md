@@ -28,16 +28,21 @@ lineage.
 - **Reads**: point `get`, snapshots (incl. an **EventuallyFileOnlySnapshot** scoped to key
   spans, invalidated by an overlapping `excise` but not a disjoint one), a **bidirectional**,
   **cloneable** iterator (`first`/`last`/`next`/`prev`/`seek_ge`/`seek_lt`) with
-  `IterOptions` bounds, `set_bounds`, `seek_prefix_ge`, **key-type selection**
+  `IterOptions` bounds, `set_bounds`, `seek_prefix_ge` (with optional **prefix-extractor bloom
+  filters** that skip whole sstables), **key-type selection**
   (`IterKeyType` points / ranges / both), range-key surfacing + coalescing,
   **range-key masking**, **block-property filters** that skip non-matching sstables, and
   `only_durable` (read only flushed data); `new_external_iter` reads sstables without
-  ingesting them, and `scan_internal` exposes the raw internal keyspace.
-- **Engine**: WAL with multi-directory failover, **group commit** (concurrent writers
-  batched through one fsync), and optional **WAL recycling** (`Options::wal_recycle_limit`,
-  reusing log files in place with tolerant tail recovery); **flush splitting**, and a full
-  leveled compaction suite —
-  score-based + manual `compact_range`, **multilevel**, **move**, **delete-only**,
+  ingesting them, and `scan_internal` exposes the raw internal keyspace. A scan presents each
+  level (and each L0 sublevel) as a single merge source and **opens sstables lazily**, reading
+  only the files it actually touches.
+- **Engine**: WAL with multi-directory failover — on a write **error** or, when
+  `Options::wal_failover_latency_threshold` is set, a **slow** (high-latency) write — **group
+  commit** (concurrent writers batched through one fsync), and optional **WAL recycling**
+  (`Options::wal_recycle_limit`, reusing log files in place with tolerant tail recovery);
+  **flush splitting**, and a full leveled compaction suite —
+  score-based (L0 scored by **sublevel count**, like Pebble) + manual `compact_range`,
+  **multilevel**, **move**, **delete-only**,
   **elision-only**, **tombstone-density**, and **read-triggered** compactions run by a
   **concurrent compaction scheduler** (`Options::max_concurrent_compactions`) with paced
   obsolete-file deletion — plus write stalls, a sharded block cache, and `EstimateDiskUsage`.
