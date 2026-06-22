@@ -69,6 +69,9 @@ func main() {
 	case "verify-pebble-blob":
 		// `dir` is a path to a native .blob file written by the Rust PebbleBlobWriter.
 		verifyPebbleBlob(dir)
+	case "verify-columnar-points":
+		// `dir` is a columnar .sst (any table format) with only point keys key0000..key0099.
+		verifyColumnarPoints(dir)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)
@@ -239,6 +242,35 @@ func verifyColumnarSST(path string) {
 	}
 	fmt.Printf("verified %d keys + %d range del + %d range key in columnar sstable %s\n",
 		count, rdCount, rkCount, path)
+}
+
+// verifyColumnarPoints opens a columnar sstable (any table format) written by the Rust engine and
+// verifies its point keys key0000..key0099 through Pebble's sstable reader.
+func verifyColumnarPoints(path string) {
+	data, err := os.ReadFile(path)
+	must(err)
+	r, err := sstable.NewMemReader(data, sstable.ReaderOptions{})
+	must(err)
+	defer r.Close()
+	it, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	must(err)
+	count := 0
+	for kv := it.First(); kv != nil; kv = it.Next() {
+		v, _, err := kv.Value(nil)
+		must(err)
+		if string(kv.K.UserKey) != fmt.Sprintf("key%04d", count) ||
+			string(v) != fmt.Sprintf("value%d", count) {
+			fmt.Fprintf(os.Stderr, "mismatch at %d: key=%q value=%q\n", count, kv.K.UserKey, v)
+			os.Exit(1)
+		}
+		count++
+	}
+	must(it.Error())
+	if count != n {
+		fmt.Fprintf(os.Stderr, "expected %d keys, got %d\n", n, count)
+		os.Exit(1)
+	}
+	fmt.Printf("verified %d keys in columnar sstable %s\n", count, path)
 }
 
 // verifyPebbleBlob opens a native blob file written by the Rust PebbleBlobWriter through Pebble's

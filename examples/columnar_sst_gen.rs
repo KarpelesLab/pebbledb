@@ -25,12 +25,22 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: columnar_sst_gen <file.sst> [spans]");
-    // Optional second arg "spans" also writes a range deletion and a range key, so the Rust→Go
-    // columnar direction exercises keyspan blocks too.
-    let with_spans = std::env::args().nth(2).as_deref() == Some("spans");
+    // Optional second arg: "spans" also writes a range deletion and a range key; "v7" writes a
+    // table-format-v7 table (columnar metaindex + v7 footer) instead of the default v5.
+    let arg2 = std::env::args().nth(2);
+    let with_spans = arg2.as_deref() == Some("spans");
+    let v7 = arg2.as_deref() == Some("v7");
 
     let cmp = Arc::new(DefaultComparer);
-    let mut w = ColumnarWriter::new(cmp, WriterOptions::default());
+    let opts = WriterOptions {
+        table_format: if v7 {
+            pebbledb::sstable::TableFormat::Pebble(7)
+        } else {
+            WriterOptions::default().table_format
+        },
+        ..Default::default()
+    };
+    let mut w = ColumnarWriter::new(cmp, opts);
     let n = 100u64;
     for i in 0..n {
         let k = InternalKey::new(

@@ -110,6 +110,13 @@ jobs:
       - name: Go reads the Rust-written native blob file
         run: ./target/interop-tool verify-pebble-blob "$RUNNER_TEMP/from-rust.blob"
 
+      # Reverse table format v7: the Rust writer emits a v7 columnar sstable, Pebble reads it.
+      - name: Rust generates a table-format-v7 columnar sstable
+        run: cargo run --example columnar_sst_gen -- "$RUNNER_TEMP/from-rust-v7.sst" v7
+
+      - name: Go reads the Rust-written v7 sstable
+        run: ./target/interop-tool verify-columnar-points "$RUNNER_TEMP/from-rust-v7.sst"
+
       # Reverse columnar database: the engine flushes columnar sstables, Go Pebble opens the DB.
       - name: Rust generates a columnar pebbledb database
         run: cargo run --example interop_gen -- "$RUNNER_TEMP/from-rust-columnar-db" columnar

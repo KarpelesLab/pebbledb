@@ -227,9 +227,18 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
       Pebble: a `pebble_blob_gen` example + a `verify-pebble-blob` interop step open the written file
       with Pebble's own `blob.FileReader` and validate its layout. (Fixed: a 0-row colblk column —
       the empty `virtualBlocks` column — must occupy no bytes and share the next column's offset.)
-    - [ ] v6/v7 sstable write (footer + columnar metaindex KV block + blob-reference-index block),
-      `NewFile5`/`NewBlobFile` MANIFEST write, the value-separation policy in flush/compaction, and
-      raising the write format ceiling.
+    - [x] **v7 sstable write.** `ColumnarWriter` emits table-format-v7 sstables (61-byte footer with
+      the feature-attributes word, columnar key-value metaindex + properties blocks, footer
+      attributes derived to match Pebble's `toAttributes` from the properties) when its
+      `table_format` is `Pebble(7)`. Verified by an in-crate round-trip and a Rust→Go interop step:
+      Pebble v2.1.6 reads a v7 columnar sstable the writer produced.
+    - [x] **`NewFile5`/`NewBlobFile` MANIFEST write.** `VersionEdit::encode` writes
+      `tagNewBlobFile`/`tagDeletedBlobFile` and the standard `customTagBlobReferences` tag for a
+      file's Pebble blob references (round-trip tested).
+    - [ ] The flush/compaction value-separation policy (route large values through
+      `PebbleBlobWriter`, emit inline handles, write the `blob-reference-index` block, add the
+      `NewFile5`/`NewBlobFile` MANIFEST records at format 24) and raising the write format ceiling —
+      the final assembly that makes the *engine* emit a value-separated database.
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the

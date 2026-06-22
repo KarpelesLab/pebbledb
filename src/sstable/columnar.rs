@@ -53,6 +53,12 @@ const TARGET_DATA_BLOCK_SIZE: usize = 32 * 1024;
 /// use empty suffix/value; a range-key SET/UNSET with several suffixes contributes one per suffix.
 type KeyspanWriteEntry = (Vec<u8>, Vec<u8>, u64, Vec<u8>, Vec<u8>);
 
+/// v7 footer attribute bits (Pebble's `sstable.Attributes`), in iota order: ValueBlocks=1<<0,
+/// RangeKeySets=1<<1, RangeKeyUnsets=1<<2, RangeKeyDels=1<<3, RangeDels=1<<4, TwoLevelIndex=1<<5,
+/// BlobValues=1<<6, PointKeys=1<<7.
+const ATTRIBUTE_RANGE_DELS: u32 = 1 << 4;
+const ATTRIBUTE_POINT_KEYS: u32 = 1 << 7;
+
 /// Property key under which the columnar key-schema name is recorded. Pebble reads its
 /// `Properties.KeySchemaName` from this exact tag to select the matching key decomposition,
 /// so emitting it lets Pebble v2 read tables this writer produces.
@@ -71,6 +77,9 @@ pub struct ColumnarWriter {
     index: colblk::IndexBlockBuilder,
     last_key: Vec<u8>,
     num_entries: u64,
+    /// Number of data blocks flushed (one index entry each). Recorded as a property so a v7
+    /// reader derives the point-keys attribute consistently with the footer.
+    num_data_blocks: u64,
     /// Collected range deletions as `(start, end, trailer)`, in add order.
     range_dels: Vec<(Vec<u8>, Vec<u8>, u64)>,
     /// Collected range keys as `(start, end, trailer, suffix, value)`, in add order. A row-format
@@ -97,6 +106,7 @@ impl ColumnarWriter {
             index: colblk::IndexBlockBuilder::new(),
             last_key: Vec::new(),
             num_entries: 0,
+            num_data_blocks: 0,
             range_dels: Vec::new(),
             range_keys: Vec::new(),
         }
@@ -211,6 +221,7 @@ impl ColumnarWriter {
         )?;
         // Index entry: the block's last key -> its handle.
         self.index.add(&self.last_key, handle.offset, handle.length);
+        self.num_data_blocks += 1;
         self.data.clear();
         self.approx_block_bytes = 0;
         Ok(())
@@ -294,6 +305,8 @@ impl ColumnarWriter {
         );
         let props = Properties {
             num_entries: self.num_entries,
+            num_data_blocks: self.num_data_blocks,
+            num_range_deletions: self.range_dels.len() as u64,
             comparer_name: self.cmp.name().to_string(),
             merger_name: "nullptr".to_string(),
             property_collectors: "[]".to_string(),
@@ -301,48 +314,86 @@ impl ColumnarWriter {
             user_properties,
             ..Default::default()
         };
-        let mut pb = BlockBuilder::new(1);
-        for (name, value) in props.encode() {
-            pb.add(name.as_bytes(), &value);
-        }
+        // Table format v6+ stores the metaindex and properties as columnar key-value blocks;
+        // v5 uses the legacy row block format.
+        let columnar_meta = matches!(self.opts.table_format, TableFormat::Pebble(v) if v >= 6);
+
+        // Properties block.
+        let prop_entries: Vec<(Vec<u8>, Vec<u8>)> = props
+            .encode()
+            .into_iter()
+            .map(|(name, value)| (name.into_bytes(), value))
+            .collect();
+        let props_block = if columnar_meta {
+            colblk::encode_key_value_block(&prop_entries)
+        } else {
+            let mut pb = BlockBuilder::new(1);
+            for (name, value) in &prop_entries {
+                pb.add(name, value);
+            }
+            pb.finish().to_vec()
+        };
         let props_handle = write_block(
             &mut self.buf,
             &mut self.offset,
-            pb.finish(),
+            &props_block,
             CompressionType::None,
             self.opts.checksum,
         )?;
 
-        // Metaindex block (uncompressed). Entries must be in sorted key order; the keyspan and
-        // properties names sort as: pebble.range_key < rocksdb.properties < rocksdb.range_del2.
-        let mut mi = BlockBuilder::new(1);
+        // Metaindex: name → block handle, in sorted name order
+        // (pebble.range_key < rocksdb.properties < rocksdb.range_del2).
+        let mut meta_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let handle_bytes = |h: BlockHandle| {
+            let mut b = Vec::new();
+            h.encode_to(&mut b);
+            b
+        };
         if let Some(h) = range_key_handle {
-            let mut b = Vec::new();
-            h.encode_to(&mut b);
-            mi.add(META_RANGE_KEY_NAME.as_bytes(), &b);
+            meta_entries.push((META_RANGE_KEY_NAME.as_bytes().to_vec(), handle_bytes(h)));
         }
-        let mut ph = Vec::new();
-        props_handle.encode_to(&mut ph);
-        mi.add(META_PROPERTIES_NAME.as_bytes(), &ph);
+        meta_entries.push((
+            META_PROPERTIES_NAME.as_bytes().to_vec(),
+            handle_bytes(props_handle),
+        ));
         if let Some(h) = range_del_handle {
-            let mut b = Vec::new();
-            h.encode_to(&mut b);
-            mi.add(META_RANGE_DEL_NAME.as_bytes(), &b);
+            meta_entries.push((META_RANGE_DEL_NAME.as_bytes().to_vec(), handle_bytes(h)));
         }
+        meta_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let meta_block = if columnar_meta {
+            colblk::encode_key_value_block(&meta_entries)
+        } else {
+            let mut mi = BlockBuilder::new(1);
+            for (name, value) in &meta_entries {
+                mi.add(name, value);
+            }
+            mi.finish().to_vec()
+        };
         let metaindex_handle = write_block(
             &mut self.buf,
             &mut self.offset,
-            mi.finish(),
+            &meta_block,
             CompressionType::None,
             self.opts.checksum,
         )?;
 
+        // v7 footer attributes must exactly equal what Pebble derives from the properties above
+        // (`toAttributes`): point-keys iff there are data blocks, range-dels iff there are range
+        // deletions. (Range-key-set/value-block attributes are derived from properties this writer
+        // does not yet emit, so they are intentionally not claimed.)
+        let mut attributes = 0u32;
+        if self.num_data_blocks > 0 {
+            attributes |= ATTRIBUTE_POINT_KEYS;
+        }
+        if !self.range_dels.is_empty() {
+            attributes |= ATTRIBUTE_RANGE_DELS;
+        }
         let footer = encode_footer(
             self.opts.table_format,
             self.opts.checksum,
             metaindex_handle,
             index_handle,
-            0, // attributes: only meaningful for v7 footers, which this v5 writer does not emit
+            attributes,
         )?;
         self.buf.extend_from_slice(&footer);
         Ok(self.buf)
@@ -648,6 +699,33 @@ mod tests {
 
     fn ikey(user: &[u8], seq: u64) -> Vec<u8> {
         InternalKey::new(user.to_vec(), seq, InternalKeyKind::Set).encode()
+    }
+
+    #[test]
+    fn columnar_v7_table_roundtrips() {
+        // A table-format-v7 table uses a columnar metaindex + properties and a v7 footer; our
+        // reader must read it back (and Pebble does too — see the interop workflow).
+        let cmp: Arc<dyn Comparer> = Arc::new(DefaultComparer);
+        let mut w = ColumnarWriter::new(
+            cmp.clone(),
+            WriterOptions {
+                table_format: TableFormat::Pebble(7),
+                compression: CompressionType::None,
+                ..Default::default()
+            },
+        );
+        for i in 0..200u32 {
+            let k = ikey(format!("key{i:05}").as_bytes(), (200 - i) as u64);
+            w.add(&k, format!("v{i}").as_bytes()).unwrap();
+        }
+        let bytes = w.finish().unwrap();
+        let r = ColumnarReader::open(bytes, cmp).unwrap();
+        let all = r.iter_all().unwrap();
+        assert_eq!(all.len(), 200);
+        for (i, (ik, v)) in all.iter().enumerate() {
+            assert_eq!(encoded_user_key(ik), format!("key{i:05}").as_bytes());
+            assert_eq!(v.as_slice(), format!("v{i}").as_bytes());
+        }
     }
 
     #[test]
