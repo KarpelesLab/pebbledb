@@ -847,6 +847,7 @@ impl<W: Write> Writer<W> {
             self.opts.checksum,
             metaindex_handle,
             index_handle,
+            0, // attributes: row writer emits ≤ v5 footers, which have no attributes word
         )?;
         self.w.write_all(&footer)?;
         self.finished = true;
@@ -939,6 +940,7 @@ pub(crate) fn encode_footer(
     checksum: ChecksumType,
     metaindex: BlockHandle,
     index: BlockHandle,
+    attributes: u32,
 ) -> Result<Vec<u8>> {
     match format {
         TableFormat::LevelDB => {
@@ -953,24 +955,57 @@ pub(crate) fn encode_footer(
         TableFormat::RocksDBv2 | TableFormat::Pebble(_) => {
             let (magic, version): (&[u8; 8], u32) = match format {
                 TableFormat::RocksDBv2 => (ROCKSDB_MAGIC, 2),
-                TableFormat::Pebble(v) => {
-                    if v > 5 {
-                        return Err(Error::Unsupported(
-                            "sstable: writing Pebblev6+ footer not supported",
-                        ));
-                    }
-                    (PEBBLE_MAGIC, u32::from(v))
-                }
+                TableFormat::Pebble(v) => (PEBBLE_MAGIC, u32::from(v)),
                 TableFormat::LevelDB => unreachable!(),
             };
-            // [checksum:1][metaindex handle][index handle][padding][version:4][magic:8]
-            let mut buf = Vec::with_capacity(ROCKSDB_FOOTER_LEN);
-            buf.push(match checksum {
-                ChecksumType::None => 0,
+            let checksum_byte = match checksum {
+                ChecksumType::None => 0u8,
                 ChecksumType::Crc32c => 1,
                 ChecksumType::XxHash => 2,
                 ChecksumType::XxHash64 => 3,
-            });
+            };
+            // The prefix is identical across all RocksDB-style footers: checksum byte then the two
+            // block handles. The (longer) v6/v7 footers add a footer checksum and (v7) an
+            // attributes word before the version + magic tail.
+            let table_version = match format {
+                TableFormat::Pebble(v) => v,
+                _ => 0, // RocksDBv2: not v6/v7
+            };
+            if table_version >= 6 {
+                // v6 = 57 bytes (adds a 4-byte footer checksum); v7 = 61 bytes (also adds a 4-byte
+                // attributes word). Layout: [checksum:1][metaindex][index][pad]
+                // [attributes:4 (v7)][footer_checksum:4][version:4][magic:8].
+                let footer_len = if table_version >= 7 {
+                    ROCKSDB_FOOTER_LEN + 4 + 4
+                } else {
+                    ROCKSDB_FOOTER_LEN + 4
+                };
+                let magic_off = footer_len - MAGIC_LEN;
+                let version_off = magic_off - VERSION_LEN;
+                let checksum_off = version_off - 4;
+                let mut buf = vec![0u8; footer_len];
+                buf[0] = checksum_byte;
+                let mut prefix = Vec::new();
+                metaindex.encode_to(&mut prefix);
+                index.encode_to(&mut prefix);
+                buf[1..1 + prefix.len()].copy_from_slice(&prefix);
+                if table_version >= 7 {
+                    let attrs_off = checksum_off - 4;
+                    buf[attrs_off..attrs_off + 4].copy_from_slice(&attributes.to_le_bytes());
+                }
+                buf[version_off..version_off + VERSION_LEN].copy_from_slice(&version.to_le_bytes());
+                buf[magic_off..].copy_from_slice(magic);
+                // Footer checksum: masked CRC32C over the footer excluding the 4 checksum bytes.
+                let mut crc_input = Vec::with_capacity(footer_len - 4);
+                crc_input.extend_from_slice(&buf[..checksum_off]);
+                crc_input.extend_from_slice(&buf[checksum_off + 4..]);
+                let crc = crate::crc::masked_crc32c(&crc_input);
+                buf[checksum_off..checksum_off + 4].copy_from_slice(&crc.to_le_bytes());
+                return Ok(buf);
+            }
+            // [checksum:1][metaindex handle][index handle][padding][version:4][magic:8]
+            let mut buf = Vec::with_capacity(ROCKSDB_FOOTER_LEN);
+            buf.push(checksum_byte);
             metaindex.encode_to(&mut buf);
             index.encode_to(&mut buf);
             buf.resize(1 + 2 * BLOCK_HANDLE_MAX_LEN, 0);

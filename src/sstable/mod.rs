@@ -1229,6 +1229,38 @@ mod tests {
     }
 
     #[test]
+    fn v6_v7_footers_roundtrip() {
+        use crate::sstable::block::ChecksumType;
+        use crate::sstable::writer::encode_footer;
+        let meta = BlockHandle {
+            offset: 1000,
+            length: 87,
+        };
+        let index = BlockHandle {
+            offset: 780,
+            length: 38,
+        };
+        for (v, len) in [(6u8, 57usize), (7, 61)] {
+            let footer = encode_footer(
+                TableFormat::Pebble(v),
+                ChecksumType::Crc32c,
+                meta,
+                index,
+                32, // attributes (PointKeys); ignored for v6
+            )
+            .unwrap();
+            assert_eq!(footer.len(), len, "v{v} footer length");
+            let parsed = parse_footer(&footer).unwrap();
+            assert_eq!(parsed.format, TableFormat::Pebble(v));
+            assert_eq!(parsed.metaindex.offset, 1000);
+            assert_eq!(parsed.metaindex.length, 87);
+            assert_eq!(parsed.index.offset, 780);
+            assert_eq!(parsed.index.length, 38);
+            assert_eq!(parsed.checksum, ChecksumType::Crc32c);
+        }
+    }
+
+    #[test]
     fn block_property_collector_and_filter() {
         use crate::base::comparer::DefaultComparer;
         use crate::base::internal_key::{InternalKey, InternalKeyKind, encoded_user_key};

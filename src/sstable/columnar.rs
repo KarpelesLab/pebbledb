@@ -342,6 +342,7 @@ impl ColumnarWriter {
             self.opts.checksum,
             metaindex_handle,
             index_handle,
+            0, // attributes: only meaningful for v7 footers, which this v5 writer does not emit
         )?;
         self.buf.extend_from_slice(&footer);
         Ok(self.buf)
