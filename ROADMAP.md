@@ -178,9 +178,16 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     columnar and overwritten values are correct) and a Rust→Go interop step where the engine
     writes, compacts, and Pebble v2 reads the columnar database. Optional value-block separation in
     columnar output remains a space optimization, not required for parity.
-- [ ] **Blob file format byte-parity.** Pebble v2 writes separate blob files; diff
-  `sstable::blob` output against a Pebble-written blob file and reconcile magic/footer/handle
-  encoding. (No longer blocked — v2 is tagged.)
+- [ ] **Blob file format byte-parity (`FormatValueSeparation`).** pebbledb has a working value
+  separation scheme (`sstable::blob`, a sibling-file 1:1 design with reference-based GC), but it is
+  *not* byte-identical to Pebble's native blob files. Pebble only writes separate `.blob` files at
+  `FormatValueSeparation` — a format major version (~24) well above `FormatColumnarBlocks` (19) that
+  also introduces a new sstable table format (`FormatTableFormatV6`, footer attributes) and the
+  richer `NewFile5` blob-reference encoding (value sizes, reference depth, garbage ratio). Reaching
+  byte-parity here is effectively implementing Pebble's whole value-separation subsystem (table v6 +
+  native blob files + blob-ref MANIFEST encoding), a distinct multi-part effort rather than a
+  format diff. (Confirmed against v2.1.6: a DB at format 19 with `ValueSeparationPolicy{Enabled}`
+  writes no `.blob` — the policy is gated on `FormatValueSeparation`.)
 - [x] **Persist blob references in the MANIFEST.** `FileMetadata::blob_refs` is recorded via a
   pebbledb-private, safe-to-ignore custom tag (Pebble skips it), so blob-file GC recovers an
   sstable's references from the MANIFEST at open instead of re-reading its metaindex; the
