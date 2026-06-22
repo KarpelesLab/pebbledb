@@ -12,9 +12,10 @@
 //! pointing at `REMOTE-OBJ-CATALOG-<iter:06>`.
 //!
 //! This module implements the on-disk **format** (edit encode/decode + replaying a catalog file
-//! into the current object set), matching Pebble byte-for-byte. Wiring it into pebbledb's
-//! [`Provider`](super::Provider) — whose current scheme discovers remote objects by probing rather
-//! than a persisted catalog — is a separate step.
+//! into the current object set), matching Pebble byte-for-byte. [`Provider`](super::Provider) uses
+//! it to persist its shared-object set: each shared put/remove rewrites the catalog file and
+//! atomically repoints the `marker.remote-obj-catalog.*` marker, and a provider replays the marked
+//! catalog on open.
 //!
 //! Edit encoding: a sequence of tagged records.
 //! - `tagNewObject(1)`: `uvarint(file_num) uvarint(obj_type) uvarint(creator_id)
