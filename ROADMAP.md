@@ -226,8 +226,15 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   open-rescan remains as a fallback for legacy / upstream-Pebble records. (Byte-parity with
   Pebble's own richer `NewFile5` blob-reference encoding — value sizes, reference depth — is part
   of the blob byte-parity work above.)
-- [ ] **objstorage catalog byte-format.** Match Pebble's shared-object catalog on-disk format
-  so a disaggregated store round-trips through the interop workflow.
+- [x] **objstorage catalog on-disk format.** `objstorage::remoteobjcat` implements Pebble's
+  shared-object catalog format (`REMOTE-OBJ-CATALOG`): a [record log](src/record) of catalog
+  version-edits with `tagNewObject(1)` (file number, object type, creator ID, creator file number,
+  cleanup method, optional locator/custom-name sub-tags, `0` terminator), `tagDeletedObject(2)`, and
+  `tagCreatorID(3)`, plus replay into the accumulated object set. Encode/decode and full
+  catalog-file round-trips are unit-tested; the format follows Pebble's
+  `remoteobjcat.VersionEdit` byte-for-byte. (Wiring it into the probe-based
+  [`Provider`](src/objstorage) read path, and a real-catalog interop diff via a Pebble
+  shared-storage harness, remain as follow-ups.)
 - [ ] **Port Pebble's `testdata` corpus.** Vendor a subset of upstream data-driven fixtures
   (needs the Go toolchain in CI) and run them through the in-crate decoders/engine.
 

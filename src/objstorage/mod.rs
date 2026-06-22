@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::vfs::{Fs, WritableFile};
 
+pub mod remoteobjcat;
+
 /// A pluggable backend for shared/remote objects, addressed by an opaque name.
 pub trait RemoteStorage: Send + Sync {
     /// Stores `data` under `name`, replacing any existing object.
