@@ -716,6 +716,50 @@ fn next_prefix_skips_versions_within_a_prefix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Db::flush_async` rotates the memtable and returns without blocking; the returned handle's
+/// `wait` blocks until a background worker has written the data to L0 (Pebble's `AsyncFlush`).
+#[test]
+fn flush_async_completes_via_handle() {
+    let dir = temp_dir("flush-async");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for i in 0..50u32 {
+        db.set(format!("k{i:03}").as_bytes(), b"value").unwrap();
+    }
+
+    let count_ssts = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some("sst")
+            })
+            .count()
+    };
+    assert_eq!(count_ssts(), 0, "no sstables before flush");
+
+    let handle = db.flush_async().unwrap();
+    handle.wait().unwrap();
+    assert!(
+        count_ssts() >= 1,
+        "flush_async + wait must produce an sstable"
+    );
+
+    // Data is readable, and a second flush_async with an empty memtable resolves immediately.
+    for i in 0..50u32 {
+        assert_eq!(
+            db.get(format!("k{i:03}").as_bytes()).unwrap().as_deref(),
+            Some(b"value".as_ref())
+        );
+    }
+    db.flush_async().unwrap().wait().unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `Iterator::stats` counts positioning work (Pebble's `Iterator.Stats`): forward/reverse seeks
 /// and steps at the call level, plus the internal key versions scanned (which exceeds the user
 /// keys surfaced when keys have multiple versions). `reset_stats` zeroes the counters.

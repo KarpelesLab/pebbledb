@@ -1006,6 +1006,52 @@ impl Db {
         opts.create_if_missing = false;
         Db::open(dir, opts)
     }
+
+    /// Rotates the active memtable out for flushing and returns a [`FlushHandle`] without waiting
+    /// for the flush to finish (Pebble's `AsyncFlush`). A background worker performs the flush; call
+    /// [`FlushHandle::wait`] to block until it completes. Equivalent to [`flush`](DbInner::flush)
+    /// but non-blocking.
+    pub fn flush_async(&self) -> Result<FlushHandle> {
+        let target_wal = {
+            let mut state = self.inner.state.lock().unwrap();
+            if state.read_only {
+                return Err(Error::InvalidState("db: opened read-only".into()));
+            }
+            self.inner.rotate_memtable(&mut state)?;
+            // The newest pending immutable WAL (includes the just-rotated memtable when it had
+            // data); `None` when nothing is awaiting flush.
+            let target = state.imm_wals.last().copied();
+            self.inner.work_cv.notify_all();
+            target
+        };
+        Ok(FlushHandle {
+            inner: Arc::clone(&self.inner),
+            target_wal,
+        })
+    }
+}
+
+/// A handle to an asynchronous flush started by [`Db::flush_async`]. Dropping it without calling
+/// [`wait`](FlushHandle::wait) is fine — the flush still proceeds on a background worker.
+pub struct FlushHandle {
+    inner: Arc<DbInner>,
+    /// Newest immutable-memtable WAL number this flush must drain (`None` if nothing was pending).
+    target_wal: Option<u64>,
+}
+
+impl FlushHandle {
+    /// Blocks until every memtable awaiting flush when [`Db::flush_async`] was called has been
+    /// written to L0. Returns immediately if there was nothing to flush.
+    pub fn wait(&self) -> Result<()> {
+        let Some(target) = self.target_wal else {
+            return Ok(());
+        };
+        let mut state = self.inner.state.lock().unwrap();
+        while state.imm_wals.iter().any(|&w| w <= target) {
+            state = self.inner.drained_cv.wait(state).unwrap();
+        }
+        Ok(())
+    }
 }
 
 impl DbInner {
