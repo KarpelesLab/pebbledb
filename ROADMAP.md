@@ -293,11 +293,17 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   `Valid`/`AtLimit`/`Exhausted`), plus cases for forward/reverse seeks, bounded iteration, and
   limited pause/resume both directions. CI-friendly (no Go). (Vendoring Pebble's full Go-DSL
   corpus verbatim — with its exact expected-output format — remains optional follow-up.)
-- [ ] **Remaining DB-API async/shared-storage parity.** `ApplyNoSyncWait`/`SyncWait` (decouple the
-  WAL fsync from visibility in the group-commit pipeline — historically deadlock-prone; niche
-  throughput benefit) and the shared-storage ingest surface (`IngestExternalFiles`, `SetCreatorID`,
-  `ObjProvider`), which require the objstorage `Provider` to be the engine's actual storage layer
-  (it is probe-based today). Both are architectural; deferred pending a focused effort.
+- [x] **`ApplyNoSyncWait` / `SyncWait`.** `Db::apply_no_sync_wait` commits a batch (visible
+  immediately) without waiting for the WAL fsync, returning a `SyncHandle` whose `sync_wait` forces
+  durability. A `no_sync` flag threads through the group-commit queue → `append_to_wal` (only
+  flipping `sync_all`→`flush`; the leader/follower coordination is untouched). Verified with a
+  WAL-fsync-counting `Fs`.
+- [ ] **Shared-storage ingest surface (`IngestExternalFiles`, `SetCreatorID`, `ObjProvider`).** These
+  are meaningful only once the objstorage `Provider` is the engine's *actual* storage layer
+  (creator-prefixed shared object names, reference-not-copy ingest, a provider exposed from `Db`) —
+  today the engine discovers shared objects by probing and rewrites ingested files locally. This is
+  the same architectural adoption the objstorage-catalog interop needs; adding the methods as stubs
+  would be misleading, so it's deferred to a focused disaggregated-storage effort.
 
 ### Deferred / blocked
 
