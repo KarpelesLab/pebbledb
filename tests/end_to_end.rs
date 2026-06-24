@@ -716,6 +716,71 @@ fn next_prefix_skips_versions_within_a_prefix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The cooperative limited-iteration family (Pebble's `*WithLimit`): a step that lands at or
+/// beyond the limit returns `AtLimit` and holds the over-limit key, which a later step (with a
+/// limit past it, no limit, or a plain `next`/`prev`) resumes from without re-reading.
+#[test]
+fn limited_iteration_pauses_and_resumes() {
+    use pebbledb::IterValidity::{AtLimit, Exhausted, Valid};
+
+    let dir = temp_dir("with-limit");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    for k in [b"a".as_ref(), b"b", b"c", b"d", b"e"] {
+        db.set(k, b"v").unwrap();
+    }
+
+    // Forward with a moving limit, including a pause at "c" resumed by a higher limit.
+    let mut it = db.iter().unwrap();
+    it.first().unwrap();
+    assert_eq!(it.key(), b"a");
+    assert_eq!(it.next_with_limit(Some(b"c")).unwrap(), Valid); // b < c
+    assert_eq!(it.key(), b"b");
+    assert_eq!(it.next_with_limit(Some(b"c")).unwrap(), AtLimit); // c >= c, paused
+    assert!(!it.valid());
+    assert_eq!(it.next_with_limit(Some(b"z")).unwrap(), Valid); // resume c
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.next_with_limit(None).unwrap(), Valid); // d, no limit
+    assert_eq!(it.key(), b"d");
+    assert_eq!(it.next_with_limit(None).unwrap(), Valid); // e
+    assert_eq!(it.next_with_limit(None).unwrap(), Exhausted);
+
+    // A plain next() resumes a forward pause in place.
+    let mut it = db.iter().unwrap();
+    it.first().unwrap();
+    assert_eq!(it.next_with_limit(Some(b"b")).unwrap(), AtLimit); // b paused
+    assert!(!it.valid());
+    it.next().unwrap();
+    assert!(it.valid() && it.key() == b"b");
+    it.next().unwrap();
+    assert_eq!(it.key(), b"c");
+
+    // Reverse with a limit (bounds the step from below): pause when the prev key drops below it.
+    let mut it = db.iter().unwrap();
+    it.last().unwrap();
+    assert_eq!(it.key(), b"e");
+    assert_eq!(it.prev_with_limit(Some(b"c")).unwrap(), Valid); // d >= c
+    assert_eq!(it.key(), b"d");
+    assert_eq!(it.prev_with_limit(Some(b"c")).unwrap(), Valid); // c >= c
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.prev_with_limit(Some(b"c")).unwrap(), AtLimit); // b < c, paused
+    assert!(!it.valid());
+    assert_eq!(it.prev_with_limit(Some(b"a")).unwrap(), Valid); // resume b
+    assert_eq!(it.key(), b"b");
+
+    // Seek variants apply the same limit check on landing.
+    let mut it = db.iter().unwrap();
+    assert_eq!(it.seek_ge_with_limit(b"b", Some(b"d")).unwrap(), Valid);
+    assert_eq!(it.key(), b"b");
+    assert_eq!(it.seek_ge_with_limit(b"d", Some(b"d")).unwrap(), AtLimit);
+    assert!(!it.valid());
+    assert_eq!(it.seek_lt_with_limit(b"d", Some(b"b")).unwrap(), Valid); // c >= b
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.seek_lt_with_limit(b"b", Some(b"b")).unwrap(), AtLimit); // a < b
+    assert!(!it.valid());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn range_key_masking_hides_older_point_versions() {
     use pebbledb::{Comparer, DefaultComparer};

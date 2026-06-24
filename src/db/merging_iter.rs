@@ -827,6 +827,25 @@ pub struct DbIterator {
     fragments: Vec<(Vec<u8>, Vec<u8>)>,
     /// Current index into `fragments` for `RangesOnly` iteration.
     frag_idx: usize,
+    /// Set by the `*_with_limit` family when a step lands on a key beyond the caller's limit: the
+    /// candidate is held in `cur_key`/`cur_value` (with `valid` false) so a later limited or plain
+    /// step can resume from it without re-reading. `dir` records which side it paused on.
+    paused: bool,
+}
+
+/// The outcome of a limited iterator step ([`DbIterator::next_with_limit`] and friends), mirroring
+/// Pebble's `IterValidityState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterValidity {
+    /// The iterator moved past the last key in range; it is exhausted.
+    Exhausted,
+    /// The iterator is positioned at a valid key (read it with [`key`](DbIterator::key) /
+    /// [`value`](DbIterator::value)).
+    Valid,
+    /// The step stopped because the next key is at or beyond the supplied limit. The iterator is
+    /// **not** readable now, but a subsequent limited step (with a limit past the key) or a plain
+    /// [`next`](DbIterator::next) / [`prev`](DbIterator::prev) resumes from the held candidate.
+    AtLimit,
 }
 
 impl DbIterator {
@@ -858,6 +877,7 @@ impl DbIterator {
             key_type: opts.key_type,
             fragments: Vec::new(),
             frag_idx: 0,
+            paused: false,
         };
         if it.key_type == IterKeyType::RangesOnly {
             it.fragments = it.compute_fragments();
@@ -1011,6 +1031,7 @@ impl DbIterator {
         self.lower_bound = lower;
         self.upper_bound = upper;
         self.valid = false;
+        self.paused = false;
     }
 
     /// Reconfigures the iterator in place (Pebble's `Iterator.SetOptions`): updates the key
@@ -1027,6 +1048,7 @@ impl DbIterator {
         self.mask_suffix = opts.range_key_masking_suffix;
         self.key_type = opts.key_type;
         self.prefix = None;
+        self.paused = false;
         // RangesOnly walks a precomputed fragment list; (re)build or drop it to match the mode.
         self.fragments = if self.key_type == IterKeyType::RangesOnly {
             self.compute_fragments()
@@ -1109,6 +1131,7 @@ impl DbIterator {
     /// Positions at the first visible key (honoring the lower bound).
     pub fn first(&mut self) -> Result<()> {
         self.prefix = None;
+        self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
             self.frag_seek_forward(0);
             return Ok(());
@@ -1127,6 +1150,7 @@ impl DbIterator {
     /// Positions at the last visible key (honoring the upper bound).
     pub fn last(&mut self) -> Result<()> {
         self.prefix = None;
+        self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
             self.frag_seek_reverse(self.fragments.len() as isize - 1);
             return Ok(());
@@ -1145,6 +1169,7 @@ impl DbIterator {
     /// Positions at the first visible key `>= target` (clamped to the lower bound).
     pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
         self.prefix = None;
+        self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
             // The first fragment that covers or follows `target` (its end is past `target`).
             let i = self
@@ -1169,6 +1194,7 @@ impl DbIterator {
     /// Positions at the last visible key `< target` (clamped to the upper bound).
     pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         self.prefix = None;
+        self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
             // The last fragment that starts strictly before `target`.
             let i = self
@@ -1223,6 +1249,16 @@ impl DbIterator {
     /// Advances to the next visible key.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<()> {
+        if self.paused {
+            // Resume from a limit pause. Forward pause: the held candidate IS the next key, so
+            // surface it without advancing. Reverse pause: fall through to the normal forward step,
+            // which repositions past the held candidate.
+            self.paused = false;
+            self.valid = true;
+            if self.dir == Dir::Forward {
+                return Ok(());
+            }
+        }
         if !self.valid {
             return Ok(());
         }
@@ -1287,8 +1323,104 @@ impl DbIterator {
         }
     }
 
+    /// Like [`seek_ge`](Self::seek_ge), but stops if the landed key is at or beyond `limit`
+    /// (Pebble's `SeekGEWithLimit`). On [`IterValidity::AtLimit`] the iterator is not readable but
+    /// holds the over-limit key for a later resumed step. `limit` of `None` means no limit.
+    pub fn seek_ge_with_limit(
+        &mut self,
+        target: &[u8],
+        limit: Option<&[u8]>,
+    ) -> Result<IterValidity> {
+        self.seek_ge(target)?;
+        Ok(self.eval_forward_limit(limit))
+    }
+
+    /// Like [`next`](Self::next), but stops at [`IterValidity::AtLimit`] if the next key is at or
+    /// beyond `limit` (Pebble's `NextWithLimit`). Resumes from a held forward pause in place.
+    pub fn next_with_limit(&mut self, limit: Option<&[u8]>) -> Result<IterValidity> {
+        if self.paused && self.dir == Dir::Forward {
+            // Re-evaluate the held candidate against the new limit without re-reading.
+            self.paused = false;
+            self.valid = true;
+        } else if self.valid || self.paused {
+            self.next()?;
+        } else {
+            return Ok(IterValidity::Exhausted);
+        }
+        Ok(self.eval_forward_limit(limit))
+    }
+
+    /// Like [`seek_lt`](Self::seek_lt), but stops at [`IterValidity::AtLimit`] if the landed key is
+    /// below `limit` (Pebble's `SeekLTWithLimit`; `limit` bounds the reverse step from below).
+    pub fn seek_lt_with_limit(
+        &mut self,
+        target: &[u8],
+        limit: Option<&[u8]>,
+    ) -> Result<IterValidity> {
+        self.seek_lt(target)?;
+        Ok(self.eval_reverse_limit(limit))
+    }
+
+    /// Like [`prev`](Self::prev), but stops at [`IterValidity::AtLimit`] if the previous key is
+    /// below `limit` (Pebble's `PrevWithLimit`). Resumes from a held reverse pause in place.
+    pub fn prev_with_limit(&mut self, limit: Option<&[u8]>) -> Result<IterValidity> {
+        if self.paused && self.dir == Dir::Reverse {
+            self.paused = false;
+            self.valid = true;
+        } else if self.valid || self.paused {
+            self.prev()?;
+        } else {
+            return Ok(IterValidity::Exhausted);
+        }
+        Ok(self.eval_reverse_limit(limit))
+    }
+
+    /// Applies a forward limit to the current position: at or beyond `limit` ⇒ pause
+    /// ([`IterValidity::AtLimit`]); exhausted ⇒ [`IterValidity::Exhausted`]; else
+    /// [`IterValidity::Valid`].
+    fn eval_forward_limit(&mut self, limit: Option<&[u8]>) -> IterValidity {
+        if !self.valid {
+            return IterValidity::Exhausted;
+        }
+        if let Some(l) = limit
+            && self.cmp.compare(&self.cur_key, l) != std::cmp::Ordering::Less
+        {
+            self.valid = false;
+            self.paused = true;
+            self.dir = Dir::Forward;
+            return IterValidity::AtLimit;
+        }
+        IterValidity::Valid
+    }
+
+    /// Applies a reverse limit to the current position: below `limit` ⇒ pause; exhausted ⇒
+    /// exhausted; else valid.
+    fn eval_reverse_limit(&mut self, limit: Option<&[u8]>) -> IterValidity {
+        if !self.valid {
+            return IterValidity::Exhausted;
+        }
+        if let Some(l) = limit
+            && self.cmp.compare(&self.cur_key, l) == std::cmp::Ordering::Less
+        {
+            self.valid = false;
+            self.paused = true;
+            self.dir = Dir::Reverse;
+            return IterValidity::AtLimit;
+        }
+        IterValidity::Valid
+    }
+
     /// Steps back to the previous visible key.
     pub fn prev(&mut self) -> Result<()> {
+        if self.paused {
+            // Symmetric to `next`: a reverse pause surfaces the held candidate in place; a forward
+            // pause falls through to the normal reverse step.
+            self.paused = false;
+            self.valid = true;
+            if self.dir == Dir::Reverse {
+                return Ok(());
+            }
+        }
         if !self.valid {
             return Ok(());
         }
