@@ -10,8 +10,11 @@
 //! state. The PRNG is deterministic, so a failure reproduces from its seed.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use pebbledb::{Db, Options};
+use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+use pebbledb::sstable::{Writer, WriterOptions};
+use pebbledb::{Db, DefaultComparer, Options};
 
 /// A tiny deterministic xorshift64* PRNG — no external crates, fully reproducible.
 struct Rng(u64);
@@ -174,7 +177,34 @@ fn run_with_seed(seed: u64) {
                     "snapshot view diverged from model-at-snapshot"
                 );
             }
-            // ~4%: reopen the database (exercises WAL recovery + MANIFEST reload).
+            // ~2%: ingest a small external sstable. The engine assigns the ingested keys the
+            // highest sequence numbers, so they win over every prior version — including
+            // unflushed memtable keys — which in the last-write-wins model is a plain insert.
+            96..=97 => {
+                let mut kvs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                for _ in 0..3 {
+                    let k = key(rng.next());
+                    let v = format!("i{}", rng.next() % 100_000).into_bytes();
+                    kvs.insert(k, v);
+                }
+                let ext = dir.join(format!("ingest-{step}.sst"));
+                {
+                    let f = std::fs::File::create(&ext).unwrap();
+                    let mut w = Writer::new(f, Arc::new(DefaultComparer), WriterOptions::default());
+                    // Keys must be added in sorted order; the BTreeMap iterates sorted. The
+                    // sequence number in the external file is irrelevant — ingest rewrites it.
+                    for (k, v) in &kvs {
+                        let ik = InternalKey::new(k.clone(), 0, InternalKeyKind::Set).encode();
+                        w.add(&ik, v).unwrap();
+                    }
+                    w.finish().unwrap();
+                }
+                db.ingest(&[&ext]).unwrap();
+                for (k, v) in kvs {
+                    model.insert(k, v);
+                }
+            }
+            // ~2%: reopen the database (exercises WAL recovery + MANIFEST reload).
             _ => {
                 drop(db);
                 db = Db::open(&dir, opts()).unwrap();
