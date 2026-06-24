@@ -74,23 +74,27 @@ gated on the Go interop CI is under **Byte-parity & interop**.
 ### In-crate refinements & optimizations
 
 - [ ] **`LazyValue` / deferred value fetch.** Avoid materializing a value until the caller
-  asks for it (Pebble's `LazyValue`). Must be sound — no `unsafe` lifetime extension.
-  - [ ] Add a `LazyValue` type that is either inline bytes or an *owned* fetch handle
-    (table `Arc<Reader>` + value-block/blob handle), fetching on `.value()`.
-  - [ ] Add an iterator accessor returning `LazyValue` (keep the eager `value()` for the
-    common path) and thread it through the merging iterator.
-  - [ ] Wire value-block and blob (`KIND_BLOB`) resolution to defer to `LazyValue::value()`.
-  - [ ] Test: iterate without touching values does no value-block/blob reads (count via a
-    probe `RemoteStorage`/reader).
+  asks for it (Pebble's `LazyValue`). **Scope note:** this is a core-read-path rework, not a
+  clean addition — the whole iterator stack exposes `value() -> &[u8]`, which assumes the value is
+  materialized before access (the row `TableIter` resolves value-block/blob values eagerly into
+  `cur_value`, and the columnar reader materializes every row at open). Genuine deferral requires
+  changing that value-access model across `InternalIter` / `TableIter` / `DbIterator` (interior
+  mutability or an owned-handle return) for a niche benefit (skipping value reads on key-only
+  scans). Deferred pending a focused effort; the safety net (model + iterator tests) is in place.
+  - [ ] Add a `LazyValue` type (inline bytes or an owned `Arc<Reader>` + handle) fetching on `.value()`.
+  - [ ] Change the value-access model to return/thread `LazyValue` instead of eager `&[u8]`.
+  - [ ] Wire value-block and blob resolution to defer; test that key-only iteration does no
+    value-block/blob reads (count via a probe reader).
 
-- [ ] **Flushable ingest (queue, don't force-flush).** Today `ingest` forces a memtable flush
-  for correctness; instead queue the ingested sstables as a flushable so writers aren't
-  blocked.
-  - [ ] Represent ingested sstables as a flushable entry in the memtable queue at the reserved
-    seqnums.
-  - [ ] Resolve it on flush by adding the files at the right level (no rewrite).
-  - [ ] Test: concurrent writers proceed during an ingest; the ingested values still win over
-    older unflushed keys.
+- [x] **Flushable ingest (skip the flush when disjoint).** `ingest` no longer force-flushes the
+  memtable unconditionally: it computes the ingested files' point-key span and flushes the
+  in-memory data only when that span overlaps a point key in the mutable memtable or an immutable
+  still awaiting flush. The common bulk-load case (ingested keys disjoint from in-memory data)
+  skips the flush entirely and never blocks on it — approximating Pebble's flushable ingest, which
+  queues a flushable instead of flushing. The overlap case keeps the correct force-flush, and the
+  ingested files still go straight into the MANIFEST (crash-consistency unchanged). The metamorphic
+  model test now exercises ingest. (A full flushable-queue for the overlap case — avoiding the
+  flush there too — remains a further optimization.)
 
 - [x] **Sublevel-aware reads + scoring.** The read path presents each level (and each L0
   sublevel) as one ordered `ConcatIter` run, opened **lazily** (a part's sstable reader is opened
@@ -282,8 +286,20 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   `prev_with_limit` returning `IterValidity` (`Valid` / `AtLimit` / `Exhausted`) with a pause/resume
   state matching Pebble's `IterValidityState`, and `stats` / `reset_stats` (forward/reverse seek and
   step counts + internal versions scanned). Each has unit/e2e coverage.
-- [ ] **Port Pebble's `testdata` corpus.** Vendor a subset of upstream data-driven fixtures
-  (needs the Go toolchain in CI) and run them through the in-crate decoders/engine.
+- [x] **`AsyncFlush` (`Db::flush_async` + `FlushHandle`).** Rotates the active memtable and returns
+  a handle immediately; a background worker performs the flush and `FlushHandle::wait` blocks until
+  the data has reached L0 (tracked by the newest pending immutable WAL number via `drained_cv`).
+- [x] **Data-driven `testdata` corpus (iterator suite).** The in-crate data-driven harness gained
+  iterator-trace directives mirroring Pebble's `iter` testdata (`iter-bounds`, `iter-first/last`,
+  `iter-next/prev`, `iter-next-prefix`, `iter-seek-ge/lt`, and the limited family rendering
+  `Valid`/`AtLimit`/`Exhausted`), plus cases for forward/reverse seeks, bounded iteration, and
+  limited pause/resume both directions. CI-friendly (no Go). (Vendoring Pebble's full Go-DSL
+  corpus verbatim — with its exact expected-output format — remains optional follow-up.)
+- [ ] **Remaining DB-API async/shared-storage parity.** `ApplyNoSyncWait`/`SyncWait` (decouple the
+  WAL fsync from visibility in the group-commit pipeline — historically deadlock-prone; niche
+  throughput benefit) and the shared-storage ingest surface (`IngestExternalFiles`, `SetCreatorID`,
+  `ObjProvider`), which require the objstorage `Provider` to be the engine's actual storage layer
+  (it is probe-based today). Both are architectural; deferred pending a focused effort.
 
 ### Deferred / blocked
 
