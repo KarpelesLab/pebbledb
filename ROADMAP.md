@@ -298,12 +298,20 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   durability. A `no_sync` flag threads through the group-commit queue → `append_to_wal` (only
   flipping `sync_all`→`flush`; the leader/follower coordination is untouched). Verified with a
   WAL-fsync-counting `Fs`.
-- [ ] **Shared-storage ingest surface (`IngestExternalFiles`, `SetCreatorID`, `ObjProvider`).** These
-  are meaningful only once the objstorage `Provider` is the engine's *actual* storage layer
-  (creator-prefixed shared object names, reference-not-copy ingest, a provider exposed from `Db`) —
-  today the engine discovers shared objects by probing and rewrites ingested files locally. This is
-  the same architectural adoption the objstorage-catalog interop needs; adding the methods as stubs
-  would be misleading, so it's deferred to a focused disaggregated-storage effort.
+- [x] **Shared-storage ingest surface (`IngestExternalFiles`, `SetCreatorID`, `ObjProvider`).**
+  `Db::set_creator_id` (non-zero, set-once, persisted), `Db::ingest_external_files` (reference-in-place:
+  the external sstable's bytes stay in remote storage under the caller's object name and are *never*
+  copied or deleted — no-cleanup semantics), and `Db::creator_id`/`external_objects` accessors
+  (`ObjProvider` parity). Correctness rests on a **synthetic seqnum**: an external file keeps its
+  on-disk seqnums, but `Reader::open_external` materializes the table and rewrites every key trailer to
+  the assigned ingest seqnum, so the ingest wins over older data *and* stays invisible to snapshots
+  taken before it (the synthetic seqnum is the file's `smallest_seqnum`; no new MANIFEST field). The
+  engine keeps a local external-object catalog (`remoteobjcat` format + atomic marker, reusing the
+  `Provider`'s helpers), persisted **before** the MANIFEST edit and pruned on open. `open_reader`
+  redirects external file numbers off `<num>.sst` to `remote.get(custom_object_name)`; `collect_obsolete`
+  drops the catalog entry but never the remote bytes. Both row- and columnar-format external sstables;
+  verified end-to-end (reference+read-back, snapshot isolation/ingest-wins, persistence across reopen,
+  no-cleanup, guard rails).
 
 ### Deferred / blocked
 

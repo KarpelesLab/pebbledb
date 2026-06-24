@@ -28,7 +28,7 @@ mod compaction;
 mod filenames;
 mod indexed_batch;
 mod maintenance;
-pub use maintenance::CheckpointOptions;
+pub use maintenance::{CheckpointOptions, ExternalFile};
 mod merging_iter;
 mod options_file;
 
@@ -680,6 +680,31 @@ pub struct DbInner {
     target_file_size: u64,
     /// L0 file-count safety cap that triggers an L0→L1 compaction regardless of sublevel count.
     l0_compaction_file_threshold: usize,
+    /// Catalog of EXTERNAL (reference-in-place) objects: maps a file number to its remote object
+    /// location, so [`open_reader`](Self::open_reader) reads those file numbers from the named
+    /// remote object instead of `<num>.sst`. Empty for databases that never ingest external files
+    /// (so the default read/write paths are unchanged). Persisted as a `REMOTE-OBJ-CATALOG` record
+    /// log + marker on the local fs, seeded at open. See [`Db::ingest_external_files`].
+    ext_catalog: Mutex<ExtCatalog>,
+}
+
+/// Engine-level catalog of external (reference-in-place) objects. The MANIFEST remains the sole
+/// authority for which files are live; this only redirects the read path off `<num>.sst` for
+/// external file numbers and records this store's creator id.
+#[derive(Default)]
+struct ExtCatalog {
+    /// This store's creator id (set once via [`Db::set_creator_id`]); required before ingesting.
+    creator_id: Option<u64>,
+    /// External objects keyed by file number → their remote location + cleanup policy. Persisted
+    /// in the catalog file.
+    objects: std::collections::BTreeMap<u64, crate::objstorage::remoteobjcat::RemoteObjectMetadata>,
+    /// Per external file number → its synthetic sequence number (the ingest seqnum applied to every
+    /// key on read). NOT persisted here — re-derived at open from each file's MANIFEST
+    /// `smallest_seqnum`. Kept beside `objects` so `open_reader` can resolve it without the state
+    /// lock (mirroring `native_blob_refs`).
+    syn_seq: std::collections::BTreeMap<u64, u64>,
+    /// File number of the current on-disk catalog file (`0` = none written yet).
+    num: u64,
 }
 
 /// Lazily opens the point iterator for one file of an ordered run (a level or L0 sublevel) when
@@ -864,6 +889,11 @@ impl DbInner {
         for phys in candidate_tables {
             if !live_tables.contains(&phys) {
                 self.cache.lock().unwrap().remove(&phys);
+                // An external (reference-in-place) object uses no-cleanup semantics: drop only the
+                // catalog entry; never delete the referenced bytes from remote storage.
+                if self.drop_ext_catalog_entry(phys) {
+                    continue;
+                }
                 let name = filenames::table(phys);
                 if let Some(remote) = &self.remote
                     && remote.exists(&name)
@@ -1296,6 +1326,9 @@ impl DbInner {
             let native_blob_refs = native_blob_refs_from_version(&state.vs);
             // Seed the span hint from the loaded files so a first scan can skip span-free ones.
             let span_seed = span_hints_from_version(&state.vs.current);
+            // Read-only: load the external-object catalog but do not prune/rewrite it (no writes).
+            let mut ext_catalog = load_ext_catalog(fs.as_ref(), &dir);
+            seed_ext_syn_seq(&mut ext_catalog, &state.vs.current);
             return Ok(DbInner {
                 dir,
                 cmp,
@@ -1349,6 +1382,7 @@ impl DbInner {
                 mem_stop_threshold: opts.mem_table_stop_writes_threshold.max(1),
                 l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
                 l0_compaction_file_threshold: opts.l0_compaction_file_threshold.max(1),
+                ext_catalog: Mutex::new(ext_catalog),
                 target_file_size: opts.target_file_size.max(1),
             });
         }
@@ -1478,6 +1512,11 @@ impl DbInner {
         // with their hint set); merge any recovery-flush hints for completeness.
         let mut span_seed = span_hints_from_version(&state.vs.current);
         span_seed.extend(recovered_span_hint);
+        // Load the external-object catalog and prune entries for any file number not in the loaded
+        // version (covers a crash between catalog and MANIFEST writes — see prune_ext_catalog).
+        let mut ext_catalog = load_ext_catalog(fs.as_ref(), &dir);
+        prune_ext_catalog(fs.as_ref(), &dir, &mut ext_catalog, &state.vs.current)?;
+        seed_ext_syn_seq(&mut ext_catalog, &state.vs.current);
         Ok(DbInner {
             dir,
             cmp,
@@ -1532,6 +1571,7 @@ impl DbInner {
             l0_compaction_threshold: opts.l0_compaction_threshold.max(1),
             l0_compaction_file_threshold: opts.l0_compaction_file_threshold.max(1),
             target_file_size: opts.target_file_size.max(1),
+            ext_catalog: Mutex::new(ext_catalog),
         })
     }
 
@@ -2834,38 +2874,78 @@ impl DbInner {
     }
 
     /// Opens (or returns a cached) reader for the sstable with the given file number.
+    /// If `file_num` is an external (reference-in-place) object, removes its catalog entry and
+    /// rewrites the catalog, returning `true`. External objects use no-cleanup semantics, so the
+    /// caller must not delete the referenced remote bytes.
+    fn drop_ext_catalog_entry(&self, file_num: u64) -> bool {
+        let mut ext = self.ext_catalog.lock().unwrap();
+        if ext.objects.remove(&file_num).is_some() {
+            ext.syn_seq.remove(&file_num);
+            // Best-effort: a failed rewrite just leaves a dangling entry, pruned on next open.
+            let _ = write_ext_catalog(self.fs.as_ref(), &self.dir, &mut ext);
+            true
+        } else {
+            false
+        }
+    }
+
     fn open_reader(&self, file_num: u64) -> Result<Arc<Reader>> {
         if let Some(r) = self.cache.lock().unwrap().get(&file_num) {
             return Ok(Arc::clone(r));
         }
-        let bytes = self.read_object(&filenames::table(file_num))?;
-        // A table written by upstream Pebble with separated values resolves them against native
-        // blob files; pass its blob references + resolver so resolution happens during the
-        // columnar reader's up-front materialization.
-        let native_blob = self
-            .native_blob_refs
-            .lock()
-            .unwrap()
-            .get(&file_num)
-            .map(|refs| {
+        // External (reference-in-place) file: its bytes live in remote storage under a custom name,
+        // and all its keys are read at a synthetic seqnum. Resolve both from the external catalog
+        // (under its own lock — never the state lock) before any I/O.
+        let external = {
+            let ext = self.ext_catalog.lock().unwrap();
+            ext.objects.get(&file_num).map(|m| {
                 (
-                    refs.clone(),
-                    Arc::clone(&self.native_blob_store)
-                        as Arc<dyn crate::sstable::pebble_blob::NativeBlobResolver>,
+                    m.custom_object_name.clone(),
+                    ext.syn_seq.get(&file_num).copied().unwrap_or(0),
                 )
-            });
-        let reader = Arc::new(
-            Reader::open_with_cache(
+            })
+        };
+        let reader = if let Some((object_name, syn_seq)) = external {
+            let remote = self.remote.as_ref().ok_or_else(|| {
+                Error::InvalidState("external object referenced but no remote backend".into())
+            })?;
+            let bytes = remote.get(&object_name)?;
+            Arc::new(Reader::open_external(
                 bytes,
                 self.cmp.clone(),
                 file_num,
-                self.block_cache.clone(),
-                native_blob,
-            )?
-            .with_blob_resolver(
-                Arc::clone(&self.blob_store) as Arc<dyn crate::sstable::BlobResolver>
-            ),
-        );
+                syn_seq,
+            )?)
+        } else {
+            let bytes = self.read_object(&filenames::table(file_num))?;
+            // A table written by upstream Pebble with separated values resolves them against native
+            // blob files; pass its blob references + resolver so resolution happens during the
+            // columnar reader's up-front materialization.
+            let native_blob = self
+                .native_blob_refs
+                .lock()
+                .unwrap()
+                .get(&file_num)
+                .map(|refs| {
+                    (
+                        refs.clone(),
+                        Arc::clone(&self.native_blob_store)
+                            as Arc<dyn crate::sstable::pebble_blob::NativeBlobResolver>,
+                    )
+                });
+            Arc::new(
+                Reader::open_with_cache(
+                    bytes,
+                    self.cmp.clone(),
+                    file_num,
+                    self.block_cache.clone(),
+                    native_blob,
+                )?
+                .with_blob_resolver(
+                    Arc::clone(&self.blob_store) as Arc<dyn crate::sstable::BlobResolver>
+                ),
+            )
+        };
         let mut cache = self.cache.lock().unwrap();
         // Bound the number of open readers. Once at capacity, drop entries that are not
         // referenced elsewhere before inserting the new reader.
@@ -3727,6 +3807,95 @@ fn span_hints_from_version(version: &crate::manifest::Version) -> HashMap<u64, b
         }
     }
     hints
+}
+
+/// Loads the engine external-object catalog from `dir` (a `REMOTE-OBJ-CATALOG` record log located
+/// by a `marker.remote-obj-catalog.*` marker), or an empty catalog if none exists. A read error or
+/// unreadable catalog yields an empty catalog (the database simply has no external objects).
+fn load_ext_catalog(fs: &dyn Fs, dir: &Path) -> ExtCatalog {
+    let Ok(Some((iter, name))) = crate::objstorage::read_catalog_marker(fs, dir) else {
+        return ExtCatalog::default();
+    };
+    match fs
+        .read(&dir.join(&name))
+        .ok()
+        .and_then(|bytes| crate::objstorage::remoteobjcat::read_catalog(&bytes).ok())
+    {
+        Some(contents) => ExtCatalog {
+            creator_id: contents.creator_id,
+            objects: contents.objects,
+            syn_seq: std::collections::BTreeMap::new(),
+            num: iter,
+        },
+        None => ExtCatalog::default(),
+    }
+}
+
+/// Rewrites the external-object catalog fresh under a new file number and atomically repoints its
+/// marker, then removes the superseded file — mirroring the objstorage `Provider`'s scheme. The
+/// catalog file + marker live on the local fs; only the referenced objects are remote.
+fn write_ext_catalog(fs: &dyn Fs, dir: &Path, ext: &mut ExtCatalog) -> Result<()> {
+    use crate::objstorage::{
+        catalog_filename, remoteobjcat::CatalogContents, update_catalog_marker,
+    };
+    let next = ext.num + 1;
+    let contents = CatalogContents {
+        creator_id: ext.creator_id,
+        objects: ext.objects.clone(),
+    };
+    let bytes = crate::objstorage::remoteobjcat::write_catalog(&contents)?;
+    let name = catalog_filename(next);
+    {
+        let mut f = fs.create(&dir.join(&name))?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    update_catalog_marker(fs, dir, next, &name)?;
+    if ext.num != 0 {
+        let _ = fs.remove(&dir.join(catalog_filename(ext.num)));
+    }
+    ext.num = next;
+    Ok(())
+}
+
+/// Derives each external file's synthetic seqnum from the loaded version (its MANIFEST
+/// `smallest_seqnum`), so `open_reader` can apply it without taking the state lock.
+fn seed_ext_syn_seq(ext: &mut ExtCatalog, version: &crate::manifest::Version) {
+    ext.syn_seq.clear();
+    for level in version.levels.iter() {
+        for f in level {
+            if ext.objects.contains_key(&f.file_num) {
+                ext.syn_seq.insert(f.file_num, f.smallest_seqnum);
+            }
+        }
+    }
+}
+
+/// Drops catalog entries whose file number is in no live level of `version`, rewriting the catalog
+/// if anything changed. Covers the crash window between writing the catalog and committing the
+/// MANIFEST edit: a dangling entry for a never-committed (and therefore reusable) file number could
+/// otherwise misdirect a future file's reads to a stale external object.
+fn prune_ext_catalog(
+    fs: &dyn Fs,
+    dir: &Path,
+    ext: &mut ExtCatalog,
+    version: &crate::manifest::Version,
+) -> Result<()> {
+    if ext.objects.is_empty() {
+        return Ok(());
+    }
+    let live: std::collections::HashSet<u64> = version
+        .levels
+        .iter()
+        .flatten()
+        .map(|f| f.file_num)
+        .collect();
+    let before = ext.objects.len();
+    ext.objects.retain(|num, _| live.contains(num));
+    if ext.objects.len() != before {
+        write_ext_catalog(fs, dir, ext)?;
+    }
+    Ok(())
 }
 
 /// Builds the `sstable file_num -> resolved native blob file numbers` map from a loaded version:

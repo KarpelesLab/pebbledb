@@ -18,11 +18,36 @@ use std::sync::Arc;
 use crate::Result;
 use crate::base::internal_key::{InternalKey, InternalKeyKind, encoded_user_key, trailer_kind};
 use crate::manifest::{FileMetadata, NewFileEntry, VersionEdit};
+use crate::objstorage::remoteobjcat::{ObjType, RemoteObjectMetadata};
 use crate::record;
 use crate::sstable::{Reader, Writer};
 use crate::vfs::WritableFile;
 
-use super::{DbInner, filenames, update_marker};
+use super::{DbInner, filenames, update_marker, write_ext_catalog};
+
+/// An sstable in external/shared storage to be ingested **by reference** (Pebble's `ExternalFile`):
+/// its bytes stay in the remote backend under `obj_name` and are read at a synthetic sequence
+/// number — never copied locally. Bounds are caller-provided (the file's key range). Synthetic
+/// prefix/suffix key transforms are not yet supported.
+#[derive(Clone, Debug)]
+pub struct ExternalFile {
+    /// Names the remote backend. Recorded for fidelity; the single configured backend is used.
+    pub locator: String,
+    /// The object's name within the remote backend.
+    pub obj_name: String,
+    /// The object's size in bytes (recorded in the catalog).
+    pub size: u64,
+    /// Inclusive smallest user key the file covers.
+    pub start_key: Vec<u8>,
+    /// Largest user key the file covers (inclusive iff `end_key_inclusive`).
+    pub end_key: Vec<u8>,
+    /// Whether `end_key` is inclusive.
+    pub end_key_inclusive: bool,
+    /// Whether the file contains point keys.
+    pub has_point_key: bool,
+    /// Whether the file contains range keys.
+    pub has_range_key: bool,
+}
 
 /// Options for [`Db::checkpoint_with_options`](DbInner::checkpoint_with_options), mirroring
 /// Pebble's `CheckpointOptions`.
@@ -241,6 +266,190 @@ impl DbInner {
     ) -> Result<()> {
         self.delete_range(start, end)?;
         self.ingest(paths)
+    }
+
+    /// Assigns this store's creator id (Pebble's `SetCreatorID`). Required before
+    /// [`ingest_external_files`](Self::ingest_external_files). Must be non-zero and may be set only
+    /// once (idempotent for the same id); persisted in the external-object catalog.
+    pub fn set_creator_id(&self, id: u64) -> Result<()> {
+        if id == 0 {
+            return Err(crate::Error::InvalidState(
+                "creator id must be non-zero".into(),
+            ));
+        }
+        if self.state.lock().unwrap().read_only {
+            return Err(crate::Error::InvalidState("db: opened read-only".into()));
+        }
+        let mut ext = self.ext_catalog.lock().unwrap();
+        match ext.creator_id {
+            Some(existing) if existing != id => {
+                return Err(crate::Error::InvalidState("creator id already set".into()));
+            }
+            Some(_) => return Ok(()), // idempotent
+            None => {}
+        }
+        ext.creator_id = Some(id);
+        write_ext_catalog(self.fs.as_ref(), &self.dir, &mut ext)
+    }
+
+    /// This store's creator id, if set.
+    pub fn creator_id(&self) -> Option<u64> {
+        self.ext_catalog.lock().unwrap().creator_id
+    }
+
+    /// The external (reference-in-place) objects currently registered, as
+    /// `(file_num, remote_object_name)` — a thin view of the object provider's external catalog.
+    pub fn external_objects(&self) -> Vec<(u64, String)> {
+        self.ext_catalog
+            .lock()
+            .unwrap()
+            .objects
+            .iter()
+            .map(|(n, m)| (*n, m.custom_object_name.clone()))
+            .collect()
+    }
+
+    /// Ingests sstables that live in external/shared storage **by reference** (Pebble's
+    /// `IngestExternalFiles`): the files are not copied or rewritten — each is registered as a table
+    /// whose bytes stay in the remote backend under its `obj_name`, read at a synthetic sequence
+    /// number so the ingest wins over older data and is invisible to snapshots taken before it.
+    /// Requires a remote backend and a creator id ([`set_creator_id`](Self::set_creator_id)).
+    /// External objects are never deleted from remote storage (no-cleanup). The caller must supply
+    /// accurate key bounds; the files are placed at L0.
+    pub fn ingest_external_files(&self, external: &[ExternalFile]) -> Result<()> {
+        if external.is_empty() {
+            return Ok(());
+        }
+        if self.remote.is_none() {
+            return Err(crate::Error::InvalidState(
+                "ingest_external_files requires a remote backend".into(),
+            ));
+        }
+        let creator_id = self.ext_catalog.lock().unwrap().creator_id.ok_or_else(|| {
+            crate::Error::InvalidState(
+                "set_creator_id required before ingest_external_files".into(),
+            )
+        })?;
+
+        // Union of the ingested key spans, to decide whether a memtable flush is needed (a stale
+        // in-memory key in the span would otherwise shadow the newer ingested value).
+        let mut span: Option<(Vec<u8>, Vec<u8>)> = None;
+        for f in external {
+            let (lo, hi) = (f.start_key.clone(), f.end_key.clone());
+            span = Some(match span {
+                None => (lo, hi),
+                Some((glo, ghi)) => (
+                    if self.cmp.compare(&lo, &glo) == std::cmp::Ordering::Less {
+                        lo
+                    } else {
+                        glo
+                    },
+                    if self.cmp.compare(&hi, &ghi) == std::cmp::Ordering::Greater {
+                        hi
+                    } else {
+                        ghi
+                    },
+                ),
+            });
+        }
+
+        // Reserve one fresh sequence number + file number per external file, and decide on a flush.
+        let (plan, needs_flush): (Vec<(u64, u64)>, bool) = {
+            let mut state = self.state.lock().unwrap();
+            if state.read_only {
+                return Err(crate::Error::InvalidState("db: opened read-only".into()));
+            }
+            let mut plan = Vec::new();
+            for _ in external {
+                let seqnum = state.vs.last_sequence + 1;
+                state.vs.last_sequence = seqnum;
+                let file_num = state.vs.allocate_file_number();
+                plan.push((file_num, seqnum));
+            }
+            let needs_flush = if let Some((lo, hi)) = &span {
+                let overlaps = |m: &Arc<crate::memtable::MemTable>| -> bool {
+                    let mut it = m.iter();
+                    it.seek_ge(lo, u64::MAX);
+                    it.valid() && self.cmp.compare(it.user_key(), hi) != std::cmp::Ordering::Greater
+                };
+                overlaps(&state.mem) || state.imm.iter().any(overlaps)
+            } else {
+                false
+            };
+            if needs_flush {
+                self.rotate_memtable(&mut state)?;
+                self.work_cv.notify_all();
+            }
+            (plan, needs_flush)
+        };
+        if needs_flush {
+            while self.flush_one()? {}
+        }
+
+        // Build each file's metadata (non-virtual; bounds from the caller-supplied keys at the
+        // ingest seqnum) and its external-catalog entry. Persist the catalog FIRST so a crash
+        // before the MANIFEST edit leaves only a dangling entry (pruned on the next open), never a
+        // live file whose bytes cannot be located.
+        let mut new_files = Vec::new();
+        {
+            let mut ext = self.ext_catalog.lock().unwrap();
+            for (f, &(file_num, seqnum)) in external.iter().zip(plan.iter()) {
+                let smallest =
+                    InternalKey::new(f.start_key.clone(), seqnum, InternalKeyKind::Set).encode();
+                let largest =
+                    InternalKey::new(f.end_key.clone(), seqnum, InternalKeyKind::Set).encode();
+                new_files.push(NewFileEntry {
+                    level: 0,
+                    meta: FileMetadata {
+                        file_num,
+                        size: f.size,
+                        smallest,
+                        largest,
+                        smallest_seqnum: seqnum,
+                        largest_seqnum: seqnum,
+                        blob_refs: Vec::new(),
+                        pebble_blob_refs: Vec::new(),
+                        backing: None,
+                        has_spans: None,
+                    },
+                });
+                ext.objects.insert(
+                    file_num,
+                    RemoteObjectMetadata {
+                        file_num,
+                        obj_type: ObjType::Table,
+                        creator_id,
+                        creator_file_num: file_num,
+                        cleanup_method: 1, // no-cleanup: never delete external bytes
+                        locator: f.locator.clone(),
+                        custom_object_name: f.obj_name.clone(),
+                    },
+                );
+                ext.syn_seq.insert(file_num, seqnum);
+            }
+            write_ext_catalog(self.fs.as_ref(), &self.dir, &mut ext)?;
+        }
+
+        // Record the files in the MANIFEST (at L0), then keep the LSM in shape.
+        {
+            let mut state = self.state.lock().unwrap();
+            let edit = VersionEdit {
+                next_file_number: Some(state.vs.next_file_number),
+                last_sequence: Some(state.vs.last_sequence),
+                new_files,
+                ..Default::default()
+            };
+            state.vs.apply(&edit)?;
+            if let Some(mw) = state.manifest.as_mut() {
+                mw.write_record(&edit.encode())?;
+                mw.sync_all()?;
+            }
+        }
+        self.maybe_compact()?;
+        if let Some(l) = &self.listener {
+            l.on_ingest_end(external.len());
+        }
+        Ok(())
     }
 
     /// Rewrites shared/remote sstables (and their blob files) overlapping the user-key range

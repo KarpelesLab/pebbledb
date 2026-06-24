@@ -29,16 +29,16 @@ pub mod remoteobjcat;
 use remoteobjcat::{CatalogContents, ObjType, RemoteObjectMetadata, read_catalog, write_catalog};
 
 /// Marker type naming the current remote-object catalog file (Pebble's `remote-obj-catalog`).
-const CATALOG_MARKER_PREFIX: &str = "marker.remote-obj-catalog.";
+pub(crate) const CATALOG_MARKER_PREFIX: &str = "marker.remote-obj-catalog.";
 
 /// Filename of the catalog record-log file numbered `num` (`REMOTE-OBJ-CATALOG-<num:06>`).
-fn catalog_filename(num: u64) -> String {
+pub(crate) fn catalog_filename(num: u64) -> String {
     format!("REMOTE-OBJ-CATALOG-{num:06}")
 }
 
 /// Returns the highest-iteration remote-obj-catalog marker in `dir` as `(iteration, value)`,
 /// where `value` is the catalog filename the marker points at.
-fn read_catalog_marker(fs: &dyn Fs, dir: &Path) -> io::Result<Option<(u64, String)>> {
+pub(crate) fn read_catalog_marker(fs: &dyn Fs, dir: &Path) -> io::Result<Option<(u64, String)>> {
     let mut best: Option<(u64, String)> = None;
     for name in fs.list(dir)? {
         let Some(rest) = name.strip_prefix(CATALOG_MARKER_PREFIX) else {
@@ -57,7 +57,12 @@ fn read_catalog_marker(fs: &dyn Fs, dir: &Path) -> io::Result<Option<(u64, Strin
 /// Atomically repoints the remote-obj-catalog marker at `value` with iteration `iter`: a new
 /// marker file is created (and synced) before the superseded markers are removed, so a crash at
 /// any point leaves the highest-iteration marker pointing at a complete catalog.
-fn update_catalog_marker(fs: &dyn Fs, dir: &Path, iter: u64, value: &str) -> io::Result<()> {
+pub(crate) fn update_catalog_marker(
+    fs: &dyn Fs,
+    dir: &Path,
+    iter: u64,
+    value: &str,
+) -> io::Result<()> {
     let new_name = format!("{CATALOG_MARKER_PREFIX}{iter:06}.{value}");
     fs.create(&dir.join(&new_name))?.sync_all()?;
     for name in fs.list(dir)? {

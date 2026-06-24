@@ -5407,3 +5407,238 @@ fn reads_pebble_v2_separated_v7_sstable_with_native_blob() {
         assert_eq!(v.as_slice(), want.as_bytes(), "separated value {i}");
     }
 }
+
+/// Builds an external sstable's bytes over `kvs` (point keys at an arbitrary on-disk seqnum that
+/// the engine overrides on read), in row or columnar format. Returns the bytes.
+fn build_ext_sstable(tag: &str, kvs: &[(&str, &str)], columnar: bool) -> Vec<u8> {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{TableFormat, WriterOptions};
+    let cmp = Arc::new(pebbledb::DefaultComparer);
+    let seqnum = 100u64; // original on-disk seqnum; replaced by the synthetic seqnum on read
+    if columnar {
+        use pebbledb::sstable::columnar::ColumnarWriter;
+        let mut w = ColumnarWriter::new(
+            cmp,
+            WriterOptions {
+                table_format: TableFormat::Pebble(5),
+                ..Default::default()
+            },
+        );
+        for (k, v) in kvs {
+            let ik = InternalKey::new(k.as_bytes().to_vec(), seqnum, InternalKeyKind::Set).encode();
+            w.add(&ik, v.as_bytes()).unwrap();
+        }
+        w.finish().unwrap()
+    } else {
+        use pebbledb::sstable::Writer;
+        let dir = temp_dir(&format!("ext-src-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("src.sst");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = Writer::new(f, cmp, WriterOptions::default());
+            for (k, v) in kvs {
+                let ik =
+                    InternalKey::new(k.as_bytes().to_vec(), seqnum, InternalKeyKind::Set).encode();
+                w.add(&ik, v.as_bytes()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+}
+
+/// `ingest_external_files` references an sstable that lives in remote storage **without copying
+/// it**, reads its keys at a synthetic seqnum (so the ingest wins over older data and is invisible
+/// to snapshots taken before it), and survives reopen. Covers both row and columnar external files.
+#[test]
+fn external_ingest_reference_read_back_snapshot_and_reopen() {
+    use pebbledb::ExternalFile;
+    use pebbledb::objstorage::{InMemoryRemote, RemoteStorage};
+
+    for columnar in [false, true] {
+        let dir = temp_dir(&format!("ext-ingest-{columnar}"));
+        let remote: Arc<dyn RemoteStorage> = Arc::new(InMemoryRemote::new());
+        let opts = || Options {
+            remote_storage: Some(Arc::clone(&remote)),
+            ..Default::default()
+        };
+        let obj = "ext/file-A.sst";
+        remote
+            .put(
+                obj,
+                &build_ext_sstable(
+                    &format!("c{columnar}"),
+                    &[("aaa", "ext-a"), ("mmm", "ext-m"), ("zzz", "ext-z")],
+                    columnar,
+                ),
+            )
+            .unwrap();
+
+        let db = Db::open(&dir, opts()).unwrap();
+        db.set_creator_id(42).unwrap();
+        // A pre-existing (older) value for an overlapping key, kept in the active memtable.
+        db.set(b"aaa", b"old-a").unwrap();
+        let snap = db.snapshot();
+
+        db.ingest_external_files(&[ExternalFile {
+            locator: String::new(),
+            obj_name: obj.to_string(),
+            size: 0,
+            start_key: b"aaa".to_vec(),
+            end_key: b"zzz".to_vec(),
+            end_key_inclusive: true,
+            has_point_key: true,
+            has_range_key: false,
+        }])
+        .unwrap();
+
+        // The external bytes were referenced, not copied: no numbered sstable was added to remote.
+        let numbered: Vec<String> = remote
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.ends_with(".sst") && n != obj)
+            .collect();
+        assert!(
+            numbered.is_empty(),
+            "external ingest must not copy ({columnar}): {numbered:?}"
+        );
+        assert!(remote.exists(obj));
+
+        // Current reads see the ingested values; the overlapping key's ingest wins over the older
+        // memtable value (the overlap forced a flush below the ingest).
+        assert_eq!(
+            db.get(b"aaa").unwrap().as_deref(),
+            Some(b"ext-a".as_ref()),
+            "{columnar}"
+        );
+        assert_eq!(
+            db.get(b"mmm").unwrap().as_deref(),
+            Some(b"ext-m".as_ref()),
+            "{columnar}"
+        );
+        assert_eq!(
+            db.get(b"zzz").unwrap().as_deref(),
+            Some(b"ext-z".as_ref()),
+            "{columnar}"
+        );
+
+        // The snapshot taken before the ingest does not see it (synthetic seqnum > snapshot).
+        assert_eq!(
+            snap.get(b"aaa").unwrap().as_deref(),
+            Some(b"old-a".as_ref()),
+            "{columnar}"
+        );
+        assert_eq!(
+            snap.get(b"mmm").unwrap().unwrap_or_default(),
+            b"",
+            "{columnar}"
+        );
+        assert_eq!(snap.get(b"zzz").unwrap(), None, "{columnar}");
+        drop(snap);
+
+        // Survives reopen: the external catalog reseeds from its marker.
+        drop(db);
+        let db = Db::open(&dir, opts()).unwrap();
+        assert_eq!(
+            db.get(b"mmm").unwrap().as_deref(),
+            Some(b"ext-m".as_ref()),
+            "{columnar}"
+        );
+        assert_eq!(
+            db.get(b"zzz").unwrap().as_deref(),
+            Some(b"ext-z".as_ref()),
+            "{columnar}"
+        );
+        assert_eq!(db.creator_id(), Some(42));
+        assert_eq!(db.external_objects().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An external object uses no-cleanup semantics: when its file leaves the LSM, the catalog entry is
+/// dropped but the remote bytes are never deleted. Guard rails on creator id / remote are enforced.
+#[test]
+fn external_ingest_no_cleanup_and_guard_rails() {
+    use pebbledb::ExternalFile;
+    use pebbledb::objstorage::{InMemoryRemote, RemoteStorage};
+
+    let dir = temp_dir("ext-ingest-cleanup");
+    let remote: Arc<dyn RemoteStorage> = Arc::new(InMemoryRemote::new());
+    let opts = || Options {
+        remote_storage: Some(Arc::clone(&remote)),
+        ..Default::default()
+    };
+    let obj = "ext/keepme.sst";
+    remote
+        .put(
+            obj,
+            &build_ext_sstable("cleanup", &[("p", "1"), ("q", "2")], false),
+        )
+        .unwrap();
+
+    let db = Db::open(&dir, opts()).unwrap();
+
+    // Guard rails.
+    assert!(
+        db.ingest_external_files(&[ExternalFile {
+            locator: String::new(),
+            obj_name: obj.to_string(),
+            size: 0,
+            start_key: b"p".to_vec(),
+            end_key: b"q".to_vec(),
+            end_key_inclusive: true,
+            has_point_key: true,
+            has_range_key: false,
+        }])
+        .is_err(),
+        "ingest before set_creator_id must fail"
+    );
+    assert!(db.set_creator_id(0).is_err(), "creator id 0 must fail");
+    db.set_creator_id(7).unwrap();
+    assert!(
+        db.set_creator_id(8).is_err(),
+        "changing the creator id must fail"
+    );
+    db.set_creator_id(7).unwrap(); // idempotent for the same id
+
+    db.ingest_external_files(&[ExternalFile {
+        locator: String::new(),
+        obj_name: obj.to_string(),
+        size: 0,
+        start_key: b"p".to_vec(),
+        end_key: b"q".to_vec(),
+        end_key_inclusive: true,
+        has_point_key: true,
+        has_range_key: false,
+    }])
+    .unwrap();
+    assert_eq!(db.get(b"p").unwrap().as_deref(), Some(b"1".as_ref()));
+
+    // Overwrite the external file's keys with newer values and compact: the new L0 flush overlaps
+    // the external file, so the compaction *merges* it away (consumed, not relevelled) and its file
+    // leaves the LSM. The remote object must remain (no-cleanup) while the catalog entry is dropped.
+    db.set(b"p", b"new1").unwrap();
+    db.set(b"q", b"new2").unwrap();
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+    assert_eq!(db.get(b"p").unwrap().as_deref(), Some(b"new1".as_ref()));
+    // A trailing flush runs the obsolete-file sweep once the superseded version has been released,
+    // so the now-unreferenced external file is collected.
+    db.set(b"zzzz", b"x").unwrap();
+    db.flush().unwrap();
+    assert!(
+        remote.exists(obj),
+        "external bytes must never be deleted from remote"
+    );
+    assert!(
+        db.external_objects().is_empty(),
+        "catalog entry dropped when the external file left the LSM"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

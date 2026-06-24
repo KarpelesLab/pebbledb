@@ -411,6 +411,92 @@ impl Reader {
         })
     }
 
+    /// Opens an sstable that is being **ingested by reference** from external/shared storage,
+    /// applying a single `synthetic_seqnum` to every key (Pebble's IngestExternalFiles: the
+    /// referenced file's on-disk sequence numbers are replaced on read so the ingest wins over
+    /// older data and is hidden from snapshots taken before it). The whole table is materialized
+    /// into owned rows (row-format tables are iterated into the same representation columnar tables
+    /// already use), every internal-key trailer is rewritten to `(synthetic_seqnum << 8 | kind)`,
+    /// and range deletions / range keys are restamped to the same seqnum — so all read paths serve
+    /// the synthetic seqnum with no further changes. The external file is assumed self-contained;
+    /// a value stored in a separate blob file (no resolver is attached) would surface as-is and is
+    /// not supported.
+    pub fn open_external(
+        file: impl Into<Arc<[u8]>>,
+        cmp: Arc<dyn Comparer>,
+        file_num: u64,
+        synthetic_seqnum: u64,
+    ) -> Result<Reader> {
+        let base = Arc::new(Reader::open_with_cache(
+            file,
+            cmp.clone(),
+            file_num,
+            None,
+            None,
+        )?);
+        // Materialize every (internal_key, value) row. Columnar tables already hold them; row
+        // tables are iterated into the same owned representation.
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = match &base.columnar_rows {
+            Some(r) => r.to_vec(),
+            None => {
+                let mut out = Vec::new();
+                let mut it = base.iter()?;
+                it.first()?;
+                while it.valid() {
+                    out.push((it.key().to_vec(), it.value().to_vec()));
+                    it.next()?;
+                }
+                out
+            }
+        };
+        // Rewrite each key's trailer (last 8 bytes: seqnum<<8 | kind) to the synthetic seqnum,
+        // preserving the kind. User keys and order are unchanged.
+        for (ik, _) in rows.iter_mut() {
+            let n = ik.len();
+            debug_assert!(n >= 8, "internal key shorter than its trailer");
+            let kind = u64::from_le_bytes(ik[n - 8..].try_into().unwrap()) & 0xff;
+            let trailer = (synthetic_seqnum << 8) | kind;
+            ik[n - 8..].copy_from_slice(&trailer.to_le_bytes());
+        }
+        let range_dels = base
+            .range_dels
+            .iter()
+            .map(|t| RangeTombstone {
+                start: t.start.clone(),
+                end: t.end.clone(),
+                seqnum: synthetic_seqnum,
+            })
+            .collect();
+        let range_keys = base
+            .range_keys
+            .iter()
+            .map(|rk| RangeKeyEntry {
+                kind: rk.kind,
+                start: rk.start.clone(),
+                seqnum: synthetic_seqnum,
+                value: rk.value.clone(),
+            })
+            .collect();
+        Ok(Reader {
+            file: Arc::clone(&base.file),
+            cmp,
+            footer: base.footer,
+            index: Arc::from(&[][..]),
+            prefixed_values: false,
+            value_block_handles: Vec::new(),
+            blob_refs: Vec::new(),
+            props: Properties::default(),
+            filter: None,
+            range_dels,
+            range_keys,
+            two_level: false,
+            file_num,
+            blob_resolver: None,
+            block_cache: None,
+            columnar_rows: Some(rows.into()),
+        })
+    }
+
     /// Attaches a blob resolver so this reader can fetch blob-referenced values from the
     /// table's associated blob file. Call before sharing the reader.
     pub fn with_blob_resolver(mut self, resolver: Arc<dyn BlobResolver>) -> Reader {
