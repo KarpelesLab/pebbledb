@@ -178,9 +178,12 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     columnar and overwritten values are correct) and a Rust→Go interop step where the engine
     writes, compacts, and Pebble v2 reads the columnar database. Optional value-block separation in
     columnar output remains a space optimization, not required for parity.
-- [ ] **Blob file format byte-parity (`FormatValueSeparation`).** pebbledb has a working value
-  separation scheme (`sstable::blob`, a sibling-file 1:1 design with reference-based GC), but it is
-  *not* byte-identical to Pebble's native blob files. Pebble only writes separate `.blob` files at
+- [x] **Blob file format byte-parity (`FormatValueSeparation`).** Read and write are both at
+  byte-parity with Pebble v2.1.6 native blob files (see the completed sub-items below); a
+  value-separated database round-trips both directions, including through compaction. Historical
+  context follows. pebbledb also retains its original sibling-file 1:1 scheme
+  (`sstable::blob`) for non-Pebble-format databases; the native path below is the Pebble-compatible
+  one. Pebble only writes separate `.blob` files at
   `FormatValueSeparation` — a format major version (~24) well above `FormatColumnarBlocks` (19) that
   also introduces a new sstable table format (`FormatTableFormatV6`, footer attributes) and the
   richer `NewFile5` blob-reference encoding (value sizes, reference depth, garbage ratio). Reaching
@@ -219,8 +222,11 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
     materialization). The read format ceiling rises to `MAX_READABLE` = 24 (distinct from the
     writable `NEWEST` = 19). Verified by a Rust→Go interop step: Go writes a value-separated
     database, the engine opens it read-only and reads every separated value.
-  - [ ] The value-separation **write** path (emit v6/v7 + separate values into native blob files).
-    Progress:
+  - [x] The value-separation **write** path (emit v6/v7 + separate values into native blob files),
+    including **compaction re-separation** (a value-separated database stays separated through
+    compaction rather than de-separating to inline v5) and **native-blob GC** (obsolete `.blob`
+    files are deleted with their sstables). Verified both ways against Pebble v2.1.6, including a
+    compacted value-separated database. Sub-items:
     - [x] **Native blob file writer.** `pebble_blob::PebbleBlobWriter` writes Pebble's native
       `.blob` format (value block + index block + 38-byte footer with masked-CRC32C checksum),
       mirroring the reader. Verified both by a round-trip through `PebbleBlobReader` and by upstream
@@ -259,9 +265,23 @@ round-trip tests, but exact byte-parity is proven only by the Go interop workflo
   cleanup method, optional locator/custom-name sub-tags, `0` terminator), `tagDeletedObject(2)`, and
   `tagCreatorID(3)`, plus replay into the accumulated object set. Encode/decode and full
   catalog-file round-trips are unit-tested; the format follows Pebble's
-  `remoteobjcat.VersionEdit` byte-for-byte. (Wiring it into the probe-based
-  [`Provider`](src/objstorage) read path, and a real-catalog interop diff via a Pebble
-  shared-storage harness, remain as follow-ups.)
+  `remoteobjcat.VersionEdit` byte-for-byte. The [`Provider`](src/objstorage) now **persists** its
+  shared-object set to a `REMOTE-OBJ-CATALOG` record log located by an atomic
+  `marker.remote-obj-catalog.*` marker (rewrite-and-remarker on each shared put/remove; replayed on
+  open), so the shared set survives reopen. (A real-catalog interop diff via a Pebble shared-storage
+  harness remains a follow-up; the engine's own shared storage still discovers objects by probing.)
+- [x] **MinLZ block compression (`FormatValueSeparation` / table v6+).** The engine reads and
+  writes MinLZ-compressed blocks (on-disk compression indicator 8, the format
+  `github.com/minio/minlz` produces), via the `minlz` crate's MinLZ codec. Verified both ways
+  against Pebble v2.1.6 (Go writes a MinLZ-compressed database → engine reads; engine writes a
+  MinLZ v7 sstable → Pebble reads, with the verifier asserting indicator byte 8). Pebble's default
+  remains Snappy, which was already supported, so this completes block-compression parity.
+- [x] **Iterator API parity (`NextPrefix`, `*WithLimit`, `Stats`).** The iterator now has
+  `next_prefix` (skip to the next key whose `cmp.split` prefix differs — MVCC-style scans), the
+  cooperative limited family `seek_ge_with_limit` / `next_with_limit` / `seek_lt_with_limit` /
+  `prev_with_limit` returning `IterValidity` (`Valid` / `AtLimit` / `Exhausted`) with a pause/resume
+  state matching Pebble's `IterValidityState`, and `stats` / `reset_stats` (forward/reverse seek and
+  step counts + internal versions scanned). Each has unit/e2e coverage.
 - [ ] **Port Pebble's `testdata` corpus.** Vendor a subset of upstream data-driven fixtures
   (needs the Go toolchain in CI) and run them through the in-crate decoders/engine.
 
