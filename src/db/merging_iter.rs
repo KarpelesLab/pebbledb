@@ -831,6 +831,27 @@ pub struct DbIterator {
     /// candidate is held in `cur_key`/`cur_value` (with `valid` false) so a later limited or plain
     /// step can resume from it without re-reading. `dir` records which side it paused on.
     paused: bool,
+    /// Cumulative positioning work, surfaced by [`stats`](DbIterator::stats).
+    stats: IteratorStats,
+}
+
+/// Cumulative work performed by an iterator since creation (or the last
+/// [`reset_stats`](DbIterator::reset_stats)), mirroring the most-used fields of Pebble's
+/// `IteratorStats`. Counts are at the interface-call level; `internal_keys` additionally reports
+/// the number of internal key versions scanned (the underlying work, which exceeds the number of
+/// user keys surfaced when keys have multiple versions).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IteratorStats {
+    /// Forward absolute positioning calls: `first`, `seek_ge`, `seek_prefix_ge`.
+    pub forward_seek_count: u64,
+    /// Reverse absolute positioning calls: `last`, `seek_lt`.
+    pub reverse_seek_count: u64,
+    /// Forward relative steps: `next` (including those driven by `next_prefix` / `next_with_limit`).
+    pub forward_step_count: u64,
+    /// Reverse relative steps: `prev` (including those driven by `prev_with_limit`).
+    pub reverse_step_count: u64,
+    /// Internal key versions scanned while collapsing user keys.
+    pub internal_keys: u64,
 }
 
 /// The outcome of a limited iterator step ([`DbIterator::next_with_limit`] and friends), mirroring
@@ -878,6 +899,7 @@ impl DbIterator {
             fragments: Vec::new(),
             frag_idx: 0,
             paused: false,
+            stats: IteratorStats::default(),
         };
         if it.key_type == IterKeyType::RangesOnly {
             it.fragments = it.compute_fragments();
@@ -1022,6 +1044,17 @@ impl DbIterator {
         self.valid
     }
 
+    /// Cumulative positioning work since the iterator was created or last
+    /// [`reset_stats`](Self::reset_stats)ed (Pebble's `Iterator.Stats`).
+    pub fn stats(&self) -> IteratorStats {
+        self.stats
+    }
+
+    /// Resets the [`stats`](Self::stats) counters to zero (Pebble's `Iterator.ResetStats`).
+    pub fn reset_stats(&mut self) {
+        self.stats = IteratorStats::default();
+    }
+
     /// Replaces the iterator's key bounds (inclusive lower, exclusive upper). This
     /// invalidates the current position (Pebble's `SetBounds` semantics): the caller must
     /// re-seek with [`first`](Self::first) / [`last`](Self::last) / [`seek_ge`](Self::seek_ge)
@@ -1130,6 +1163,7 @@ impl DbIterator {
 
     /// Positions at the first visible key (honoring the lower bound).
     pub fn first(&mut self) -> Result<()> {
+        self.stats.forward_seek_count += 1;
         self.prefix = None;
         self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
@@ -1149,6 +1183,7 @@ impl DbIterator {
 
     /// Positions at the last visible key (honoring the upper bound).
     pub fn last(&mut self) -> Result<()> {
+        self.stats.reverse_seek_count += 1;
         self.prefix = None;
         self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
@@ -1168,6 +1203,7 @@ impl DbIterator {
 
     /// Positions at the first visible key `>= target` (clamped to the lower bound).
     pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        self.stats.forward_seek_count += 1;
         self.prefix = None;
         self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
@@ -1193,6 +1229,7 @@ impl DbIterator {
 
     /// Positions at the last visible key `< target` (clamped to the upper bound).
     pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+        self.stats.reverse_seek_count += 1;
         self.prefix = None;
         self.paused = false;
         if self.key_type == IterKeyType::RangesOnly {
@@ -1230,6 +1267,8 @@ impl DbIterator {
             }
             return Ok(());
         }
+        self.stats.forward_seek_count += 1;
+        self.paused = false;
         let key = if self.below_lower(target) {
             self.lower_bound.clone().unwrap()
         } else {
@@ -1249,6 +1288,7 @@ impl DbIterator {
     /// Advances to the next visible key.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<()> {
+        self.stats.forward_step_count += 1;
         if self.paused {
             // Resume from a limit pause. Forward pause: the held candidate IS the next key, so
             // surface it without advancing. Reverse pause: fall through to the normal forward step,
@@ -1412,6 +1452,7 @@ impl DbIterator {
 
     /// Steps back to the previous visible key.
     pub fn prev(&mut self) -> Result<()> {
+        self.stats.reverse_step_count += 1;
         if self.paused {
             // Symmetric to `next`: a reverse pause surfaces the held candidate in place; a forward
             // pause falls through to the normal reverse step.
@@ -1506,6 +1547,7 @@ impl DbIterator {
                     self.merge.value().to_vec(),
                 ));
                 self.merge.advance()?;
+                self.stats.internal_keys += 1;
             }
             if self.below_lower(&ukey) {
                 continue;
@@ -1549,6 +1591,7 @@ impl DbIterator {
                     self.merge.value().to_vec(),
                 ));
                 self.merge.retreat()?;
+                self.stats.internal_keys += 1;
             }
             versions.reverse();
             if self.at_or_above_upper(&ukey) {

@@ -716,6 +716,43 @@ fn next_prefix_skips_versions_within_a_prefix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Iterator::stats` counts positioning work (Pebble's `Iterator.Stats`): forward/reverse seeks
+/// and steps at the call level, plus the internal key versions scanned (which exceeds the user
+/// keys surfaced when keys have multiple versions). `reset_stats` zeroes the counters.
+#[test]
+fn iterator_stats_count_positioning_work() {
+    let dir = temp_dir("iter-stats");
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // Three user keys, each overwritten twice (three internal versions apiece) in one memtable.
+    for _ in 0..3 {
+        for k in [b"a".as_ref(), b"b", b"c"] {
+            db.set(k, b"v").unwrap();
+        }
+    }
+
+    let mut it = db.iter().unwrap();
+    it.first().unwrap(); // 1 forward seek
+    let mut steps = 0;
+    while it.valid() {
+        it.next().unwrap(); // forward steps (incl. the one off the end)
+        steps += 1;
+    }
+    let s = it.stats();
+    assert_eq!(s.forward_seek_count, 1);
+    assert_eq!(s.forward_step_count, steps);
+    assert_eq!(s.reverse_seek_count, 0);
+    // Three user keys × three versions = nine internal keys scanned.
+    assert_eq!(s.internal_keys, 9, "internal versions scanned");
+
+    it.reset_stats();
+    assert_eq!(it.stats(), pebbledb::IteratorStats::default());
+    it.last().unwrap(); // 1 reverse seek
+    assert_eq!(it.stats().reverse_seek_count, 1);
+    assert_eq!(it.stats().forward_seek_count, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The cooperative limited-iteration family (Pebble's `*WithLimit`): a step that lands at or
 /// beyond the limit returns `AtLimit` and holds the over-limit key, which a later step (with a
 /// limit past it, no limit, or a plain `next`/`prev`) resumes from without re-reading.
