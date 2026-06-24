@@ -130,15 +130,36 @@ impl DbInner {
         if paths.is_empty() {
             return Ok(());
         }
-        // Reserve a sequence number per file and rotate the active memtable out, atomically
-        // under one lock. The ingested data therefore gets a higher sequence number than every
-        // existing in-memory key, and those keys are moved to the immutable queue to be
-        // flushed — so once flushed they sit in L0 *below* the ingest (which is read
-        // newest-first), and no stale in-memory key can shadow the ingested value. (A flushable
-        // ingest avoids the flush by queueing the sstables directly; this forced-flush form is
-        // the correctness baseline.) Writes that arrive after this point get even higher
-        // sequence numbers and stay in the new memtable, correctly newer than the ingest.
-        let plan: Vec<(std::path::PathBuf, u64, u64)> = {
+        // The ingested data is assigned sequence numbers higher than every existing key. Point
+        // reads consult memtables before L0, so a *stale* in-memory version of an ingested key
+        // would wrongly shadow the newer ingested value. To prevent that, the engine flushes the
+        // in-memory data to L0 (below the ingest) — but only when it actually overlaps the ingest.
+        // For the common bulk-load case where the ingested keys are disjoint from anything in
+        // memory, the flush is skipped entirely (Pebble's flushable ingest avoids the flush via a
+        // queued flushable; we avoid it whenever there is nothing to shadow). Compute the ingested
+        // files' point-key span up front to make that decision.
+        let mut span: Option<(Vec<u8>, Vec<u8>)> = None;
+        for path in paths {
+            if let Some((lo, hi)) = self.external_point_bounds(path.as_ref())? {
+                span = Some(match span {
+                    None => (lo, hi),
+                    Some((glo, ghi)) => (
+                        if self.cmp.compare(&lo, &glo) == std::cmp::Ordering::Less {
+                            lo
+                        } else {
+                            glo
+                        },
+                        if self.cmp.compare(&hi, &ghi) == std::cmp::Ordering::Greater {
+                            hi
+                        } else {
+                            ghi
+                        },
+                    ),
+                });
+            }
+        }
+
+        let (plan, needs_flush): (Vec<(std::path::PathBuf, u64, u64)>, bool) = {
             let mut state = self.state.lock().unwrap();
             if state.read_only {
                 return Err(crate::Error::InvalidState("db: opened read-only".into()));
@@ -150,14 +171,30 @@ impl DbInner {
                 let file_num = state.vs.allocate_file_number();
                 plan.push((path.as_ref().to_path_buf(), file_num, seqnum));
             }
-            self.rotate_memtable(&mut state)?;
-            self.work_cv.notify_all();
-            plan
+            // A flush is needed only if some in-memory point key falls within the ingested span
+            // (mutable memtable or any immutable still awaiting flush).
+            let needs_flush = if let Some((lo, hi)) = &span {
+                let overlaps = |m: &Arc<crate::memtable::MemTable>| -> bool {
+                    let mut it = m.iter();
+                    it.seek_ge(lo, u64::MAX);
+                    it.valid() && self.cmp.compare(it.user_key(), hi) != std::cmp::Ordering::Greater
+                };
+                overlaps(&state.mem) || state.imm.iter().any(overlaps)
+            } else {
+                false
+            };
+            if needs_flush {
+                self.rotate_memtable(&mut state)?;
+                self.work_cv.notify_all();
+            }
+            (plan, needs_flush)
         };
 
-        // Flush the rotated memtable (and any queued immutables) to L0 off the lock, so the
-        // ingest is ordered above all prior in-memory data.
-        while self.flush_one()? {}
+        // When the ingest overlaps in-memory data, drain the immutable queue to L0 off the lock so
+        // the ingest is ordered above it. Disjoint ingests skip this and never block on a flush.
+        if needs_flush {
+            while self.flush_one()? {}
+        }
 
         // Rewrite the external files at their reserved sequence numbers (off the lock).
         let mut new_files = Vec::new();
@@ -254,6 +291,23 @@ impl DbInner {
     /// Reads the external sstable at `src`, rewrites its point keys, range tombstones, and
     /// range keys into `<dir>/<file_num>.sst` with every entry stamped at `seqnum`, and
     /// returns the resulting file's metadata.
+    /// Reads the smallest and largest **point**-key user keys of an external sstable, or `None`
+    /// when it has no point keys. Used to decide whether an ingest overlaps in-memory data and so
+    /// must flush the memtable first.
+    fn external_point_bounds(&self, src: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let bytes = self.fs.read(src)?;
+        let reader = Arc::new(Reader::open(bytes, self.cmp.clone())?);
+        let mut it = reader.iter()?;
+        it.first()?;
+        if !it.valid() {
+            return Ok(None);
+        }
+        let lo = encoded_user_key(it.key()).to_vec();
+        it.last()?;
+        let hi = encoded_user_key(it.key()).to_vec();
+        Ok(Some((lo, hi)))
+    }
+
     fn rewrite_external(&self, src: &Path, file_num: u64, seqnum: u64) -> Result<FileMetadata> {
         let bytes = self.fs.read(src)?;
         let reader = Arc::new(Reader::open(bytes, self.cmp.clone())?);

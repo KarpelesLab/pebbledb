@@ -424,6 +424,74 @@ fn ingest_wins_over_overlapping_unflushed_memtable_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A disjoint ingest (its keys don't overlap any in-memory key) skips the memtable flush
+/// entirely — the memtable keys stay in memory, so the only sstable on disk is the ingested
+/// file. An overlapping ingest still flushes (covered by the overlap test). Pebble's flushable
+/// ingest avoids the flush whenever there is nothing to shadow.
+#[test]
+fn disjoint_ingest_skips_memtable_flush() {
+    use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
+    use pebbledb::sstable::{Writer, WriterOptions};
+
+    let dir = temp_dir("ingest-disjoint");
+    let ext_dir = temp_dir("ingest-disjoint-src");
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    let db = Db::open(&dir, Options::default()).unwrap();
+    // Live keys in the active memtable, never flushed.
+    for k in ["m1", "m2", "m3"] {
+        db.set(k.as_bytes(), b"mem").unwrap();
+    }
+
+    // Ingest a key range disjoint from the memtable (z*). The source file lives outside the DB
+    // directory so the on-disk sstable count reflects only what the engine wrote.
+    let ext = ext_dir.join("external.sst");
+    {
+        let f = std::fs::File::create(&ext).unwrap();
+        let cmp = std::sync::Arc::new(pebbledb::DefaultComparer);
+        let mut w = Writer::new(f, cmp, WriterOptions::default());
+        for k in ["z1", "z2", "z3"] {
+            let ik = InternalKey::new(k.as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
+            w.add(&ik, b"ing").unwrap();
+        }
+        w.finish().unwrap();
+    }
+    db.ingest(&[&ext]).unwrap();
+
+    // Exactly one sstable exists: the ingested file. The memtable was NOT flushed.
+    let ssts = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("sst")
+        })
+        .count();
+    assert_eq!(ssts, 1, "disjoint ingest must not force a memtable flush");
+
+    // All keys are readable (memtable + ingested) and survive reopen.
+    for k in ["m1", "m2", "m3"] {
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(b"mem".as_ref())
+        );
+    }
+    for k in ["z1", "z2", "z3"] {
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(b"ing".as_ref())
+        );
+    }
+    drop(db);
+    let db = Db::open(&dir, Options::default()).unwrap();
+    assert_eq!(db.get(b"m2").unwrap().as_deref(), Some(b"mem".as_ref()));
+    assert_eq!(db.get(b"z2").unwrap().as_deref(), Some(b"ing".as_ref()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ingest_with_blob_separation() {
     use pebbledb::base::internal_key::{InternalKey, InternalKeyKind};
