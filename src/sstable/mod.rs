@@ -788,6 +788,8 @@ impl Reader {
             data: None,
             cur_value: Vec::new(),
             cur_blob_ref: None,
+            defer: false,
+            cur_raw: None,
             columnar,
         })
     }
@@ -818,6 +820,8 @@ impl Reader {
                 data: None,
                 cur_value: Vec::new(),
                 cur_blob_ref: None,
+                defer: false,
+                cur_raw: None,
                 columnar: Some(columnar),
             });
         }
@@ -847,8 +851,51 @@ impl Reader {
             data: None,
             cur_value: Vec::new(),
             cur_blob_ref: None,
+            defer: false,
+            cur_raw: None,
             columnar: None,
         })
+    }
+}
+
+/// A value that may be fetched lazily (Pebble's `LazyValue`). `Inline` already holds the bytes;
+/// `Deferred` resolves them on demand via [`value`](LazyValue::value) — used so a key-only scan can
+/// skip a blob-file read it never needs. Cloning a `Deferred` shares the underlying fetch handle.
+#[derive(Clone)]
+pub enum LazyValue {
+    /// The value, already in memory.
+    Inline(Vec<u8>),
+    /// A value resolved on demand (a separated/blob value in a deferred-value iterator).
+    Deferred(Arc<dyn LazyFetch>),
+}
+
+/// Fetches a deferred [`LazyValue`]'s bytes. Implemented over an owned `Arc<Reader>` + the raw
+/// stored value, so it stays valid for the value's lifetime independent of the iterator.
+pub trait LazyFetch: Send + Sync {
+    /// Materializes the value (may perform I/O, e.g. reading a blob file).
+    fn fetch(&self) -> Result<Vec<u8>>;
+}
+
+impl LazyValue {
+    /// Materializes the value, performing any deferred read.
+    pub fn value(&self) -> Result<Vec<u8>> {
+        match self {
+            LazyValue::Inline(v) => Ok(v.clone()),
+            LazyValue::Deferred(f) => f.fetch(),
+        }
+    }
+}
+
+/// A [`LazyFetch`] that resolves a raw stored value (value-block handle or blob reference) through
+/// its owning [`Reader`] on demand.
+struct RawFetch {
+    reader: Arc<Reader>,
+    raw: Vec<u8>,
+}
+
+impl LazyFetch for RawFetch {
+    fn fetch(&self) -> Result<Vec<u8>> {
+        self.reader.resolve_value(&self.raw)
     }
 }
 
@@ -861,6 +908,13 @@ impl Reader {
 #[derive(Clone)]
 pub struct TableIter {
     reader: Arc<Reader>,
+    /// When set, an external value (value-block handle or blob reference) is left unresolved at
+    /// positioning time and surfaced as a [`LazyValue::Deferred`] instead, so a key-only scan
+    /// skips the (possibly blob-file) read. `value()` is not meaningful while deferred; callers in
+    /// deferred mode read through [`lazy_value`](InternalIter::lazy_value).
+    defer: bool,
+    /// In deferred mode, the unresolved raw value of the current external entry (else `None`).
+    cur_raw: Option<Vec<u8>>,
     handles: Vec<BlockHandle>,
     /// Parallel to `handles`: whether each data block is skipped by a block-property filter.
     /// Empty means "skip nothing" (the unfiltered iterator).
@@ -952,11 +1006,14 @@ impl TableIter {
     /// Resolves and caches the current entry's value, and records its blob reference (if any).
     fn refresh_value(&mut self) -> Result<()> {
         self.cur_blob_ref = None;
+        self.cur_raw = None;
         let raw = match self.data.as_ref() {
             Some(d) if d.valid() => d.value().to_vec(),
-            _ => return Ok(()),
+            _ => {
+                self.cur_value = Vec::new();
+                return Ok(());
+            }
         };
-        self.cur_value = self.reader.resolve_value(&raw)?;
         if self.reader.prefixed_values
             && !raw.is_empty()
             && valblk::value_kind(raw[0]) == blob::KIND_BLOB
@@ -968,7 +1025,41 @@ impl TableIter {
                 .get(file_index as usize)
                 .map(|&num| (num, h));
         }
+        // In deferred mode an *external* value (value-block handle or blob reference) is kept raw
+        // and surfaced as a `LazyValue` rather than resolved now — so a key-only scan skips the
+        // (possibly blob-file) read. In-place values are resolved eagerly (no I/O to defer).
+        let external = self.reader.prefixed_values
+            && !raw.is_empty()
+            && valblk::value_kind(raw[0]) != valblk::KIND_IN_PLACE;
+        if self.defer && external {
+            self.cur_value = Vec::new();
+            self.cur_raw = Some(raw);
+        } else {
+            self.cur_value = self.reader.resolve_value(&raw)?;
+        }
         Ok(())
+    }
+
+    /// Sets whether external values are resolved lazily (see [`lazy_value_repr`](Self::lazy_value_repr)).
+    pub fn with_defer(mut self, defer: bool) -> TableIter {
+        self.defer = defer;
+        self
+    }
+
+    /// The current value as a [`LazyValue`]: deferred (unresolved) when this iterator is in
+    /// deferred mode and the current value is external, otherwise the resolved bytes inline.
+    pub fn lazy_value_repr(&self) -> LazyValue {
+        if self.columnar.is_some() {
+            // Columnar tables materialize every value at open; nothing to defer.
+            return LazyValue::Inline(self.value().to_vec());
+        }
+        match &self.cur_raw {
+            Some(raw) => LazyValue::Deferred(Arc::new(RawFetch {
+                reader: Arc::clone(&self.reader),
+                raw: raw.clone(),
+            })),
+            None => LazyValue::Inline(self.cur_value.clone()),
+        }
     }
 
     /// The current entry's blob reference `(blob_file_num, handle)`, if its value is stored in

@@ -25,7 +25,7 @@ use crate::base::internal_key::{
 };
 use crate::base::range_del::{RangeTombstone, max_covering_seqnum};
 use crate::memtable::OwnedMemIter;
-use crate::sstable::TableIter;
+use crate::sstable::{LazyValue, TableIter};
 
 /// A bidirectional, seekable iterator over a sorted stream of encoded internal keys.
 /// Implemented by both sstable and memtable iterators so a [`MergingIter`] can interleave
@@ -43,6 +43,12 @@ pub(crate) trait InternalIter {
     fn valid(&self) -> bool;
     fn key(&self) -> &[u8];
     fn value(&self) -> &[u8];
+    /// The current value as a [`LazyValue`], so a caller can avoid materializing it. The default
+    /// wraps the eager [`value`](Self::value); sources that can defer (the row `TableIter` in
+    /// deferred mode) override this to return an unresolved handle.
+    fn lazy_value(&self) -> LazyValue {
+        LazyValue::Inline(self.value().to_vec())
+    }
     fn advance(&mut self) -> Result<()>;
     fn retreat(&mut self) -> Result<()>;
     /// If the current entry's value is stored in a blob file, the `(blob_file_num, handle)`
@@ -80,6 +86,9 @@ impl InternalIter for TableIter {
     }
     fn value(&self) -> &[u8] {
         TableIter::value(self)
+    }
+    fn lazy_value(&self) -> LazyValue {
+        TableIter::lazy_value_repr(self)
     }
     fn advance(&mut self) -> Result<()> {
         TableIter::next(self).map(|_| ())
@@ -229,6 +238,9 @@ impl InternalIter for BoundedIter {
     }
     fn value(&self) -> &[u8] {
         self.inner.value()
+    }
+    fn lazy_value(&self) -> LazyValue {
+        self.inner.lazy_value()
     }
     fn advance(&mut self) -> Result<()> {
         self.inner.advance()?;
@@ -498,6 +510,12 @@ impl InternalIter for ConcatIter {
             .expect("valid")
             .value()
     }
+    fn lazy_value(&self) -> LazyValue {
+        self.parts[self.cur.expect("valid")]
+            .as_ref()
+            .expect("valid")
+            .lazy_value()
+    }
     fn advance(&mut self) -> Result<()> {
         let i = self.cur.expect("advance on invalid concat iter");
         let valid = {
@@ -691,6 +709,11 @@ impl MergingIter {
         self.sources[self.cur.expect("valid")].value()
     }
 
+    /// The current entry's value as a [`LazyValue`] (deferred when the source supports it).
+    pub(crate) fn lazy_value(&self) -> LazyValue {
+        self.sources[self.cur.expect("valid")].lazy_value()
+    }
+
     /// The current entry's blob reference, if its value lives in a blob file.
     pub(crate) fn blob_ref(&self) -> Option<(u64, crate::sstable::blob::BlobHandle)> {
         self.sources[self.cur.expect("valid")].blob_ref()
@@ -788,6 +811,12 @@ pub struct IterOptions {
     /// memtables (and their range tombstones / range keys) are excluded, so only state that
     /// would survive a process crash without an OS flush is visible.
     pub only_durable: bool,
+    /// Defer value materialization (Pebble's `LazyValue`). When set, the iterator does not
+    /// resolve a separated/blob value during positioning; read it via
+    /// [`DbIterator::lazy_value`] (and `LazyValue::value`) only when needed — so a key-only scan
+    /// skips blob-file reads. With this set, [`DbIterator::value`] is not meaningful; use
+    /// `lazy_value`. Default `false` (eager `value`).
+    pub defer_values: bool,
 }
 
 /// A bidirectional iterator over a database's user keys at a fixed snapshot.
@@ -833,6 +862,11 @@ pub struct DbIterator {
     paused: bool,
     /// Cumulative positioning work, surfaced by [`stats`](DbIterator::stats).
     stats: IteratorStats,
+    /// When set (from [`IterOptions::defer_values`]), values are not materialized during
+    /// positioning; the current value is held in `cur_lazy` and read via [`lazy_value`](Self::lazy_value).
+    defer: bool,
+    /// The current value as a possibly-deferred [`LazyValue`] (always set alongside `cur_value`).
+    cur_lazy: LazyValue,
 }
 
 /// Cumulative work performed by an iterator since creation (or the last
@@ -900,6 +934,8 @@ impl DbIterator {
             frag_idx: 0,
             paused: false,
             stats: IteratorStats::default(),
+            defer: opts.defer_values,
+            cur_lazy: LazyValue::Inline(Vec::new()),
         };
         if it.key_type == IterKeyType::RangesOnly {
             it.fragments = it.compute_fragments();
@@ -1080,6 +1116,7 @@ impl DbIterator {
         self.upper_bound = opts.upper_bound;
         self.mask_suffix = opts.range_key_masking_suffix;
         self.key_type = opts.key_type;
+        self.defer = opts.defer_values;
         self.prefix = None;
         self.paused = false;
         // RangesOnly walks a precomputed fragment list; (re)build or drop it to match the mode.
@@ -1098,10 +1135,20 @@ impl DbIterator {
         &self.cur_key
     }
 
-    /// The current value.
+    /// The current value. In a deferred-value iterator ([`IterOptions::defer_values`]) this is
+    /// empty — read the value through [`lazy_value`](Self::lazy_value) instead.
     pub fn value(&self) -> &[u8] {
         debug_assert!(self.valid);
         &self.cur_value
+    }
+
+    /// The current value as a [`LazyValue`] (Pebble's `Iterator.LazyValue`). With
+    /// [`IterOptions::defer_values`] set, a separated/blob value is returned unresolved and only
+    /// read when [`LazyValue::value`] is called — so a key-only scan never touches it. Without
+    /// deferral it wraps the already-materialized value.
+    pub fn lazy_value(&self) -> LazyValue {
+        debug_assert!(self.valid);
+        self.cur_lazy.clone()
     }
 
     fn below_lower(&self, ukey: &[u8]) -> bool {
@@ -1483,16 +1530,16 @@ impl DbIterator {
     fn resolve(
         &self,
         ukey: &[u8],
-        versions: &[(SeqNum, InternalKeyKind, Vec<u8>)],
-    ) -> Option<Vec<u8>> {
+        versions: &[(SeqNum, InternalKeyKind, LazyValue)],
+    ) -> Result<Option<LazyValue>> {
         let max_rts = max_covering_seqnum(
             &self.range_tombstones,
             self.cmp.as_ref(),
             ukey,
             self.snapshot,
         );
-        let mut operands: Vec<Vec<u8>> = Vec::new();
-        let mut base: Option<Vec<u8>> = None;
+        let mut operands: Vec<LazyValue> = Vec::new();
+        let mut base: Option<LazyValue> = None;
         for (seq, kind, value) in versions {
             if *seq > self.snapshot {
                 continue;
@@ -1513,13 +1560,23 @@ impl DbIterator {
             }
         }
         if operands.is_empty() {
-            base
+            // A plain Set (or nothing): the value can stay deferred — the caller only materializes
+            // it on `value()` / `lazy_value().value()`.
+            Ok(base)
         } else {
+            // Merge needs the bytes now: materialize the base and operands and fold them.
             operands.reverse(); // chronological (oldest first)
-            Some(match &self.merger {
-                Some(m) => m.full_merge(ukey, base.as_deref(), &operands),
-                None => operands.pop().unwrap(), // no merger: newest operand
-            })
+            let base_bytes = match &base {
+                Some(b) => Some(b.value()?),
+                None => None,
+            };
+            let operand_bytes: Vec<Vec<u8>> =
+                operands.iter().map(|o| o.value()).collect::<Result<_>>()?;
+            let merged = match &self.merger {
+                Some(m) => m.full_merge(ukey, base_bytes.as_deref(), &operand_bytes),
+                None => operand_bytes.into_iter().next_back().unwrap(), // no merger: newest operand
+            };
+            Ok(Some(LazyValue::Inline(merged)))
         }
     }
 
@@ -1544,7 +1601,7 @@ impl DbIterator {
                 versions.push((
                     trailer_seqnum(trailer),
                     trailer_kind(trailer),
-                    self.merge.value().to_vec(),
+                    self.merge.lazy_value(),
                 ));
                 self.merge.advance()?;
                 self.stats.internal_keys += 1;
@@ -1555,14 +1612,27 @@ impl DbIterator {
             if self.masked(&ukey) {
                 continue;
             }
-            if let Some(value) = self.resolve(&ukey, &versions) {
+            if let Some(lazy) = self.resolve(&ukey, &versions)? {
                 self.cur_key = ukey;
-                self.cur_value = value;
+                self.set_current_value(lazy)?;
                 self.valid = true;
                 return Ok(());
             }
         }
         self.valid = false;
+        Ok(())
+    }
+
+    /// Stores `lazy` as the current value: in deferred mode it is kept unresolved (surfaced via
+    /// [`lazy_value`](Self::lazy_value)) and `cur_value` is cleared; otherwise it is materialized
+    /// into `cur_value` for the eager [`value`](Self::value) accessor.
+    fn set_current_value(&mut self, lazy: LazyValue) -> Result<()> {
+        if self.defer {
+            self.cur_value.clear();
+        } else {
+            self.cur_value = lazy.value()?;
+        }
+        self.cur_lazy = lazy;
         Ok(())
     }
 
@@ -1588,7 +1658,7 @@ impl DbIterator {
                 versions.push((
                     trailer_seqnum(trailer),
                     trailer_kind(trailer),
-                    self.merge.value().to_vec(),
+                    self.merge.lazy_value(),
                 ));
                 self.merge.retreat()?;
                 self.stats.internal_keys += 1;
@@ -1600,9 +1670,9 @@ impl DbIterator {
             if self.masked(&ukey) {
                 continue;
             }
-            if let Some(value) = self.resolve(&ukey, &versions) {
+            if let Some(lazy) = self.resolve(&ukey, &versions)? {
                 self.cur_key = ukey;
-                self.cur_value = value;
+                self.set_current_value(lazy)?;
                 self.valid = true;
                 return Ok(());
             }

@@ -690,6 +690,8 @@ struct RunPartOpener {
     db: Arc<DbInner>,
     files: Vec<Arc<crate::manifest::FileMetadata>>,
     filters: Vec<Arc<dyn crate::sstable::blockprop::BlockPropertyFilter>>,
+    /// Open each file's point iterator in deferred-value mode (see [`IterOptions::defer_values`]).
+    defer: bool,
 }
 
 impl merging_iter::PartOpener for RunPartOpener {
@@ -706,7 +708,11 @@ impl merging_iter::PartOpener for RunPartOpener {
         if point_excluded {
             return Ok(Box::new(merging_iter::EmptyIter));
         }
-        let inner: Box<dyn InternalIter> = Box::new(reader.iter_with_filters(&self.filters)?);
+        let inner: Box<dyn InternalIter> = Box::new(
+            reader
+                .iter_with_filters(&self.filters)?
+                .with_defer(self.defer),
+        );
         if f.backing.is_some() {
             Ok(Box::new(merging_iter::BoundedIter::new(
                 inner,
@@ -2608,6 +2614,7 @@ impl DbInner {
                         db: Arc::clone(&me),
                         files: run,
                         filters: opts.block_property_filters.clone(),
+                        defer: opts.defer_values,
                     });
                 sources.push(Box::new(merging_iter::ConcatIter::new(
                     opener,

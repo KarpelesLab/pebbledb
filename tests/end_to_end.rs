@@ -828,6 +828,130 @@ fn flush_async_completes_via_handle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `IterOptions::defer_values` (Pebble's `LazyValue`): a key-only scan over a blob-separated table
+/// performs no blob-file reads; the value is only fetched when `lazy_value().value()` is called.
+#[test]
+fn lazy_value_defers_blob_reads_until_requested() {
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+    use std::io;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    // Wraps an inner `Fs`, counting reads of `.blob` files (where separated values live).
+    struct CountingFs {
+        inner: Arc<dyn Fs>,
+        blob_reads: Arc<AtomicUsize>,
+    }
+    impl Fs for CountingFs {
+        fn create(&self, p: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.create(p)
+        }
+        fn reuse(&self, p: &Path) -> io::Result<Box<dyn WritableFile>> {
+            self.inner.reuse(p)
+        }
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            if p.extension().is_some_and(|e| e == "blob") {
+                self.blob_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.inner.read(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.inner.remove(p)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+            self.inner.rename(a, b)
+        }
+        fn list(&self, d: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(d)
+        }
+        fn create_dir_all(&self, p: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn exists(&self, p: &Path) -> bool {
+            self.inner.exists(p)
+        }
+        fn size(&self, p: &Path) -> io::Result<u64> {
+            self.inner.size(p)
+        }
+        fn sync_dir(&self, d: &Path) -> io::Result<()> {
+            self.inner.sync_dir(d)
+        }
+        fn lock(&self, p: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(p)
+        }
+    }
+
+    let blob_reads = Arc::new(AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(CountingFs {
+        inner: Arc::new(MemFs::new()),
+        blob_reads: Arc::clone(&blob_reads),
+    });
+    let db = Db::open(
+        "/lazy-val",
+        Options {
+            fs: Arc::clone(&fs),
+            blob_value_threshold: Some(16), // large values are separated into a sibling .blob
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let big = |i: u32| format!("bigvalue-{i}-{}", "x".repeat(40));
+    for i in 0..20u32 {
+        db.set(format!("key{i:03}").as_bytes(), big(i).as_bytes())
+            .unwrap();
+    }
+    db.flush().unwrap(); // values now live in a .blob file, not the memtable
+
+    // A deferred-value, key-only scan must not read any blob file.
+    blob_reads.store(0, AtomicOrdering::Relaxed);
+    let mut it = db
+        .iter_with_options(IterOptions {
+            defer_values: true,
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    let mut keys = Vec::new();
+    while it.valid() {
+        keys.push(it.key().to_vec());
+        it.next().unwrap();
+    }
+    assert_eq!(keys.len(), 20);
+    assert_eq!(
+        blob_reads.load(AtomicOrdering::Relaxed),
+        0,
+        "a deferred key-only scan must not read blob files"
+    );
+
+    // Requesting a deferred value materializes it (and reads the blob), returning the right bytes.
+    blob_reads.store(0, AtomicOrdering::Relaxed);
+    let mut it = db
+        .iter_with_options(IterOptions {
+            defer_values: true,
+            ..Default::default()
+        })
+        .unwrap();
+    it.first().unwrap();
+    assert_eq!(it.key(), b"key000");
+    let lazy = it.lazy_value();
+    assert_eq!(lazy.value().unwrap(), big(0).into_bytes());
+    assert!(
+        blob_reads.load(AtomicOrdering::Relaxed) >= 1,
+        "reading a deferred value must read the blob file"
+    );
+
+    // A normal (eager) scan still returns correct values via value().
+    let mut it = db.iter().unwrap();
+    it.first().unwrap();
+    let mut n = 0u32;
+    while it.valid() {
+        assert_eq!(it.value(), big(n).as_bytes());
+        n += 1;
+        it.next().unwrap();
+    }
+    assert_eq!(n, 20);
+}
+
 /// `Iterator::stats` counts positioning work (Pebble's `Iterator.Stats`): forward/reverse seeks
 /// and steps at the call level, plus the internal key versions scanned (which exceeds the user
 /// keys surfaced when keys have multiple versions). `reset_stats` zeroes the counters.
