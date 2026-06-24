@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/KarpelesLab/pebbledb/compare/v0.0.1...v0.0.2) - 2026-06-24
+
+### Added
+
+- shared-storage ingest surface (IngestExternalFiles + SetCreatorID + ObjProvider)
+- Db::apply_no_sync_wait + SyncHandle (Pebble's ApplyNoSyncWait)
+- LazyValue / deferred value fetch (Pebble's LazyValue)
+- ingest skips the memtable flush when disjoint from in-memory data
+- Db::flush_async + FlushHandle (Pebble's AsyncFlush)
+- Iterator::stats / reset_stats (Pebble's Iterator.Stats)
+- limited iteration family (Pebble's *WithLimit)
+- Iterator::next_prefix (Pebble's NextPrefix)
+- MinLZ block compression (Pebble v2 indicator 8) read + write
+- persist the objstorage Provider's shared-object catalog
+- GC obsolete native blob files in collect_obsolete
+- compaction re-separates large values (value-separated DBs stay separated)
+- Pebble reads our value-separated databases (blob-values attribute)
+- engine writes value-separated databases (format 24)
+- value separation in the columnar writer (out-of-line large values)
+- write table-format-v7 columnar sstables (Pebble reads them)
+- encode native blob-file MANIFEST records + Pebble blob references
+- encode Pebble v6/v7 sstable footers
+- write separated (out-of-line) values in columnar data blocks
+- colblk key-value block encoder (v6/v7 metaindex write foundation)
+- native blob file writer (PebbleBlobWriter)
+- implement Pebble's shared-object catalog format (remoteobjcat)
+- read Pebble value-separation databases end-to-end (format 24)
+- decode native blob-file MANIFEST tags (format-24 readability)
+- resolve separated values in v6/v7 columnar tables (native blob)
+- decode Pebble inline blob handles (value-separation read foundation)
+- read Pebble table format v6/v7 sstables (columnar metaindex)
+- read Pebble v2 native blob files (FormatValueSeparation)
+- columnar compaction output — columnar databases stay columnar
+- engine flushes columnar sstables at the columnar format version
+- columnar writer emits range-del / range-key keyspan blocks (Rust→Go)
+- columnar writer produces Pebble v2-readable sstables (Rust→Go)
+- read out-of-line (value-block) columnar values from Pebble v2
+- read columnar keyspan blocks (range-del / range-key) from Pebble v2
+- read Pebble v2 columnar (FormatColumnarBlocks) sstables
+- upgrade interop to Pebble v2 + write the format-version marker
+- persist blob-file references in the MANIFEST
+- latency-triggered WAL failover
+- persist the per-file span hint in the MANIFEST
+- score L0 compaction by sublevel count (Pebble's L0 score)
+- prefix-extractor bloom filters + table skipping on seek_prefix_ge
+- large batches commit as their own flushable memtable
+- per-operation latency metrics (get / commit / flush / compaction)
+- cloneable iterators (DbIterator: Clone)
+- EFOS invalidation on overlapping excise (disjoint excise stays valid)
+
+### Fixed
+
+- colblk bitmap encoding bytes match Pebble (default=0, zero=1)
+- never compact a partial L0 in compact_range (stale-read inversion)
+- align compaction output splits to user-key boundaries
+- sync the data directory before the MANIFEST references new sstables
+
+### Other
+
+- ROADMAP — ApplyNoSyncWait done; scope shared-storage ingest surface
+- refresh ROADMAP — async flush, flushable ingest, testdata iterator suite
+- data-driven iterator-trace directives + cases (testdata corpus)
+- cover ingest in the metamorphic model test
+- refresh ROADMAP — value separation, MinLZ, objstorage catalog, iterator API
+- VersionSet::load populates the native blob-file registry
+- verify native blob writer against upstream Pebble (Rust→Go)
+- mark columnar parity complete; scope remaining byte-parity items
+- note columnar out-of-line-value/bitmap gap in the data-block reader
+- poll for L0 drain in full_lifecycle (fix macOS flake)
+- ROADMAP — columnar read parity done (Pebble v2)
+- ROADMAP — byte-parity unblocked by Pebble v2; columnar steps
+- ROADMAP — note byte-parity interop is blocked on a tagged Pebble release
+- README — lazy-open scans, prefix bloom, sublevel scoring, WAL latency failover
+- lazy-open ConcatIter — a scan opens only the files it touches
+- README — cloneable iterators, unbounded batches, EFOS disjoint-excise
+- read each LSM level as one merge source via a concat iterator
+
 ## [0.0.1](https://github.com/KarpelesLab/pebbledb/compare/v0.0.0...v0.0.1) - 2026-06-21
 
 ### Added
