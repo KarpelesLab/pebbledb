@@ -30,13 +30,21 @@ fn main() {
     let arg2 = std::env::args().nth(2);
     let with_spans = arg2.as_deref() == Some("spans");
     let v7 = arg2.as_deref() == Some("v7");
+    // "minlz" writes a table-format-v7 table whose blocks use MinLZ compression (Pebble v2's
+    // compression indicator 8), so the Go side can read it back through Pebble's MinLZ decoder.
+    let minlz = arg2.as_deref() == Some("minlz");
 
     let cmp = Arc::new(DefaultComparer);
     let opts = WriterOptions {
-        table_format: if v7 {
+        table_format: if v7 || minlz {
             pebbledb::sstable::TableFormat::Pebble(7)
         } else {
             WriterOptions::default().table_format
+        },
+        compression: if minlz {
+            pebbledb::sstable::block::CompressionType::MinLZ
+        } else {
+            WriterOptions::default().compression
         },
         ..Default::default()
     };
@@ -49,7 +57,13 @@ fn main() {
             InternalKeyKind::Set,
         )
         .encode();
-        let v = format!("value{i}");
+        // In MinLZ mode use a long, compressible value so the data block genuinely compresses
+        // with MinLZ rather than falling back to no compression.
+        let v = if minlz {
+            format!("value{i}-{}", "x".repeat(80))
+        } else {
+            format!("value{i}")
+        };
         w.add(&k, v.as_bytes()).expect("add");
     }
     if with_spans {

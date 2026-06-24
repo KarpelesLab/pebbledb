@@ -42,6 +42,7 @@ fn compression_name(c: CompressionType) -> &'static str {
         CompressionType::None => "NoCompression",
         CompressionType::Snappy => "Snappy",
         CompressionType::Zstd => "ZSTD",
+        CompressionType::MinLZ => "MinLZ",
     }
 }
 
@@ -931,6 +932,20 @@ fn compress(raw: &[u8], compression: CompressionType) -> Result<(u8, Vec<u8>)> {
                 Ok((CompressionType::None.as_u8(), raw.to_vec()))
             }
         }
+        CompressionType::MinLZ => {
+            // MinLZ cannot encode blocks larger than its 8 MiB max; Pebble falls back to Snappy
+            // there. (Sstable blocks are far smaller, so this effectively never triggers.)
+            if raw.len() > minlz::minlz::MAX_BLOCK_SIZE {
+                return compress(raw, CompressionType::Snappy);
+            }
+            let c = minlz::minlz::compress(raw)
+                .map_err(|e| Error::Corruption(format!("sstable: minlz encode: {e:?}")))?;
+            if c.len() < raw.len() {
+                Ok((CompressionType::MinLZ.as_u8(), c))
+            } else {
+                Ok((CompressionType::None.as_u8(), raw.to_vec()))
+            }
+        }
     }
 }
 
@@ -1108,6 +1123,12 @@ mod tests {
     #[test]
     fn roundtrip_zstd_many_blocks() {
         roundtrip_with(CompressionType::Zstd, 256, TableFormat::Pebble(2));
+    }
+
+    #[test]
+    fn roundtrip_minlz_many_blocks() {
+        // MinLZ (Pebble v2's compression indicator 8) round-trips through write_block/read_block.
+        roundtrip_with(CompressionType::MinLZ, 256, TableFormat::Pebble(2));
     }
 
     #[test]

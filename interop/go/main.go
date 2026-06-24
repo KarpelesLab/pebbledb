@@ -10,6 +10,7 @@
 //	interop generate-columnar-spans <dir> columnar keys + a range deletion and a range key
 //	interop generate-columnar-valueblock <dir> columnar table with an out-of-line value block
 //	interop generate-separated    <dir>   FormatValueSeparation DB with native blob files
+//	interop generate-columnar-minlz <dir> DB whose blocks use MinLZ compression (indicator 8)
 //	interop verify                <dir>   open <dir> read-only and verify the known keys
 //	interop verify-columnar-sst   <file>  read a Rust-written columnar .sst and verify the keys
 //	interop verify-pebble-blob    <file>  read a Rust-written native .blob via Pebble's blob reader
@@ -61,6 +62,10 @@ func main() {
 		// A FormatValueSeparation (format 24) database whose values are separated into native
 		// blob files.
 		generateSeparated(dir)
+	case "generate-columnar-minlz":
+		// A database whose blocks use MinLZ compression (compression indicator 8), the format
+		// github.com/minio/minlz produces — exercising the Rust engine's MinLZ block decoder.
+		generateColumnarMinLZ(dir)
 	case "verify":
 		verify(dir)
 	case "verify-columnar-sst":
@@ -72,6 +77,9 @@ func main() {
 	case "verify-columnar-points":
 		// `dir` is a columnar .sst (any table format) with only point keys key0000..key0099.
 		verifyColumnarPoints(dir)
+	case "verify-columnar-minlz":
+		// `dir` is a Rust-written columnar .sst whose data blocks must be MinLZ-compressed.
+		verifyColumnarMinLZ(dir)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)
@@ -153,6 +161,29 @@ func generateSeparated(dir string) {
 	must(db.Flush())
 	must(db.Close())
 	fmt.Printf("generated value-separated database in %s\n", dir)
+}
+
+// generateColumnarMinLZ writes a database whose blocks are compressed with MinLZ (compression
+// indicator 8), which is only valid for table formats v6+ — so it opens at FormatValueSeparation
+// (no value-separation policy, so values stay inline and land in the MinLZ-compressed data
+// blocks). Values are deliberately compressible (a long repeated suffix) so the data blocks
+// genuinely compress with MinLZ instead of falling back to no compression. Keys key0000..key0099
+// hold "value<i>-" followed by 80 'x'.
+func generateColumnarMinLZ(dir string) {
+	opts := &pebble.Options{FormatMajorVersion: pebble.FormatValueSeparation}
+	// Compression is per-level; set every level to MinLZ so the flushed L0 tables use it.
+	for i := range opts.Levels {
+		opts.Levels[i].Compression = func() *sstable.CompressionProfile { return sstable.MinLZCompression }
+	}
+	db, err := pebble.Open(dir, opts)
+	must(err)
+	for i := 0; i < n; i++ {
+		v := []byte(fmt.Sprintf("value%d-%s", i, strings.Repeat("x", 80)))
+		must(db.Set(key(i), v, pebble.Sync))
+	}
+	must(db.Flush())
+	must(db.Close())
+	fmt.Printf("generated MinLZ-compressed database in %s\n", dir)
 }
 
 func verify(dir string) {
@@ -271,6 +302,53 @@ func verifyColumnarPoints(path string) {
 		os.Exit(1)
 	}
 	fmt.Printf("verified %d keys in columnar sstable %s\n", count, path)
+}
+
+// verifyColumnarMinLZ opens a Rust-written columnar sstable whose data blocks must be MinLZ
+// compressed (compression indicator 8), asserts at least one data block actually uses that
+// indicator, and verifies its point keys key0000..key0099 (values "value<i>-" + 80 'x'). This is
+// the Rust→Go direction for MinLZ: Pebble's own MinLZ decoder must accept our encoder's output.
+func verifyColumnarMinLZ(path string) {
+	data, err := os.ReadFile(path)
+	must(err)
+	r, err := sstable.NewMemReader(data, sstable.ReaderOptions{})
+	must(err)
+	defer r.Close()
+
+	layout, err := r.Layout()
+	must(err)
+	const minLZIndicator = 8 // block.MinLZCompressionIndicator (internal; the on-disk byte is 8)
+	foundMinLZ := false
+	for _, bh := range layout.Data {
+		// The compression indicator is the first trailer byte, right after the block data.
+		if data[bh.Offset+bh.Length] == minLZIndicator {
+			foundMinLZ = true
+		}
+	}
+	if !foundMinLZ {
+		fmt.Fprintf(os.Stderr, "no MinLZ-compressed data block found in %s\n", path)
+		os.Exit(1)
+	}
+
+	it, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	must(err)
+	count := 0
+	for kv := it.First(); kv != nil; kv = it.Next() {
+		v, _, err := kv.Value(nil)
+		must(err)
+		want := fmt.Sprintf("value%d-%s", count, strings.Repeat("x", 80))
+		if string(kv.K.UserKey) != fmt.Sprintf("key%04d", count) || string(v) != want {
+			fmt.Fprintf(os.Stderr, "mismatch at %d: key=%q value=%q\n", count, kv.K.UserKey, v)
+			os.Exit(1)
+		}
+		count++
+	}
+	must(it.Error())
+	if count != n {
+		fmt.Fprintf(os.Stderr, "expected %d keys, got %d\n", n, count)
+		os.Exit(1)
+	}
+	fmt.Printf("verified %d keys + MinLZ-compressed blocks in columnar sstable %s\n", count, path)
 }
 
 // verifyPebbleBlob opens a native blob file written by the Rust PebbleBlobWriter through Pebble's

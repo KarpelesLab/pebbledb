@@ -70,6 +70,9 @@ pub enum CompressionType {
     Snappy,
     /// Zstandard, with a varint decompressed-length prefix (indicator byte 7).
     Zstd,
+    /// MinLZ block compression (indicator byte 8; Pebble v2, table formats v6+). The block is a
+    /// self-framed minlz block (it carries its own decompressed-length header — no extra prefix).
+    MinLZ,
 }
 
 impl CompressionType {
@@ -79,6 +82,7 @@ impl CompressionType {
             CompressionType::None => 0,
             CompressionType::Snappy => 1,
             CompressionType::Zstd => 7,
+            CompressionType::MinLZ => 8,
         }
     }
 
@@ -89,6 +93,7 @@ impl CompressionType {
             0 => Ok(CompressionType::None),
             1 => Ok(CompressionType::Snappy),
             7 => Ok(CompressionType::Zstd),
+            8 => Ok(CompressionType::MinLZ),
             other => Err(Error::Corruption(format!(
                 "sstable: unsupported compression indicator {other}"
             ))),
@@ -181,6 +186,12 @@ fn decompress(kind: CompressionType, raw: &[u8]) -> Result<Arc<[u8]>> {
                 .ok_or_else(|| Error::corruption("sstable: bad zstd length prefix"))?;
             let out = compcol::vec::decompress_to_vec::<compcol::zstd::Zstd>(&raw[n..])
                 .map_err(|e| Error::Corruption(format!("sstable: zstd decode: {e:?}")))?;
+            Ok(Arc::from(out))
+        }
+        CompressionType::MinLZ => {
+            // A minlz block self-frames its decompressed length, so the raw bytes decode directly.
+            let out = minlz::minlz::decompress(raw)
+                .map_err(|e| Error::Corruption(format!("sstable: minlz decode: {e:?}")))?;
             Ok(Arc::from(out))
         }
     }

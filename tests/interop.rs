@@ -111,3 +111,27 @@ fn reads_separated_value_database_written_by_go_pebble() {
         );
     }
 }
+
+/// Reads a Go-written database whose blocks use **MinLZ** compression (Pebble v2's compression
+/// indicator 8, table formats v6+) — the format `github.com/minio/minlz` produces. Gated on
+/// `PEBBLEDB_INTEROP_MINLZ_DIR`. Proves the engine decodes real MinLZ-compressed blocks (not just
+/// the S2 format some "minlz"-named libraries actually implement). Values are compressible so the
+/// data blocks genuinely compress with MinLZ rather than falling back to no compression.
+#[test]
+fn reads_minlz_compressed_database_written_by_go_pebble() {
+    let Ok(dir) = std::env::var("PEBBLEDB_INTEROP_MINLZ_DIR") else {
+        eprintln!("PEBBLEDB_INTEROP_MINLZ_DIR unset; skipping Go MinLZ interop test");
+        return;
+    };
+
+    let db = Db::open_read_only(&dir, Options::default()).expect("open Go-written MinLZ DB");
+    for i in 0..100u32 {
+        let k = format!("key{i:04}");
+        let want = format!("value{i}-{}", "x".repeat(80));
+        assert_eq!(
+            db.get(k.as_bytes()).unwrap().as_deref(),
+            Some(want.as_bytes()),
+            "MinLZ-compressed value for {k}"
+        );
+    }
+}

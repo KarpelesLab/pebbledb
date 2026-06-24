@@ -14,6 +14,9 @@ categories = ["database-implementations", "data-structures"]
 # Compression for sstable blocks. compcol is a pure-Rust, no_std, MSRV-1.88 crate that
 # exposes Pebble's two block compressors (snappy, zstd) behind a uniform API.
 compcol = { version = "0.6", default-features = false, features = ["std", "snappy", "zstd"] }
+# Pebble v2's MinLZ block compression (on-disk compression indicator 8, table formats v6+).
+# Only the `minlz` codec is enabled (not the crate's S2 codec, which compcol's snappy covers).
+minlz = { version = "1.2", default-features = false, features = ["minlz", "std"] }
 
 [dev-dependencies]
 
