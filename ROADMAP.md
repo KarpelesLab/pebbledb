@@ -73,18 +73,16 @@ gated on the Go interop CI is under **Byte-parity & interop**.
 
 ### In-crate refinements & optimizations
 
-- [ ] **`LazyValue` / deferred value fetch.** Avoid materializing a value until the caller
-  asks for it (Pebble's `LazyValue`). **Scope note:** this is a core-read-path rework, not a
-  clean addition — the whole iterator stack exposes `value() -> &[u8]`, which assumes the value is
-  materialized before access (the row `TableIter` resolves value-block/blob values eagerly into
-  `cur_value`, and the columnar reader materializes every row at open). Genuine deferral requires
-  changing that value-access model across `InternalIter` / `TableIter` / `DbIterator` (interior
-  mutability or an owned-handle return) for a niche benefit (skipping value reads on key-only
-  scans). Deferred pending a focused effort; the safety net (model + iterator tests) is in place.
-  - [ ] Add a `LazyValue` type (inline bytes or an owned `Arc<Reader>` + handle) fetching on `.value()`.
-  - [ ] Change the value-access model to return/thread `LazyValue` instead of eager `&[u8]`.
-  - [ ] Wire value-block and blob resolution to defer; test that key-only iteration does no
-    value-block/blob reads (count via a probe reader).
+- [x] **`LazyValue` / deferred value fetch (Pebble's `LazyValue`).** Opt-in via
+  `IterOptions::defer_values`: a separated (blob / value-block) value is left unresolved during
+  positioning and surfaced as `sstable::LazyValue` through `DbIterator::lazy_value()`; its bytes are
+  read only when `LazyValue::value()` is called, so a key-only scan over a blob-separated table does
+  no blob-file reads. Default (flag off) keeps the eager `value() -> &[u8]` path unchanged.
+  Implementation: `InternalIter::lazy_value()` (default `Inline(value())`) overridden by the row
+  `TableIter` (deferred mode keeps the raw handle, resolved later via an owned `Arc<Reader>`);
+  `DbIterator`'s version-collapse carries `LazyValue` and keeps a plain `Set` deferred (merges
+  materialize). Verified with a blob-read-counting `Fs` (zero reads on a key-only deferred scan;
+  exactly the blob on `value()`); default path unchanged (model stress clean).
 
 - [x] **Flushable ingest (skip the flush when disjoint).** `ingest` no longer force-flushes the
   memtable unconditionally: it computes the ingested files' point-key span and flushes the

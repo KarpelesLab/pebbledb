@@ -828,6 +828,133 @@ fn flush_async_completes_via_handle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Db::apply_no_sync_wait` (Pebble's `ApplyNoSyncWait`): the batch is visible immediately but its
+/// WAL fsync is deferred until `SyncHandle::sync_wait`. Verified with a WAL-sync-counting `Fs`.
+#[test]
+fn apply_no_sync_wait_defers_the_wal_fsync() {
+    use pebbledb::vfs::{DirLock, Fs, MemFs, WritableFile};
+    use std::io::{self, Write};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AO};
+
+    struct CountWritable {
+        inner: Box<dyn WritableFile>,
+        is_wal: bool,
+        wal_syncs: Arc<AtomicUsize>,
+    }
+    impl Write for CountWritable {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.inner.write(b)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl WritableFile for CountWritable {
+        fn sync_all(&mut self) -> io::Result<()> {
+            if self.is_wal {
+                self.wal_syncs.fetch_add(1, AO::Relaxed);
+            }
+            self.inner.sync_all()
+        }
+    }
+    // Wraps MemFs, counting fsyncs of `.log` (WAL) files.
+    struct CountFs {
+        inner: MemFs,
+        wal_syncs: Arc<AtomicUsize>,
+    }
+    impl CountFs {
+        fn wrap(&self, p: &Path, f: Box<dyn WritableFile>) -> Box<dyn WritableFile> {
+            Box::new(CountWritable {
+                inner: f,
+                is_wal: p.extension().is_some_and(|e| e == "log"),
+                wal_syncs: Arc::clone(&self.wal_syncs),
+            })
+        }
+    }
+    impl Fs for CountFs {
+        fn create(&self, p: &Path) -> io::Result<Box<dyn WritableFile>> {
+            Ok(self.wrap(p, self.inner.create(p)?))
+        }
+        fn reuse(&self, p: &Path) -> io::Result<Box<dyn WritableFile>> {
+            Ok(self.wrap(p, self.inner.reuse(p)?))
+        }
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.inner.read(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.inner.remove(p)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+            self.inner.rename(a, b)
+        }
+        fn list(&self, d: &Path) -> io::Result<Vec<String>> {
+            self.inner.list(d)
+        }
+        fn create_dir_all(&self, p: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn exists(&self, p: &Path) -> bool {
+            self.inner.exists(p)
+        }
+        fn size(&self, p: &Path) -> io::Result<u64> {
+            self.inner.size(p)
+        }
+        fn sync_dir(&self, d: &Path) -> io::Result<()> {
+            self.inner.sync_dir(d)
+        }
+        fn lock(&self, p: &Path) -> io::Result<Box<dyn DirLock>> {
+            self.inner.lock(p)
+        }
+    }
+
+    let wal_syncs = Arc::new(AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(CountFs {
+        inner: MemFs::new(),
+        wal_syncs: Arc::clone(&wal_syncs),
+    });
+    let db = Db::open(
+        "/nsw",
+        Options {
+            fs: Arc::clone(&fs),
+            wal_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A normal commit fsyncs the WAL.
+    wal_syncs.store(0, AO::Relaxed);
+    db.set(b"a", b"1").unwrap();
+    assert!(
+        wal_syncs.load(AO::Relaxed) >= 1,
+        "a normal commit fsyncs the WAL"
+    );
+
+    // apply_no_sync_wait: visible immediately, with no new WAL fsync.
+    wal_syncs.store(0, AO::Relaxed);
+    let mut b = pebbledb::Batch::new();
+    b.set(b"k", b"v");
+    let h = db.apply_no_sync_wait(b).unwrap();
+    assert_eq!(
+        db.get(b"k").unwrap().as_deref(),
+        Some(b"v".as_ref()),
+        "no-sync-wait commit is visible immediately"
+    );
+    assert_eq!(
+        wal_syncs.load(AO::Relaxed),
+        0,
+        "apply_no_sync_wait must not fsync the WAL"
+    );
+
+    // sync_wait forces the deferred fsync.
+    h.sync_wait().unwrap();
+    assert!(
+        wal_syncs.load(AO::Relaxed) >= 1,
+        "sync_wait must fsync the WAL"
+    );
+}
+
 /// `IterOptions::defer_values` (Pebble's `LazyValue`): a key-only scan over a blob-separated table
 /// performs no blob-file reads; the value is only fetched when `lazy_value().value()` is called.
 #[test]

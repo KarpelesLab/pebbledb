@@ -354,8 +354,10 @@ struct CommitSlot {
 /// itself. No queued write can be stranded with no thread responsible for committing it.
 #[derive(Default)]
 struct CommitQueue {
-    /// Writes awaiting commit, each with its batch and completion slot.
-    items: Vec<(Batch, Arc<CommitSlot>)>,
+    /// Writes awaiting commit, each with its batch, completion slot, and whether its WAL append
+    /// may skip the fsync (`ApplyNoSyncWait`: visible immediately, durable on a later `SyncWait`
+    /// or the next synced commit).
+    items: Vec<(Batch, Arc<CommitSlot>, bool)>,
     /// Whether a leader is currently draining the queue.
     leader: bool,
 }
@@ -1034,6 +1036,35 @@ impl Db {
             inner: Arc::clone(&self.inner),
             target_wal,
         })
+    }
+
+    /// Commits `batch`, making it visible immediately, but without waiting for the WAL fsync
+    /// (Pebble's `ApplyNoSyncWait`). The batch is durable only after [`SyncHandle::sync_wait`] on
+    /// the returned handle (or the next synced commit on the same WAL). Useful to pipeline a slow
+    /// fsync off the write's critical path; with WAL syncing disabled it behaves like [`apply`](DbInner::apply).
+    pub fn apply_no_sync_wait(&self, batch: Batch) -> Result<SyncHandle> {
+        self.inner.apply_inner(batch, true)?;
+        Ok(SyncHandle {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
+/// A handle to a write committed via [`Db::apply_no_sync_wait`] whose durability is pending.
+pub struct SyncHandle {
+    inner: Arc<DbInner>,
+}
+
+impl SyncHandle {
+    /// Blocks until the write is durable (Pebble's `Batch.SyncWait`): forces an fsync of the
+    /// active WAL. The write's WAL — current or already rotated out (rotation fsyncs the outgoing
+    /// WAL) — is durable on return.
+    pub fn sync_wait(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(wal) = state.wal.as_mut() {
+            wal.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -1843,6 +1874,14 @@ impl DbInner {
     /// its batch. Under concurrency this amortizes one `fsync` across many writers; with a
     /// single writer it degrades to one batch per commit.
     pub fn apply(&self, batch: Batch) -> Result<()> {
+        self.apply_inner(batch, false)
+    }
+
+    /// The shared commit path for [`apply`](Self::apply) and the `no_sync` variant backing
+    /// [`Db::apply_no_sync_wait`]. With `no_sync`, the batch's WAL append skips its fsync, so the
+    /// write is visible on return but only durable after a later [`SyncHandle::sync_wait`] (or the
+    /// next synced commit on the same WAL).
+    fn apply_inner(&self, batch: Batch, no_sync: bool) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -1855,7 +1894,7 @@ impl DbInner {
         // Enqueue and claim or decline leadership atomically under the queue lock.
         let am_leader = {
             let mut q = self.commit_q.lock().unwrap();
-            q.items.push((batch, Arc::clone(&slot)));
+            q.items.push((batch, Arc::clone(&slot), no_sync));
             if q.leader {
                 false
             } else {
@@ -1890,7 +1929,7 @@ impl DbInner {
                 std::mem::take(&mut q.items)
             };
             let result = self.commit_group(&group);
-            for (_, s) in &group {
+            for (_, s, _) in &group {
                 *s.result.lock().unwrap() = Some(clone_commit_result(&result));
                 s.cv.notify_all();
             }
@@ -1908,7 +1947,7 @@ impl DbInner {
     /// sync, assigning sequence numbers in queue order. Returns one shared result for the
     /// whole group (all batches in a group share fate: they are made durable and visible
     /// together, or fail together).
-    fn commit_group(&self, group: &[(Batch, Arc<CommitSlot>)]) -> Result<()> {
+    fn commit_group(&self, group: &[(Batch, Arc<CommitSlot>, bool)]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.read_only {
             return Err(Error::InvalidState("db: opened read-only".into()));
@@ -1931,8 +1970,8 @@ impl DbInner {
             l.on_write_stall_end();
         }
 
-        for (batch, _) in group {
-            self.commit_one(&mut state, batch)?;
+        for (batch, _, no_sync) in group {
+            self.commit_one(&mut state, batch, *no_sync)?;
         }
         Ok(())
     }
@@ -1940,7 +1979,7 @@ impl DbInner {
     /// Applies a single batch within a held state lock: memtable rotation, sequence
     /// assignment, WAL append+sync (with failover), and memtable apply. Write-stall
     /// backpressure is applied once per group by the caller (it owns the lock guard).
-    fn commit_one(&self, state: &mut State, batch: &Batch) -> Result<()> {
+    fn commit_one(&self, state: &mut State, batch: &Batch, no_sync: bool) -> Result<()> {
         let mut batch = batch.clone();
         let base = state.vs.last_sequence + 1;
         batch.set_seqnum(base);
@@ -1959,7 +1998,7 @@ impl DbInner {
         // the dedicated memtable to the batch means an arbitrarily large batch still commits.
         if needed > self.mem_table_size {
             if state.wal.is_some() {
-                self.append_to_wal(state, &batch)?;
+                self.append_to_wal(state, &batch, no_sync)?;
             }
             let fmem = Arc::new(MemTable::new(self.cmp.clone(), needed));
             fmem.apply(&batch)?;
@@ -1986,7 +2025,7 @@ impl DbInner {
         }
 
         if state.wal.is_some() {
-            self.append_to_wal(state, &batch)?;
+            self.append_to_wal(state, &batch, no_sync)?;
         }
         state.mem.apply(&batch)?;
         state.vs.last_sequence = base + count - 1;
@@ -1996,19 +2035,18 @@ impl DbInner {
     /// Appends `batch` to the active WAL, failing over to the next WAL directory if the
     /// write (or its sync) fails — e.g. a stalled or failing disk. The batch is re-logged
     /// to the new WAL so it is durable before the write returns.
-    fn append_to_wal(&self, state: &mut State, batch: &Batch) -> Result<()> {
+    fn append_to_wal(&self, state: &mut State, batch: &Batch, no_sync: bool) -> Result<()> {
+        // `no_sync` (ApplyNoSyncWait) forces the buffered-flush path even when the engine otherwise
+        // fsyncs every commit: the record is written but not made durable until a later sync.
+        let sync = self.wal_sync && !no_sync;
         // Time the write only when latency-triggered failover is armed (avoids a clock read on
         // the hot path otherwise).
         let timer = self.wal_failover_latency_threshold.map(|_| Instant::now());
         {
             let wal = state.wal.as_mut().expect("wal present");
-            let res = wal.write_record(batch.as_bytes()).and_then(|_| {
-                if self.wal_sync {
-                    wal.sync_all()
-                } else {
-                    wal.flush()
-                }
-            });
+            let res = wal
+                .write_record(batch.as_bytes())
+                .and_then(|_| if sync { wal.sync_all() } else { wal.flush() });
             if res.is_ok() {
                 // The write succeeded. If it was slow and a further failover directory is
                 // available, proactively switch future writes there (this batch is already
@@ -2034,7 +2072,7 @@ impl DbInner {
         let (mut writer, dir_idx) =
             create_wal(self.fs.as_ref(), &self.wal_dirs, next_dir, new_wal)?;
         writer.write_record(batch.as_bytes())?;
-        if self.wal_sync {
+        if sync {
             writer.sync_all()?;
         } else {
             writer.flush()?;

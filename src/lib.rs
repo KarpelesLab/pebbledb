@@ -67,6 +67,6 @@ pub use db::{
     ArchiveCleaner, CheckpointOptions, Cleaner, Db, DbIterator, DeleteCleaner, EventListener,
     EventuallyFileOnlySnapshot, FlushHandle, FormatMajorVersion, IndexedBatch, InternalScan,
     IterKeyType, IterOptions, IterValidity, IteratorStats, LatencyStat, Logger, Metrics,
-    OpLatencyMetrics, Options, OptionsFile, Snapshot, TableStats, new_external_iter,
+    OpLatencyMetrics, Options, OptionsFile, Snapshot, SyncHandle, TableStats, new_external_iter,
 };
 pub use error::{Error, Result};
