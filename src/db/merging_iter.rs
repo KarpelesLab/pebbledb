@@ -1248,6 +1248,45 @@ impl DbIterator {
         self.advance_to_next_user_key()
     }
 
+    /// Advances to the next key whose **prefix** differs from the current key's prefix, where the
+    /// prefix is `key[..cmp.split(key)]` (Pebble's `Iterator.NextPrefix`). For the default
+    /// comparer — whose split returns the whole key, so every key is its own prefix — this is
+    /// equivalent to [`next`](Self::next). For a suffix-aware comparer (e.g. an MVCC
+    /// key@timestamp scheme) it skips every remaining version sharing the current prefix, landing
+    /// on the first key of the next prefix.
+    ///
+    /// Like Pebble, `NextPrefix` is a forward operation and is not supported during prefix-bounded
+    /// iteration (`seek_prefix_ge`): in that mode it simply exhausts the iterator.
+    pub fn next_prefix(&mut self) -> Result<()> {
+        if !self.valid {
+            return Ok(());
+        }
+        // Prefix-bounded iteration is confined to a single prefix, so the next prefix is always
+        // out of range — matching Pebble's `hasPrefix → IterExhausted`.
+        if self.prefix.is_some() {
+            self.valid = false;
+            return Ok(());
+        }
+        if self.key_type == IterKeyType::RangesOnly {
+            return self.next();
+        }
+        let split = self.cmp.split(&self.cur_key);
+        let cur_prefix = self.cur_key[..split].to_vec();
+        // Step forward over user keys until the prefix changes or the iterator is exhausted.
+        // (Pebble seeks to the prefix's immediate successor; stepping is comparer-agnostic and the
+        // version count per prefix is small in practice.)
+        loop {
+            self.next()?;
+            if !self.valid {
+                return Ok(());
+            }
+            let s = self.cmp.split(&self.cur_key);
+            if self.cmp.compare(&self.cur_key[..s], &cur_prefix) != std::cmp::Ordering::Equal {
+                return Ok(());
+            }
+        }
+    }
+
     /// Steps back to the previous visible key.
     pub fn prev(&mut self) -> Result<()> {
         if !self.valid {

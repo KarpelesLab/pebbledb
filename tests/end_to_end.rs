@@ -644,6 +644,78 @@ fn comparer_registry_resolves_recorded_comparer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Iterator::next_prefix` skips the remaining versions sharing the current key's prefix and
+/// lands on the first key of the next prefix (Pebble's `NextPrefix`). Verified against a
+/// suffix-aware (MVCC-style `prefix@suffix`) comparer, and that it equals `next` under the default
+/// comparer (where every key is its own prefix).
+#[test]
+fn next_prefix_skips_versions_within_a_prefix() {
+    use pebbledb::{Comparer, DefaultComparer};
+    use std::cmp::Ordering;
+
+    struct AtComparer(DefaultComparer);
+    impl Comparer for AtComparer {
+        fn name(&self) -> &str {
+            "test.AtComparator"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+            self.0.compare(a, b)
+        }
+        fn abbreviated_key(&self, key: &[u8]) -> u64 {
+            self.0.abbreviated_key(key)
+        }
+        fn split(&self, key: &[u8]) -> usize {
+            key.iter().rposition(|&b| b == b'@').unwrap_or(key.len())
+        }
+        fn separator(&self, dst: &mut Vec<u8>, a: &[u8], b: &[u8]) {
+            self.0.separator(dst, a, b)
+        }
+        fn successor(&self, dst: &mut Vec<u8>, a: &[u8]) {
+            self.0.successor(dst, a)
+        }
+    }
+
+    let dir = temp_dir("next-prefix");
+    let db = Db::open(
+        &dir,
+        Options {
+            comparer: Arc::new(AtComparer(DefaultComparer)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Three prefixes, several versions each (distinct user keys under this comparer).
+    for k in [b"a@1".as_ref(), b"a@5", b"a@9", b"b@1", b"b@2", b"c@1"] {
+        db.set(k, b"v").unwrap();
+    }
+
+    // next_prefix from the first key of each prefix lands on the first key of the next prefix.
+    let mut it = db.iter().unwrap();
+    let mut out = Vec::new();
+    it.first().unwrap();
+    while it.valid() {
+        out.push(it.key().to_vec());
+        it.next_prefix().unwrap();
+    }
+    assert_eq!(
+        out,
+        vec![b"a@1".to_vec(), b"b@1".to_vec(), b"c@1".to_vec()],
+        "next_prefix should surface one key per prefix"
+    );
+
+    // A plain next() walks every version, confirming the data has multiple versions per prefix.
+    let mut it = db.iter().unwrap();
+    let mut all = Vec::new();
+    it.first().unwrap();
+    while it.valid() {
+        all.push(it.key().to_vec());
+        it.next().unwrap();
+    }
+    assert_eq!(all.len(), 6, "next() walks every version");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn range_key_masking_hides_older_point_versions() {
     use pebbledb::{Comparer, DefaultComparer};
